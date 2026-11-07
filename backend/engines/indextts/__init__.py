@@ -244,6 +244,8 @@ class IndexTTS2Backend(SubprocessBackend):
 
         language = _normalize_indextts25_language(kw.get("language"), text)
         forwarded: dict = {"ref_audio": ref_audio, "lang": language}
+        if kw.get("seed") is not None:
+            forwarded["seed"] = int(kw["seed"])
 
         # Duration control — codec frame rate ≈ 21 Hz.
         duration = kw.get("duration")
@@ -263,6 +265,11 @@ class IndexTTS2Backend(SubprocessBackend):
             forwarded["duration_factor"] = _duration_factor(
                 text, language, float(duration)
             )
+        elif kw.get("speed") and abs(float(kw["speed"]) - 1.0) > 1e-3:
+            # IndexTTS has no speed of its own, so a dub line's speed was
+            # dropped. 2.5's duration factor scales the take's length exactly
+            # (the S2M target length), keeping the pitch.
+            forwarded["duration_factor"] = max(0.5, min(1.0 / float(kw["speed"]), 2.0))
 
         if (
             emo_vector

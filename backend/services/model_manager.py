@@ -25,7 +25,28 @@ def _lazy_torch():
     if _torch is None:
         import torch as _t
         _torch = _t
+        _configure_rocm_windows(_t)
     return _torch
+
+
+def _configure_rocm_windows(torch):
+    """ROCm on Windows: PyTorch's own convolutions instead of MIOpen's, and
+    AOTriton attention on consumer Radeons.
+
+    MIOpen searches and compiles kernels for every new input shape, and every
+    take has a new length: the first generate on a Radeon 890M spent over 300 s
+    in the audio tokenizer's first convolution. Without AOTriton (experimental
+    on RDNA 3) attention takes the math path, about 10x slower.
+    OMNIVOICE_MIOPEN=1 keeps MIOpen.
+    """
+    if sys.platform != "win32" or getattr(torch.version, "hip", None) is None:
+        return
+    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+    if os.environ.get("OMNIVOICE_MIOPEN") != "1":
+        torch.backends.cudnn.enabled = False
+        logging.getLogger("omnivoice.model").info(
+            "ROCm on Windows: MIOpen off (OMNIVOICE_MIOPEN=1 keeps it), AOTriton attention on"
+        )
 
 
 def _missing_module_is_omnivoice(exc: ModuleNotFoundError) -> bool:
@@ -2444,9 +2465,16 @@ def _load_model_sync():
             logger.info("Preloading PyTorch Whisper after TTS model load.")
         else:
             logger.info("Skipping PyTorch Whisper preload; ASR will load on demand.")
+        # float16 has no fast CPU kernels (~7x slower than float32 on x86), so
+        # keep half precision for accelerators only.
+        tts_dtype = torch.float32 if str(device).startswith("cpu") else torch.float16
+
         def _load():
             return VoiceStudio.from_pretrained(
-                checkpoint, device_map=device, dtype=torch.float16, load_asr=False,
+                checkpoint,
+                device_map=device,
+                dtype=tts_dtype,
+                load_asr=False,
             )
 
         def _recover_corrupt_weights(exc: BaseException):

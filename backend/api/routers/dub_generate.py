@@ -692,6 +692,27 @@ async def dub_generate(job_id: str, req: DubRequest):
         # `seg_i.wav` on disk and slot into the final mix unchanged.
         regen_only = set(req.regen_only or []) if req.regen_only is not None else None
         seg_ids = req.segment_ids or []
+        # Per-segment emotion references, by segment id; only engines that
+        # declare supports_emotion (IndexTTS 2) receive them.
+        _seg_emo = {
+            (seg_ids[k] if k < len(seg_ids) else f"seg_{k}"): {
+                "emo_audio": s.emo_audio,
+                **({"emo_alpha": s.emo_alpha} if s.emo_alpha is not None else {}),
+            }
+            for k, s in enumerate(req.segments)
+            if s.emo_audio
+        }
+        # Per-segment voice references (audio + its exact transcript), which
+        # replace the profile's reference for that segment.
+        _seg_ref = {
+            (seg_ids[k] if k < len(seg_ids) else f"seg_{k}"): (s.ref_audio, s.ref_text)
+            for k, s in enumerate(req.segments)
+            if s.ref_audio and s.ref_text
+        }
+        # Per-segment seeds, for the same engines as emotion references.
+        for k, s in enumerate(req.segments):
+            if s.seed is not None:
+                _seg_emo.setdefault(seg_ids[k] if k < len(seg_ids) else f"seg_{k}", {})["seed"] = s.seed
         strategy = (req.timing_strategy or "concise").lower()
         # Voice-identity mode (see DubRequest.voice_match). The memo makes the
         # "consistent" pick once per speaker and hands the SAME reference to
@@ -1157,6 +1178,13 @@ async def dub_generate(job_id: str, req: DubRequest):
                 if used_seed is not None and not prepare_only:
                     torch.manual_seed(used_seed)
 
+                # A per-segment reference (e.g. the voice's clips plus this
+                # line's own original) replaces the profile's; it's used once,
+                # so keep it out of the prompt cache.
+                if effective_seg_id in _seg_ref:
+                    ref_audio, ref_text = _seg_ref[effective_seg_id]
+                    ref_single_use = True
+
                 # Last gate before the engine: every resolution branch above
                 # produces a PATH, and none of them can know it still exists.
                 ref_audio = warn_if_ref_missing(
@@ -1181,14 +1209,22 @@ async def dub_generate(job_id: str, req: DubRequest):
                         "seed": used_seed,
                     }
 
+                emo_kw = _seg_emo.get(effective_seg_id, {}) if getattr(backend, "supports_emotion", False) else {}
                 try:
                     audio_out = backend.generate(
-                        text=text, language=lang if lang != "Auto" else None,
-                        ref_audio=ref_audio, ref_text=ref_text,
+                        text=text,
+                        language=lang if lang != "Auto" else None,
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
                         cache_ref=not ref_single_use,
                         instruct=instruct_str if instruct_str else None,
-                        duration=dur_s, num_step=nstep, guidance_scale=cfg,
-                        speed=spd, denoise=True, postprocess_output=_job_postprocess,
+                        duration=dur_s,
+                        num_step=nstep,
+                        guidance_scale=cfg,
+                        speed=spd,
+                        denoise=True,
+                        postprocess_output=_job_postprocess,
+                        **emo_kw,
                     )
                     sr = backend.sample_rate
 
@@ -1224,12 +1260,19 @@ async def dub_generate(job_id: str, req: DubRequest):
                         # prevent, to optimize a path that only runs after an
                         # OOM already cost seconds.
                         audio_out = backend.generate(
-                            text=text, language=lang if lang != "Auto" else None,
-                            ref_audio=ref_audio, ref_text=ref_text,
+                            text=text,
+                            language=lang if lang != "Auto" else None,
+                            ref_audio=ref_audio,
+                            ref_text=ref_text,
                             cache_ref=not ref_single_use,
                             instruct=instruct_str if instruct_str else None,
-                            duration=dur_s, num_step=retry_steps, guidance_scale=cfg,
-                            speed=spd, denoise=True, postprocess_output=_job_postprocess,
+                            duration=dur_s,
+                            num_step=retry_steps,
+                            guidance_scale=cfg,
+                            speed=spd,
+                            denoise=True,
+                            postprocess_output=_job_postprocess,
+                            **emo_kw,
                         )
                         sr = backend.sample_rate
 
@@ -1609,6 +1652,12 @@ async def dub_generate(job_id: str, req: DubRequest):
             job.setdefault("seg_natural_durs_by_lang", {}).setdefault(
                 lang_code, {},
             ).update(_natural_dur_records)
+        # Every cached WAV is natural-rate once synthesis is done (a full run
+        # just rewrote them all). Record it now, not only after assembly, so a
+        # run that stops at a timing overflow still allows partial regen next
+        # time instead of re-synthesizing every segment.
+        job.setdefault("seg_wav_kind_by_lang", {})[lang_code] = "natural"
+        job["seg_wav_kind"] = "natural"
         # Single job flush instead of one per 8 segments.
         _save_job(job_id, job)
         _t_diskw = time.perf_counter() - _t_diskw_0

@@ -212,6 +212,15 @@ def _venv_can_import_indextts(python_path: Path) -> ProbeResult:
         " if exc.name != 'indextts.infer_v2_5': raise\n"
         " import indextts.infer_v2\n"
     )
+    if os.name == "nt":
+        # The sidecar adapts a ROCm torch before it imports indextts; so must
+        # the probe, or it rejects a working venv (main._configure_rocm_windows).
+        # main.py is stdlib-only at import time.
+        probe = (
+            "import importlib.util as u\n"
+            f"s = u.spec_from_file_location('indextts_sidecar', {str(INDEXTTS_SIDECAR_SCRIPT)!r})\n"
+            "m = u.module_from_spec(s); s.loader.exec_module(m); m._configure_rocm_windows()\n"
+        ) + probe
     return venv_can_import(python_path, probe, engine="indextts", logger=logger)
 
 

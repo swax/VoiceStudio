@@ -30,6 +30,18 @@ class DubSegment(BaseModel):
     # so directions never reached TTS and never entered the regen
     # fingerprint (#281).
     direction: Optional[str] = None
+    # Per-segment emotion reference for engines that take one (IndexTTS 2):
+    # a local audio file whose delivery this line should follow (e.g. the
+    # original actor's line), and how strongly (0-1, engine default 1.0).
+    emo_audio: Optional[str] = None
+    emo_alpha: Optional[float] = None
+    # Per-segment voice reference: a local audio file and its exact transcript,
+    # replacing the profile's reference for this line only (both required).
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
+    # Per-segment random seed for engines that sample in a sidecar (IndexTTS 2),
+    # so a take re-timed at another speed keeps its performance.
+    seed: Optional[int] = None
     effect_preset: str = "broadcast"   # NEW: DSP preset id (default: broadcast)
     # Echo of the segment's imported caption source id (`webvtt_source.id` /
     # `srt_source.id`) while its text is still that import's text. Without

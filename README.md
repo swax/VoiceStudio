@@ -1,3 +1,33 @@
+# VoiceStudio for Dub Anything
+
+This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the public
+VoiceStudio fork used as the voice backend for
+[Dub Anything](https://github.com/swax/dub-anything). Dub Anything directs,
+renders and checks video dubs through this backend, and includes it as a Git
+submodule pinned to a tested commit.
+
+This fork carries these changes on upstream commit `c52618af`:
+
+- **Transcription:** respect the selected source language when transcribing dub audio.
+- **CPU inference:** load OmniVoice in float32 on the CPU.
+- **Render recovery:** reuse generated takes after a timing overflow, so corrections
+  only regenerate the changed lines.
+- **Per-line direction:** accept voice references, emotion references and random seeds
+  for individual segments, and forward speed and seeds to IndexTTS 2.5.
+- **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
+- **Windows AMD support:** adapt the backend and IndexTTS sidecar to ROCm, including
+  attention, convolution and reduced-precision settings.
+
+For installation, use [Dub Anything's setup guide](https://github.com/swax/dub-anything/blob/main/docs/setup.md).
+The former standalone patch is maintained here as commits. See
+[fork maintenance notes](DUB_ANYTHING.md) for the baseline and update workflow.
+VoiceStudio retains its [AGPL-3.0 license and notices](LICENSE-NOTICE.md);
+model weights retain their own licenses.
+
+The original project's README follows.
+
+---
+
 <div align="center">
   <img src="docs/logo.png" alt="VoiceStudio" width="88" />
   <h1>VoiceStudio</h1>

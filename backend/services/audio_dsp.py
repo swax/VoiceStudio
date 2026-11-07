@@ -70,6 +70,34 @@ EFFECT_PRESETS = {
             {"type": "reverb", "room_size": 0.15, "wet_level": 0.06, "dry_level": 0.94},
         ],
     },
+    "echo": {
+        "label": "Echo",
+        "icon": "🌀",
+        "description": "Heavy hall reverb for flashbacks and remembered voices.",
+        "chain": [
+            {"type": "highpass", "cutoff_hz": 80},
+            {"type": "compressor", "threshold_db": -18, "ratio": 3.0, "attack_ms": 5, "release_ms": 80},
+            {"type": "eq", "low_gain_db": 1.5, "mid_gain_db": 0, "high_gain_db": 2.0},
+            # Matched to a drama's flashback echo: -25 dB ~0.6 s after the voice.
+            {"type": "reverb", "room_size": 0.9, "wet_level": 0.4, "dry_level": 0.7, "damping": 0.3, "tail_ms": 1000},
+            {"type": "limiter", "threshold_db": -1.0},
+        ],
+    },
+    "pa": {
+        "label": "PA",
+        "icon": "📢",
+        "description": "Public-address announcement heard in a big hall.",
+        "chain": [
+            {"type": "highpass", "cutoff_hz": 80},
+            {"type": "compressor", "threshold_db": -18, "ratio": 3.0, "attack_ms": 5, "release_ms": 80},
+            # Matched to a drama's PA in a hospital atrium: +3-5 dB at 200-500 Hz
+            # and a dip around 1.5 kHz against the same actor dry, and -25 dB
+            # ~0.25 s after the voice.
+            {"type": "eq", "low_gain_db": 4.5, "mid_gain_db": -3.0, "high_gain_db": 2.0},
+            {"type": "reverb", "room_size": 0.8, "wet_level": 0.3, "dry_level": 0.75, "damping": 0.5, "tail_ms": 500},
+            {"type": "limiter", "threshold_db": -1.0},
+        ],
+    },
     "bright": {
         "label": "Bright",
         "icon": "✨",
@@ -216,7 +244,10 @@ def apply_effects_chain(audio_tensor, sample_rate: int, chain: list[dict]) -> to
         highpass    — cutoff_hz (default 80)
         lowpass     — cutoff_hz (default 8000)
         compressor  — threshold_db, ratio, attack_ms, release_ms
-        reverb      — room_size, wet_level, dry_level
+        reverb      — room_size, wet_level, dry_level, damping; tail_ms (default 0)
+                      pads the audio so the tail can ring out, fading to
+                      silence over its last 40%, instead of stopping dead
+                      where the dry audio ends
         noise_gate  — threshold_db, release_ms
         eq          — low_gain_db, mid_gain_db, high_gain_db
         limiter     — threshold_db
@@ -243,6 +274,7 @@ def apply_effects_chain(audio_tensor, sample_rate: int, chain: list[dict]) -> to
         return audio_tensor
 
     plugins = []
+    tail_s = 0.0
     for fx in chain:
         t = fx.get("type", "").lower()
         try:
@@ -258,11 +290,15 @@ def apply_effects_chain(audio_tensor, sample_rate: int, chain: list[dict]) -> to
                     release_ms=fx.get("release_ms", 100),
                 ))
             elif t == "reverb":
-                plugins.append(Reverb(
-                    room_size=fx.get("room_size", 0.2),
-                    wet_level=fx.get("wet_level", 0.1),
-                    dry_level=fx.get("dry_level", 0.9),
-                ))
+                plugins.append(
+                    Reverb(
+                        room_size=fx.get("room_size", 0.2),
+                        wet_level=fx.get("wet_level", 0.1),
+                        dry_level=fx.get("dry_level", 0.9),
+                        damping=fx.get("damping", 0.5),
+                    )
+                )
+                tail_s = max(tail_s, fx.get("tail_ms", 0) / 1000)
             elif t == "noise_gate":
                 plugins.append(NoiseGate(
                     threshold_db=fx.get("threshold_db", -40),
@@ -292,8 +328,14 @@ def apply_effects_chain(audio_tensor, sample_rate: int, chain: list[dict]) -> to
     audio_np = audio_tensor.cpu().numpy()
     if audio_np.ndim == 1:
         audio_np = audio_np[None, :]
+    pad = int(tail_s * sample_rate)
+    if pad:
+        audio_np = np.pad(audio_np, ((0, 0), (0, pad)))
     try:
         effected = board(audio_np, sample_rate, reset=False)
+        if pad:
+            fade = int(pad * 0.4)
+            effected[:, effected.shape[1] - fade :] *= np.linspace(1.0, 0.0, fade, dtype=effected.dtype)
         return torch.from_numpy(effected).to(audio_tensor.device)
     except Exception as e:
         logger.warning("Effects chain failed: %s — returning unmodified audio", e)

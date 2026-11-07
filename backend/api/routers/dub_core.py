@@ -1481,7 +1481,20 @@ async def dub_transcribe_stream(
                     tmp.close()
                     try:
                         _safe_soundfile_write(tmp.name, arr, local_sr)
-                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True)
+                        # Honour the user's source-language pick; without it
+                        # Whisper auto-detects per chunk and can mislabel short
+                        # or noisy clips (e.g. Japanese detected as English).
+                        lang_kw = {}
+                        hint = job.get("source_lang_override")
+                        if hint:
+                            import inspect
+
+                            try:
+                                if "language" in inspect.signature(_asr_backend.transcribe).parameters:
+                                    lang_kw["language"] = hint
+                            except (TypeError, ValueError):
+                                pass
+                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True, **lang_kw)
                     finally:
                         try: os.remove(tmp.name)
                         except OSError: pass
