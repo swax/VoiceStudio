@@ -8,6 +8,10 @@
 # It is NOT a credential. Personal keys (`phx_`) remain fully banned.
 # `tests/test_no_committed_analytics_token.py` separately pins the literal to
 # exactly two canonical files and requires both to carry the same value.
+#
+# Rotating the token? The old value stays in git history, so the weekly
+# full-history scan flags it. Add those findings' fingerprints to
+# .gitleaksignore rather than keeping the retired value here.
 
 [extend]
 useDefault = true

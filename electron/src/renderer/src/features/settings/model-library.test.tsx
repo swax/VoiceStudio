@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { ReactNode } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 const mock = vi.hoisted(() => ({
   api: vi.fn(),
@@ -7,11 +8,21 @@ const mock = vi.hoisted(() => ({
 }));
 vi.mock('@/lib/api/client', () => ({ apiJson: mock.api }));
 vi.mock('sonner', () => ({ toast: mock.toast }));
+vi.mock('@tanstack/react-router', () => ({
+  Link: ({ to, children, className }: { to: string; children: ReactNode; className?: string }) => (
+    <a href={to} className={className}>
+      {children}
+    </a>
+  ),
+}));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
-import { ModelLibrary, SystemRecommendations } from './model-library';
+import { ModelLibrary, PerformanceModelPacks, SystemRecommendations } from './model-library';
 import { modelFamilies } from './model-family';
+import { EngineFamilyList } from './model-list/engine-family-list';
+import { DiarisationSettings } from './model-list/diarisation-list';
+import { performancePackRepos } from './performance-model-packs';
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -55,7 +66,7 @@ it('prioritizes required and curated models across families, with optional downl
   const invalidate = vi.spyOn(client, 'invalidateQueries');
   render(
     <QueryClientProvider client={client}>
-      <ModelLibrary setup />
+      <ModelLibrary />
     </QueryClientProvider>,
   );
   const required = await screen.findByText('Required');
@@ -74,7 +85,7 @@ it('prioritizes required and curated models across families, with optional downl
   expect(mock.api).toHaveBeenCalledWith(
     '/models/install',
     expect.objectContaining({
-      body: JSON.stringify({ repo_id: 'required', target: 'local' }),
+      body: JSON.stringify({ repo_id: 'required' }),
     }),
   );
   await waitFor(() =>
@@ -82,6 +93,117 @@ it('prioritizes required and curated models across families, with optional downl
       queryKey: ['performance-profile'],
     }),
   );
+});
+
+const makeBalancedCatalogue = (present: boolean) => [
+  {
+    repo_id: performancePackRepos.balanced[0],
+    label: 'Studio synthesizer',
+    role: 'TTS',
+    size_gb: 2.1,
+    installed: present,
+    supported: true,
+  },
+  {
+    repo_id: performancePackRepos.balanced[1],
+    label: 'Rapid recognizer',
+    role: 'ASR',
+    size_gb: 1.4,
+    installed: present,
+    supported: true,
+  },
+  {
+    repo_id: performancePackRepos.balanced[2],
+    label: 'Pocket listener',
+    role: 'ASR',
+    dictation_id: 'pocket',
+    size_gb: 0.3,
+    installed: present,
+    supported: true,
+  },
+  {
+    repo_id: performancePackRepos.balanced[3],
+    label: 'Desk listener',
+    role: 'ASR',
+    dictation_id: 'desk',
+    size_gb: 0.8,
+    installed: present,
+    supported: true,
+  },
+];
+
+const balancedProfile = {
+  global: 'balanced',
+  overrides: {},
+  effective: {},
+  families: [],
+  implemented_families: [],
+  targets: { tts: {} },
+  selections: { tts: { engine: 'fixture-engine', model: null } },
+};
+
+function serveBalancedPack({ installed, freeGb }: { installed: boolean; freeGb: number }) {
+  mock.api.mockImplementation((path: string) => {
+    if (path === '/models')
+      return Promise.resolve({
+        models: makeBalancedCatalogue(installed),
+        disk_free_gb: freeGb,
+        disk_headroom_gb: 10,
+      });
+    if (path === '/models/install/status') return Promise.resolve({ jobs: [] });
+    if (path === '/setup/recommendations')
+      return Promise.resolve({ device: { label: 'Fixture workstation' } });
+    if (path === '/api/settings/performance-profile') return Promise.resolve(balancedProfile);
+    return Promise.resolve({});
+  });
+}
+
+it('keeps distinct model names visible in the compact pack summary', async () => {
+  serveBalancedPack({ installed: false, freeGb: 40 });
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PerformanceModelPacks compact />
+    </QueryClientProvider>,
+  );
+  const labels = makeBalancedCatalogue(false).map(({ label }) => label);
+  expect(await screen.findByText(labels[0])).toBeVisible();
+  expect(labels.slice(1).every((label) => screen.getByText(label))).toBe(true);
+  expect(screen.getAllByText(/engineSidebar\.dictation/)).toHaveLength(2);
+});
+
+it('lets an already installed pack be chosen even when the disk is nearly full', async () => {
+  serveBalancedPack({ installed: true, freeGb: 0.2 });
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PerformanceModelPacks />
+    </QueryClientProvider>,
+  );
+  const choose = await screen.findByRole('button', { name: /models\.pack_use/ });
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(choose).toBeEnabled();
+  fireEvent.click(choose);
+  await waitFor(() =>
+    expect(mock.api).toHaveBeenCalledWith('/api/settings/performance-profile', {
+      method: 'PUT',
+      body: JSON.stringify({ tier: 'balanced', family: null }),
+    }),
+  );
+  expect(choose).toBeEnabled();
+  expect(mock.api.mock.calls.some(([path]) => path === '/models/install')).toBe(false);
+});
+
+it('disables a pack that still needs downloads when reserve space is missing', async () => {
+  serveBalancedPack({ installed: false, freeGb: 0.5 });
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PerformanceModelPacks />
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByRole('alert')).toHaveTextContent('models.pack_low_disk');
+  const blockedAction = await screen.findByRole('button', { name: /models\.pack_install/ });
+  fireEvent.click(blockedAction);
+  expect(blockedAction).toBeDisabled();
+  expect(mock.api).not.toHaveBeenCalledWith('/models/install', expect.anything());
 });
 
 it('unloads a resident model before deleting its slash-separated repository', async () => {
@@ -126,7 +248,7 @@ it('unloads a resident model before deleting its slash-separated repository', as
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="tts" />
+      <EngineFamilyList family="tts" />
     </QueryClientProvider>,
   );
 
@@ -173,7 +295,7 @@ it('confirms reinstall, removes the old copy, then starts a fresh install', asyn
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="asr" />
+      <EngineFamilyList family="asr" />
     </QueryClientProvider>,
   );
 
@@ -186,7 +308,7 @@ it('confirms reinstall, removes the old copy, then starts a fresh install', asyn
       '/models/install',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ repo_id: 'owner/model', target: 'local' }),
+        body: JSON.stringify({ repo_id: 'owner/model' }),
       }),
     ),
   );
@@ -235,7 +357,7 @@ it('surfaces the backend routing verdict when selecting an ASR model from the ca
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="asr" />
+      <EngineFamilyList family="asr" />
     </QueryClientProvider>,
   );
 
@@ -271,7 +393,7 @@ it('surfaces an interrupted cache as repairable and removable', async () => {
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="tts" />
+      <EngineFamilyList family="tts" />
     </QueryClientProvider>,
   );
 
@@ -314,7 +436,7 @@ it('keeps speaker diarisation models discoverable after setup', async () => {
   expect(modelFamilies).toContain('diarisation');
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family={'diarisation' as never} />
+      <DiarisationSettings />
     </QueryClientProvider>,
   );
 
@@ -335,6 +457,8 @@ it('searches model metadata and keeps incompatible choices folded', async () => 
             note: 'Expressive narration',
             supported: true,
           },
+          { ...base, repo_id: 'owner/second', label: 'Second model', supported: true },
+          { ...base, repo_id: 'owner/third', label: 'Third model', supported: true },
           {
             ...base,
             repo_id: 'owner/apple-only',
@@ -352,7 +476,7 @@ it('searches model metadata and keeps incompatible choices folded', async () => 
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="tts" />
+      <EngineFamilyList family="tts" />
     </QueryClientProvider>,
   );
 
@@ -406,79 +530,19 @@ it('shows device recommendations and live aggregate download telemetry', async (
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="tts" />
+      <EngineFamilyList family="tts" />
     </QueryClientProvider>,
   );
 
   await screen.findByText('Fast local model');
   expect(screen.getByText('firstrun.chip_recommended')).toBeInTheDocument();
   expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
-  expect(screen.getByText('512.0 MB / 1.00 GB')).toBeInTheDocument();
-  expect(screen.getByText('8.0 MB/s')).toBeInTheDocument();
-  expect(screen.getByText('~2m')).toBeInTheDocument();
-});
-
-it('shows progress for the selected remote target instead of a same-repo local job', async () => {
-  mock.api.mockImplementation((path: string) => {
-    if (path === '/models') {
-      return Promise.resolve({
-        target: 'gpu2',
-        models: [
-          {
-            repo_id: 'owner/shared',
-            label: 'Remote model',
-            role: 'TTS',
-            size_gb: 1,
-            installed: false,
-            supported: true,
-          },
-        ],
-      });
-    }
-    if (path === '/models/install/status') {
-      return Promise.resolve({
-        jobs: [
-          {
-            repo_id: 'owner/shared',
-            target: 'local',
-            state: 'downloading',
-            bytes_done: 90 * 1024 ** 2,
-            total_bytes: 100 * 1024 ** 2,
-          },
-          {
-            repo_id: 'owner/shared',
-            target: 'gpu2',
-            state: 'downloading',
-            bytes_done: 25 * 1024 ** 2,
-            total_bytes: 100 * 1024 ** 2,
-          },
-        ],
-      });
-    }
-    if (path === '/model/loaded') return Promise.resolve({ models: [], count: 0 });
-    return Promise.resolve({});
-  });
-
-  render(
-    <QueryClientProvider client={new QueryClient()}>
-      <ModelLibrary family="tts" />
-    </QueryClientProvider>,
-  );
-
-  await screen.findByText('Remote model');
-  expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '25');
-  expect(screen.getByText('25.0 MB / 100.0 MB')).toBeInTheDocument();
-
-  fireEvent.click(screen.getByRole('button', { name: 'common.cancel' }));
-  await waitFor(() =>
-    expect(mock.api).toHaveBeenCalledWith(
-      '/models/install/cancel',
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify({ repo_id: 'owner/shared', target: 'gpu2' }),
-      }),
-    ),
-  );
+  // Bytes, speed and ETA come from the shared install progress (formatted
+  // values are covered in model-install-progress.test.tsx).
+  expect(screen.getByRole('status')).toHaveTextContent('modelInstall.downloadingPct');
+  expect(
+    screen.getByText('modelInstall.bytes · modelInstall.speed · modelInstall.eta'),
+  ).toBeInTheDocument();
 });
 
 it('shows the device bundle, warns before exceeding disk space, and starts selected installs', async () => {
@@ -531,7 +595,7 @@ it('shows the device bundle, warns before exceeding disk space, and starts selec
       '/models/install',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ repo_id: 'owner/required', target: 'local' }),
+        body: JSON.stringify({ repo_id: 'owner/required' }),
       }),
     ),
   );
@@ -604,4 +668,96 @@ it('labels installed recommendations and distinguishes the active model', async 
   expect(screen.getByText('modelSettings.selected')).toBeInTheDocument();
   expect(screen.getByText('modelMaintenance.installed')).toBeInTheDocument();
   expect(screen.getByText('Optional voice')).toBeInTheDocument();
+});
+
+it.each([
+  // Fits the raw download but not the headroom the backend keeps (#2597).
+  { free: 8, headroom: undefined, warns: true },
+  { free: 8, headroom: 2, warns: false },
+  { free: 20, headroom: 10, warns: false },
+])(
+  'warns about the full bundle with the backend disk rule (free $free GB, headroom $headroom)',
+  async ({ free, headroom, warns }) => {
+    mock.api.mockImplementation((path: string) => {
+      if (path === '/models') {
+        return Promise.resolve({ models: [], disk_free_gb: free, disk_headroom_gb: headroom });
+      }
+      if (path === '/setup/recommendations') {
+        return Promise.resolve({
+          device: { label: 'Test device' },
+          models: [
+            {
+              repo_id: 'owner/required',
+              label: 'Required voice',
+              role: 'TTS',
+              size_gb: 4,
+              required: true,
+              installed: false,
+            },
+          ],
+          download_gb_remaining: 4,
+          total_gb: 4,
+          all_installed: false,
+        });
+      }
+      if (path === '/models/install/status') return Promise.resolve({ jobs: [] });
+      return Promise.resolve({});
+    });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <SystemRecommendations />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText('models.reco_disk_free');
+    expect(screen.queryByRole('alert') !== null).toBe(warns);
+  },
+);
+
+it('sends a gated install that failed on a chosen mirror to the mirror settings', async () => {
+  mock.api.mockImplementation((path: string) => {
+    if (path === '/models') {
+      return Promise.resolve({
+        models: [
+          {
+            repo_id: 'owner/gated',
+            label: 'Gated model',
+            role: 'TTS',
+            size_gb: 1,
+            installed: false,
+            supported: true,
+            gated: true,
+          },
+        ],
+      });
+    }
+    if (path === '/models/install/status') {
+      return Promise.resolve({
+        jobs: [
+          {
+            repo_id: 'owner/gated',
+            state: 'failed',
+            docs_topic: 'HF_MIRROR_GATED',
+            error: '401 Client Error',
+          },
+        ],
+      });
+    }
+    if (path === '/model/loaded') return Promise.resolve({ models: [], count: 0 });
+    return Promise.resolve({});
+  });
+
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <EngineFamilyList family="tts" />
+    </QueryClientProvider>,
+  );
+
+  expect(await screen.findByText('modelMaintenance.mirrorGatedAccess')).toBeInTheDocument();
+  expect(screen.queryByText('401 Client Error')).not.toBeInTheDocument();
+  expect(screen.getByRole('link', { name: 'models.mirror_title' })).toHaveAttribute(
+    'href',
+    '/settings/models',
+  );
 });

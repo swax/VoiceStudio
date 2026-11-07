@@ -219,6 +219,7 @@ export interface Profile {
   ref_text?: string;
   instruct?: string;
   vd_states?: string | null;
+  design_recipe?: string | null;
   description?: string;
   created_at?: string;
   is_locked?: boolean;

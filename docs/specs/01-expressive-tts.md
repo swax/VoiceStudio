@@ -3,7 +3,7 @@
 **Date:** 2026-06-25
 **Status:** Proposed
 **Target line:** v0.3.x (continuous-to-main; no RC, no deferral to v0.4)
-**Related:** `docs/specs/2026-06-12-elevenlabs-parity-program.md` (this is the "perceived-quality" half that program left open), issues #674/#679 (design-mode profile_id handling).
+**Related:** [Expressive speech](../expressive-speech.md) describes current engine support and remaining design work; issues #674/#679 cover design-mode profile_id handling.
 
 ---
 
@@ -25,7 +25,7 @@ The #1 perceived-quality gap users report vs ElevenLabs is **expressive delivery
 **What's missing / the gap:**
 
 - No way to direct **emotion** at all from the Studio generate path. The only "style" the **VoiceStudio base model** accepts is the validated `instruct` taxonomy (Gender/Age/Pitch/**Style=whisper only**/Accent/Dialect) — confirmed in `core/describe_voice.py` and the engine's `omnivoice/utils/voice_design.py` validator. The base model **does not** take `[happy]`/`[sad]` ([k2-fsa/OmniVoice issue #78 — Emotion/Tone](https://github.com/k2-fsa/OmniVoice/issues/78)); only a finetune does.
-- The capable engines express emotion **very differently**: CosyVoice 3 via natural-language instruct `…<|endofprompt|>` + inline `[laughter]`/`[breath]`/`<strong>` ([CosyVoice 3 paper](https://arxiv.org/html/2505.17589v1)); IndexTTS2 via an **8-dim emotion vector** `[happy,angry,sad,afraid,disgusted,melancholic,surprised,calm]` or an emotion-reference clip ([IndexTTS2](https://indextts.ai/), [arXiv 2506.21619](https://arxiv.org/html/2506.21619v2)); VoxCPM2 via a `(instruct)text` prefix (`tts_backend.py:423`).
+- The capable engines express emotion **very differently**: CosyVoice 3 via natural-language instruct `…<|endofprompt|>` + inline `[laughter]`/`[breath]`/`<strong>` ([CosyVoice 3 paper](https://arxiv.org/html/2505.17589v1)); IndexTTS2 via an **8-dim emotion vector** `[happy,angry,sad,afraid,disgusted,melancholic,surprised,calm]` or an emotion-reference clip ([IndexTTS2](https://github.com/index-tts/index-tts), [arXiv 2506.21619](https://arxiv.org/html/2506.21619v2)); VoxCPM2 via a `(instruct)text` prefix (`tts_backend.py:423`).
 - The lexicon is project-local JSON only — no global, no per-language, no DB persistence, no UI, no IPA/phoneme path, no inline one-off override.
 
 **Design principle:** one engine-agnostic *intent* surface (tags + sliders + dictionary) that **lowers** to whatever each engine can actually do, and **degrades visibly** (never silently) where it can't.
@@ -180,7 +180,7 @@ Grammar precedence (extends `longform_parser.py:10`):
 
 - **Respelling (alias) rows** → existing `apply_lexicon` (already correct: longest-first, boundary-aware, ReDoS-safe). Works on **every** engine — it's just text substitution.
 - **Phoneme rows (IPA/CMU)** → engine phoneme markup where supported (e.g. CosyVoice/sherpa-onnx models with a phoneme front-end), else **graceful fallback to the respelling** if the row also has one, else passed through and flagged "phoneme not honored on this engine" (parity-rule: visible degradation). No engine is *broken* by a phoneme row; worst case it's spoken as the literal grapheme.
-- Per-language: global rows always apply; language-tagged rows apply when request `language` matches (or is `Auto`). Matching is case-insensitive on the 2-letter prefix, consistent with `CosyVoiceBackend.LANG_TAGS` handling.
+- Per-language: global rows always apply; language-tagged rows apply when request `language` matches (or is `Auto`). Matching resolves both sides through the bundled language map: picker names (`Spanish`) and ISO ids (`es`, `kbt`, regional `es-MX`) compare as the same language id.
 
 ---
 

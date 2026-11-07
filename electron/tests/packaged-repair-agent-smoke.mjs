@@ -39,7 +39,7 @@ try {
   await page.evaluate(() => {
     window.location.hash = '/settings/updates';
   });
-  const launcher = page.getByRole('button', { name: 'Repair with an agent' });
+  const launcher = page.getByRole('button', { name: 'Ask VoiceStudio Agent' });
   await launcher.waitFor();
   await page.evaluate(() => {
     window.dispatchEvent(
@@ -48,10 +48,10 @@ try {
       }),
     );
   });
-  const dock = page.getByRole('region', { name: 'Repair with an agent' });
+  const dock = page.getByRole('region', { name: 'Ask VoiceStudio Agent' });
   await dock.waitFor();
-  assert.equal(await dock.getByRole('button', { name: 'Fix', exact: true }).isEnabled(), true);
-  assert.equal(await dock.getByRole('button', { name: 'Diagnose', exact: true }).isEnabled(), true);
+  assert.equal(await dock.getByRole('button', { name: 'Send', exact: true }).isEnabled(), true);
+  assert.equal(await dock.getByRole('button', { name: 'Plan', exact: true }).isEnabled(), true);
   assert.equal(await dock.getByRole('button', { name: 'Choose folder…' }).count(), 0);
 
   const ordinaryError = await page.evaluate(async () => {

@@ -4,6 +4,7 @@
  * Both editors compile to a chapter/span plan and stream progress from the same
  * server-side renderer (`_render_longform_sse`), emitting the same event shapes:
  *   { type: 'started', chapters }
+ *   { type: 'progress', index, total, fraction, eta_s, rtf, chunk_s, elapsed_s }  (#3417, live-only)
  *   { type: 'chapter' | 'chapter_error', index, total, title }
  *   { type: 'assembling' }
  *   { type: 'done', output, cached_chapters?, failed_chapters? }
@@ -50,14 +51,18 @@ export async function consumeLongformStream(res, onEvent, { isAborted, signal } 
     }
   };
 
+  // Every exit other than the stream ending on its own (abort, a throwing
+  // onEvent, a transport error) must cancel the reader — otherwise the body
+  // stays locked and the fetch open, and the server keeps rendering.
+  let streamEnded = false;
   try {
     while (true) {
-      if (aborted()) {
-        await releaseStream();
-        return;
-      }
+      if (aborted()) return;
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        streamEnded = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
       const { lines, rest } = splitSSEBuffer(buffer);
       buffer = rest;
@@ -69,11 +74,10 @@ export async function consumeLongformStream(res, onEvent, { isAborted, signal } 
   } catch (e) {
     // An abort mid-read (AbortController.abort() / reader.cancel()) rejects the
     // pending read() — swallow it when WE initiated the stop; re-throw a genuine
-    // stream/transport error so callers still surface it.
-    if (aborted()) {
-      await releaseStream();
-      return;
-    }
+    // stream/transport error (or an onEvent throw) so callers still surface it.
+    if (aborted()) return;
     throw e;
+  } finally {
+    if (!streamEnded) await releaseStream();
   }
 }

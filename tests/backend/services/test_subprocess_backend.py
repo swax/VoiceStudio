@@ -36,6 +36,20 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 ECHO_SCRIPT = REPO_ROOT / "backend" / "engines" / "_echo" / "main.py"
 
 
+@pytest.mark.parametrize("home", ["/Users/private-user", "/home/private-user", "C:\\Users\\private-user"])
+def test_stderr_scrubbed_before_logging_and_buffering(home, caplog):
+    from types import SimpleNamespace
+    backend = EchoBackend()
+    tail = collections.deque()
+    separator = "\\" if home.startswith("C:") else "/"
+    proc = SimpleNamespace(stderr=io.BytesIO(f"transcribing {home}{separator}reference.wav\n".encode()))
+    with caplog.at_level("INFO"):
+        backend._drain_stderr(proc, tail)
+    assert "private-user" not in caplog.text
+    assert "private-user" not in str(list(tail))
+    assert f"~{separator}reference.wav" in caplog.text
+
+
 # ── test-only subclass ─────────────────────────────────────────────────────
 
 
@@ -162,7 +176,7 @@ def test_env_forwarding_contract(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("HF_TOKEN", "hf_test_abc")
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf_home"))
-    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
+    monkeypatch.setenv("HF_ENDPOINT", "https://huggingface.co")
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf_cache"))
     monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
 
@@ -188,10 +202,108 @@ def test_env_forwarding_contract(monkeypatch, tmp_path):
         keys = reply["keys"]
         assert keys["HF_TOKEN"] == "hf_test_abc"
         assert keys["HF_HOME"] == str(tmp_path / "hf_home")
-        assert keys["HF_ENDPOINT"] == "https://hf-mirror.com"
+        assert keys["HF_ENDPOINT"] == "https://huggingface.co"
         assert keys["HF_HUB_CACHE"] == str(tmp_path / "hf_cache")
     finally:
         backend.shutdown()
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_automatic_endpoint_reaches_sidecar_without_token_or_parent_mutation(monkeypatch, gated):
+    from services import endpoint_race, subprocess_backend
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.setenv("HF_TOKEN", "hf_test_secret")
+    monkeypatch.setenv("YOUR_HF_TOKEN", "hf_test_secret")
+    monkeypatch.setattr(endpoint_race, "effective_endpoint", lambda: "https://hf-mirror.com")
+    monkeypatch.setattr(endpoint_race, "explicit_mirror", lambda: "")
+    monkeypatch.setattr(EchoBackend, "requires_hf_auth", gated, raising=False)
+    captured = {}
+    def spawn(*args, **kwargs):
+        captured.update(kwargs["env"])
+        raise RuntimeError("captured spawn")
+    monkeypatch.setattr(subprocess_backend, "spawn_owned", spawn)
+    with pytest.raises(RuntimeError, match="captured spawn"):
+        EchoBackend()._spawn()
+    if gated:
+        assert captured["HF_ENDPOINT"] == endpoint_race.CANONICAL_ENDPOINT
+        assert captured["HF_TOKEN"] == "hf_test_secret"
+    else:
+        assert captured["HF_ENDPOINT"] == "https://hf-mirror.com"
+        assert "HF_TOKEN" not in captured
+        assert "YOUR_HF_TOKEN" not in captured
+        assert captured["HF_HUB_DISABLE_IMPLICIT_TOKEN"] == "1"
+    assert "HF_ENDPOINT" not in os.environ
+    assert os.environ["HF_TOKEN"] == "hf_test_secret"
+
+
+@pytest.mark.parametrize("failure,changed,preselected,manual,gated,expected_restarts", [
+    ("Connection reset by peer", True, False, False, False, 1),
+    ("Connection reset by peer", False, False, False, False, 0),
+    ("Connection reset by peer", False, True, False, False, 1),
+    ("Connection reset by peer", True, False, True, False, 0),
+    ("Connection reset by peer", True, False, False, True, 0),
+    ("CUDA out of memory", True, False, False, False, 0),
+])
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_live_sidecar_restarts_only_for_changed_automatic_download_endpoint(
+    monkeypatch, failure, changed, preselected, manual, gated, expected_restarts, retry_fails,
+):
+    from services import endpoint_race, model_manager
+    from types import SimpleNamespace
+
+    backend = EchoBackend()
+    monkeypatch.setattr(backend, "requires_hf_auth", gated)
+    spawns, retired, reselections = [], [], []
+    monkeypatch.setattr(model_manager, "running_on_gpu_pool", lambda: True)
+    monkeypatch.setattr(endpoint_race, "mode", lambda: "manual" if manual else "auto")
+    endpoint = ["https://hf-mirror.com"]
+    def reselect(repo, reason):
+        reselections.append((repo, reason))
+        if changed:
+            endpoint[0] = None
+        return changed
+    monkeypatch.setattr(endpoint_race, "reselect_after_failure", reselect)
+    monkeypatch.setattr(endpoint_race, "download_endpoint", lambda *, gated=False: endpoint_race.CANONICAL_ENDPOINT if gated else endpoint[0])
+    def spawn():
+        assert backend._lock.locked()
+        backend._proc = SimpleNamespace(number=len(spawns), stdin=None, wait=lambda timeout=None: 0)
+        backend._spawn_hf_endpoint = endpoint_race.download_endpoint(gated=gated) or endpoint_race.CANONICAL_ENDPOINT
+        spawns.append(backend._proc)
+    def retire(proc):
+        assert backend._lock.locked()
+        retired.append(proc)
+        backend._proc = None
+    monkeypatch.setattr(backend, "_spawn", spawn)
+    monkeypatch.setattr(backend, "_reap_unusable_process", retire)
+    monkeypatch.setattr(backend, "_send", lambda msg: None)
+    replies = iter([
+        {"op": "error", "stage": "synthesize", "message": failure},
+        {"op": "error", "stage": "synthesize", "message": failure} if retry_fails else {"op": "audio", "audio_pcm_b64": "AAA="},
+    ])
+    def receive(timeout):
+        if preselected:
+            # Another download selected the official endpoint while this child
+            # was still using the mirror. No new global reselection is needed.
+            endpoint[0] = None
+        return next(replies)
+    monkeypatch.setattr(backend, "_recv_with_timeout", receive)
+    try:
+        if expected_restarts and not retry_fails:
+            assert backend.generate("Hello").shape == (1, 1)
+        else:
+            with pytest.raises(RuntimeError, match=failure):
+                backend.generate("Hello")
+        assert len(spawns) == 1 + expected_restarts
+        assert len(retired) == expected_restarts
+        if expected_restarts:
+            assert retired[0] is spawns[0]
+            assert backend._spawn_hf_endpoint == endpoint_race.CANONICAL_ENDPOINT
+            assert len(reselections) == 1
+    finally:
+        # Backend instances remain in the global sidecar registry until GC
+        # (and have an atexit shutdown callback). Never expose a protocol fake
+        # to later reaper/lifecycle tests, including when an assertion fails.
+        backend._proc = None
 
 
 # ── frame protocol DoS guards ──────────────────────────────────────────────
@@ -425,3 +537,21 @@ def test_the_quoted_stderr_is_scrubbed_and_bounded(echo_backend):
     text = echo_backend._stderr_tail_text()
     assert "alice" not in text and "hf_aaaa" not in text
     assert len(text) <= 801
+
+
+def test_float_transport_retains_pcm16_duration_budget(monkeypatch):
+    import json
+    import services.subprocess_backend as protocol
+    monkeypatch.setitem(EchoBackend._recv.__globals__, "MAX_FRAME_BYTES", 128)
+    backend = EchoBackend()
+    backend.supports_float_transport = True
+    frame = json.dumps({"op": "audio", "audio_format": "f32le", "audio_pcm_b64": "A" * 100}).encode()
+    assert 128 < len(frame) < 256
+    try:
+        backend._proc = _MockProc(struct.pack("!I", len(frame)) + frame)
+        assert backend._recv()["audio_format"] == "f32le"
+        backend._proc = _MockProc(struct.pack("!I", 257))
+        with pytest.raises(IOError, match="frame too large"):
+            backend._recv()
+    finally:
+        backend._proc = None

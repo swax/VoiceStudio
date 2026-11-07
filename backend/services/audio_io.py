@@ -49,16 +49,28 @@ from __future__ import annotations
 
 import io
 import logging
+from dataclasses import dataclass
 
 from core.render_trace import timed as _render_timed
 import os
 import shutil
+import subprocess
 import tempfile
 from typing import Any, BinaryIO, Union
 
 import numpy as np
 import torch
-import torchaudio
+
+# torchaudio can fail to import outright (missing TorchCodec shared libraries,
+# a broken wheel on arm64 CUDA hosts). An unguarded module-level import here
+# turns that into a full startup crash, because api.routers.* import this
+# module during the ml_imports phase and _deferred_startup treats any failure
+# there as fatal (#3150 review). Degrade instead: every call site below falls
+# back to soundfile/ffmpeg when the module is None.
+try:
+    import torchaudio
+except Exception:  # noqa: BLE001
+    torchaudio = None  # type: ignore[assignment]
 
 logger = logging.getLogger("omnivoice.audio_io")
 
@@ -66,6 +78,204 @@ logger = logging.getLogger("omnivoice.audio_io")
 # (``io.BytesIO`` for in-memory responses). ``torchaudio.save`` accepts
 # both; we forward whichever the caller hands us.
 PathOrBuf = Union[str, "os.PathLike[str]", BinaryIO, io.IOBase]
+MAX_DECODED_AUDIO_BYTES = 512 * 1024 ** 2
+MAX_COMPRESSED_AUDIO_BYTES = 512 * 1024 ** 2
+_DECODE_DISK_RESERVE = 64 * 1024 ** 2
+
+
+def pcm16_mono(wav_tensor: torch.Tensor) -> torch.Tensor:
+    """Float audio → mono int16 for the streaming wire (``pcm16`` frames).
+
+    Takes channel 0 of an N-D tensor. Audio that overshoots full scale is
+    scaled down to fit instead of hard-clipped: streamed chunks are
+    provenance-marked before they are encoded (#1169), and clipping a marked
+    chunk can erase the mark, while a uniform gain change cannot. Ordinary
+    output is normalized below full scale, so this is normally a plain cast.
+    """
+    wav = wav_tensor.detach().float().cpu()
+    while wav.ndim > 1:
+        wav = wav[0]
+    peak = float(wav.abs().max()) if wav.numel() else 0.0
+    if peak > 1.0:
+        wav = wav / peak
+    return (wav * 32767).round().clamp(-32768, 32767).to(torch.int16)
+
+
+def load_audio(source: PathOrBuf) -> tuple[torch.Tensor, int]:
+    """Read normalized channel-first audio even when TorchCodec is unavailable."""
+    position = source.tell() if hasattr(source, "tell") and getattr(source, "seekable", lambda: False)() else None
+    if torchaudio is not None:
+        try:
+            return torchaudio.load(source)
+        except (ImportError, RuntimeError) as exc:
+            if isinstance(exc, RuntimeError) and "could not load libtorchcodec" not in str(exc).lower():
+                raise
+            if position is not None:
+                source.seek(position)
+    import soundfile as sf
+    try:
+        samples, sample_rate = sf.read(source, dtype="float32", always_2d=True)
+    except RuntimeError:
+        # libsndfile does not support every accepted upload container (AAC,
+        # M4A in particular). Decode with the already-installed ffmpeg.
+        from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
+
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise
+        temporary = None
+        try:
+            if hasattr(source, "read"):
+                if position is not None:
+                    source.seek(position)
+                fd, temporary = tempfile.mkstemp(suffix=".audio")
+                with os.fdopen(fd, "wb") as target:
+                    copied = 0
+                    while True:
+                        remaining = min(
+                            MAX_COMPRESSED_AUDIO_BYTES - copied,
+                            shutil.disk_usage(tempfile.gettempdir()).free - _DECODE_DISK_RESERVE,
+                        )
+                        if remaining < 0:
+                            raise ValueError("Audio exceeds the input size limit; free temporary storage or use a shorter clip.")
+                        chunk = source.read(min(1024 ** 2, remaining + 1))
+                        if not chunk:
+                            break
+                        if len(chunk) > remaining:
+                            raise ValueError("Audio exceeds the input size limit; free temporary storage or use a shorter clip.")
+                        target.write(chunk)
+                        copied += len(chunk)
+                filename = temporary
+            else:
+                filename = os.fspath(source)
+            # Keep decoded transport on disk, not as another full WAV in
+            # memory alongside the sample tensor. Close/unlink on all exits.
+            with tempfile.TemporaryFile() as decoded:
+                limit = min(MAX_DECODED_AUDIO_BYTES,
+                            shutil.disk_usage(tempfile.gettempdir()).free - _DECODE_DISK_RESERVE)
+                if limit <= 0:
+                    raise ValueError("Audio exceeds the decoding size limit; free temporary storage or use a shorter clip.")
+                subprocess.run(
+                    local_inputs_only(
+                        [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                         "-i", filename,
+                         "-map", "0:a:0", "-f", "wav", "-c:a", "pcm_f32le",
+                         "-fs", str(limit), "pipe:1"],
+                        tool="ffmpeg",
+                    ),
+                    stdout=decoded, stderr=subprocess.PIPE, check=True, timeout=120,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                # ffmpeg exits successfully at -fs; never return truncated audio.
+                if decoded.seek(0, os.SEEK_END) >= limit:
+                    raise ValueError("Audio exceeds the decoding size limit; use a shorter clip.")
+                decoded.seek(0)
+                samples, sample_rate = sf.read(decoded, dtype="float32", always_2d=True)
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+    return torch.from_numpy(samples.T), sample_rate
+
+@dataclass(frozen=True)
+class AudioInfo:
+    """Header facts about an audio file; field names mirror ``torchaudio.info``."""
+
+    sample_rate: int
+    num_frames: int
+    num_channels: int
+    bits_per_sample: int  # 0 when the format has no fixed width (compressed)
+
+
+_SUBTYPE_BITS = {
+    "PCM_S8": 8, "PCM_U8": 8, "PCM_16": 16, "PCM_24": 24, "PCM_32": 32,
+    "FLOAT": 32, "DOUBLE": 64,
+}
+
+
+def _riff_wav_header(source: PathOrBuf) -> "AudioInfo | None":
+    """Header-DECLARED facts of a fixed-width RIFF/WAVE file, or None.
+
+    Handles integer PCM, IEEE float and WAVE_FORMAT_EXTENSIBLE. Reports what the
+    ``data`` chunk header claims, as ``torchaudio.info`` did: libsndfile clamps
+    the frame count to the bytes actually present, which would hide a truncated
+    cache from the dub fast-path integrity check (``_cached_payload_intact``)
+    that compares the two. Leaves a seekable stream where it found it.
+    """
+    import struct
+
+    handle = source if hasattr(source, "read") else open(os.fspath(source), "rb")
+    start = handle.tell() if hasattr(handle, "tell") else 0
+    try:
+        head = handle.read(12)
+        if len(head) != 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+            return None
+        fmt = None
+        while True:
+            chunk = handle.read(8)
+            if len(chunk) != 8:
+                return None
+            cid, size = chunk[:4], struct.unpack("<I", chunk[4:])[0]
+            if cid == b"fmt ":
+                body = handle.read(size)
+                if len(body) < 16:
+                    return None
+                tag, channels, rate, _brate, _align, bits = struct.unpack("<HHIIHH", body[:16])
+                if tag not in (1, 3, 0xFFFE) or channels < 1 or bits < 8 or bits % 8:
+                    return None
+                fmt = (channels, rate, bits)
+                if size % 2:
+                    handle.read(1)
+            elif cid == b"data":
+                if fmt is None:
+                    return None
+                channels, rate, bits = fmt
+                return AudioInfo(rate, size // (channels * bits // 8), channels, bits)
+            else:
+                handle.seek(size + (size % 2), os.SEEK_CUR)
+    finally:
+        if handle is source:
+            try:
+                handle.seek(start)
+            except (OSError, ValueError):
+                pass
+        else:
+            handle.close()
+
+
+def audio_info(source: PathOrBuf) -> AudioInfo:
+    """Read an audio header without ``torchaudio.info``.
+
+    torchaudio 2.9 removed ``info`` (and routes ``load`` through TorchCodec), so
+    every caller of it died with ``AttributeError`` — which the dub cache checks
+    swallow, silently treating each cached segment as missing and re-rendering
+    the whole job (#2378). Fixed-width WAV reports its declared header values;
+    libsndfile reads the other formats the app writes; anything else falls back
+    to a full :func:`load_audio` decode. Raises whatever the underlying reader
+    raises for an unreadable file.
+    """
+    import soundfile as sf
+
+    position = source.tell() if hasattr(source, "tell") and getattr(source, "seekable", lambda: False)() else None
+    declared = _riff_wav_header(source)
+    if declared is not None:
+        return declared
+    if position is not None:
+        source.seek(position)
+    try:
+        meta = sf.info(source)
+    except RuntimeError:  # LibsndfileError subclasses it
+        # sf.info may have consumed header bytes; the decoder needs them all.
+        if position is not None:
+            source.seek(position)
+        wav, rate = load_audio(source)
+        return AudioInfo(int(rate), int(wav.shape[-1]), int(wav.shape[0]), 0)
+    if position is not None:
+        source.seek(position)
+    return AudioInfo(
+        int(meta.samplerate), int(meta.frames), int(meta.channels),
+        _SUBTYPE_BITS.get(meta.subtype, 0),
+    )
+
 
 # Opus is carried in Ogg for both .opus and .ogg filenames.
 OPUS_CODEC_ARGS = ["-c:a", "libopus", "-b:a", "64k"]
@@ -204,6 +414,28 @@ def _safe_torchaudio_save(
     encoding = "PCM_F" if bits_per_sample == 32 else "PCM_S"
 
     fmt = (format or "wav").lower()
+    if torchaudio is None:
+        # torchaudio never loaded (missing TorchCodec libraries or a broken
+        # wheel). The tensor is already normalised above, so hand it straight
+        # to libsndfile.
+        if fmt == "wav":
+            subtype = "FLOAT" if bits_per_sample == 32 else ("PCM_24" if bits_per_sample == 24 else "PCM_16")
+        elif fmt == "flac":
+            subtype = "PCM_24" if bits_per_sample == 24 else "PCM_16"
+        elif fmt == "ogg":
+            subtype = "VORBIS"
+        elif fmt == "mp3":
+            subtype = "MPEG_LAYER_III"
+        else:
+            subtype = "PCM_16"
+        try:
+            _safe_soundfile_write(
+                path_or_buf, tensor.t().contiguous().numpy(), sample_rate,
+                subtype=subtype, format=fmt.upper(),
+            )
+        except Exception as e:
+            raise _describe_write_failure(e, path_or_buf) from e
+        return
     try:
         _ensure_audio_parent(path_or_buf)
         if fmt == "wav":
@@ -248,38 +480,35 @@ def _safe_torchaudio_save(
                 )
                 torchaudio.save(path_or_buf, tensor, sample_rate, format=fmt)
     except (ImportError, RuntimeError) as e:
+        # Only a TorchCodec loading problem is worth a second route; any other
+        # RuntimeError is a genuine write failure.
         if isinstance(e, RuntimeError) and "could not load libtorchcodec" not in str(e).lower():
             raise _describe_write_failure(e, path_or_buf) from e
-        # torchaudio >= 2.9 routes save() through TorchCodec, which needs
-        # FFmpeg *shared libraries* on the system. Where those are absent the
-        # write raises ImportError and every generation fails. #1931 guarded
-        # set_audio_backend() against that torchaudio but left save() itself
-        # unprotected; arm64 CUDA hosts reach it unavoidably, since torch
-        # 2.8.0 publishes no aarch64 wheel. soundfile is already a locked
-        # dependency and the tensor is normalized by this point, so hand it to
-        # the audited sibling helper rather than failing the request.
+        # torchaudio >= 2.9 sends save() through TorchCodec, which needs the
+        # FFmpeg shared libraries (unavoidable on arm64 CUDA hosts). libsndfile
+        # can write the same containers without them.
         logger.warning(
-            "torchaudio.save needs TorchCodec (%s); writing via soundfile", e
+            "torchaudio.save needs TorchCodec / FFmpeg shared libraries (%s); "
+            "writing through soundfile instead", e,
         )
         if hasattr(path_or_buf, "seek") and hasattr(path_or_buf, "truncate"):
             try:
                 path_or_buf.seek(0)
                 path_or_buf.truncate(0)
             except (OSError, io.UnsupportedOperation):
-                pass  # Non-seekable streams cannot be rewound; preserve fallback behavior.
-        _subtype = {
-            "wav": "FLOAT" if bits_per_sample == 32 else "PCM_16",
-            "flac": "PCM_16",
-            "ogg": "VORBIS",
-            "mp3": "MPEG_LAYER_III",
-        }.get(fmt, "PCM_16")
+                pass  # best effort: a half-written buffer would corrupt the output
+        if fmt == "wav":
+            subtype = "FLOAT" if bits_per_sample == 32 else "PCM_16"
+        elif fmt == "ogg":
+            subtype = "VORBIS"
+        elif fmt == "mp3":
+            subtype = "MPEG_LAYER_III"
+        else:
+            subtype = "PCM_16"
         try:
             _safe_soundfile_write(
-                path_or_buf,
-                tensor.transpose(0, 1).contiguous().numpy(),
-                sample_rate,
-                subtype=_subtype,
-                format=fmt.upper(),
+                path_or_buf, tensor.t().contiguous().numpy(), sample_rate,
+                subtype=subtype, format=fmt.upper(),
             )
         except Exception as e2:
             raise _describe_write_failure(e2, path_or_buf) from e2
@@ -342,68 +571,35 @@ def _describe_write_failure(e: Exception, path_or_buf: PathOrBuf) -> Exception:
 
 def _safe_soundfile_write(
     path: PathOrBuf,
-    samples: np.ndarray,
+    samples: Any,
     sample_rate: int,
     *,
     subtype: str = "PCM_16",
     format: str | None = None,
 ) -> None:
-    """Sibling helper for the one in-tree ``sf.write`` site.
+    """Audited ``soundfile.write``: refuses empty input, sanitises dtype and range.
 
-    ``soundfile`` is a different library than ``torchaudio`` — numpy
-    arrays instead of tensors, ``subtype`` instead of
-    ``encoding`` + ``bits_per_sample`` — so it gets its own entry point.
-    The correctness invariants are the same: contiguous, finite, in
-    range, non-empty.
-
-    Args:
-        path: Filesystem path or file-like object.
-        samples: 1D ``(samples,)`` or 2D ``(samples, channels)`` numpy
-            array — soundfile's native shape, opposite of torchaudio's.
-        sample_rate: WAV sample rate in Hz.
-        subtype: Soundfile subtype string. ``"PCM_16"`` (default) for
-            standard 16-bit PCM WAV; ``"PCM_24"``, ``"FLOAT"`` etc.
-            also work.
-        format: Container format (``"WAV"``, ``"FLAC"``, ``"OGG"``,
-            ``"MP3"``). ``None`` lets soundfile infer it from the path's
-            extension — which it cannot do for a file-like object, so
-            callers passing a buffer must name it.
-
-    Raises:
-        ValueError: if the array is empty.
+    ``samples`` is soundfile-shaped: ``(samples,)`` or ``(samples, channels)``
+    (the transpose of torchaudio's layout). ``format`` names the container
+    (``"WAV"``, ``"FLAC"``, ``"OGG"``, ``"MP3"``); ``None`` infers it from the
+    file extension, which only works for paths, so buffers must pass it.
     """
-    # Import here so this module doesn't fail to import when soundfile
-    # is somehow absent (it's a transitive dep but we don't want a hard
-    # import-time coupling).
     import soundfile as sf
 
     if not isinstance(samples, np.ndarray):
-        # Accept memoryview / list / torch tensor inputs by coercing.
         samples = np.asarray(samples)
-
     if samples.size == 0:
         raise ValueError(
-            "_safe_soundfile_write refuses to write an empty array — "
-            "a zero-length WAV is exactly the #48 silent-corruption mode."
+            "_safe_soundfile_write refuses to write an empty array — a "
+            "zero-length file is the silent-corruption mode of #48."
         )
-
-    # Coerce to a soundfile-friendly dtype. soundfile accepts
-    # float32 / float64 / int16 / int32; we normalize anything else to
-    # float32 so the clamp below is well-defined.
     if samples.dtype not in (np.float32, np.float64, np.int16, np.int32):
         samples = samples.astype(np.float32)
-
-    # Out-of-range protection for float inputs.
-    if samples.dtype in (np.float32, np.float64):
-        # ``np.clip`` with ``out=`` requires the out array to be
-        # writable + same dtype. ``np.ascontiguousarray`` may return
-        # the original array (writable) or a copy (also writable), so
-        # clipping in place is safe after it.
-        samples = np.ascontiguousarray(samples)
+    samples = np.ascontiguousarray(samples)
+    if not samples.flags.writeable:
+        samples = samples.copy()
+    if samples.dtype.kind == "f":
         np.clip(samples, -1.0, 1.0, out=samples)
-    else:
-        samples = np.ascontiguousarray(samples)
-
     _ensure_audio_parent(path)
     sf.write(path, samples, sample_rate, subtype=subtype, format=format)
 

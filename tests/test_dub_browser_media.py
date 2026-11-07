@@ -25,7 +25,7 @@ def _run_local_ingest(tmp_path, monkeypatch, *, input_type="video"):
 
     def factory(_job_id):
         async def run_proc(cmd, **_kwargs):
-            output = next((str(arg) for arg in cmd if str(arg).endswith(".wav")), None)
+            output = next((str(arg) for arg in reversed(cmd) if str(arg).endswith(".wav")), None)
             if output:
                 with open(output, "wb") as handle:
                     handle.write(b"RIFF")

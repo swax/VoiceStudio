@@ -1,11 +1,8 @@
-"""LLM provider registry — the OpenAI-compatible providers VoiceStudio can use
-for Cinematic / Autofit translation (and any future LLM feature).
+"""LLM provider registry for every VoiceStudio LLM skill.
 
-Every provider here speaks the OpenAI chat-completions shape, so a single
-client (`llm_backend.OpenAICompatBackend`) drives all of them — the only
-per-provider differences are ``base_url``, ``model``, and the API key. This
-module is the one place that knows those defaults and resolves the live value
-for the *active* provider.
+OpenAI-compatible, native SDK and desktop CLI transports share the same
+completion interface. This module resolves configuration without contacting
+providers or starting agents; llm_transport handles explicit inference calls.
 
 Resolution precedence for every field (key / base_url / model), highest first:
     1. Environment variable  — power-user / `.env` override, wins always.
@@ -24,11 +21,14 @@ users.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("omnivoice.llm_providers")
 
@@ -64,6 +64,8 @@ class Provider:
     account_env: Optional[str] = None
     signup_url: str = ""
     notes: str = ""
+    transport: str = "openai"
+    sdk_provider: str = ""
 
 
 # Order here is the display order in the settings page. OpenAI first (the
@@ -86,6 +88,24 @@ _PROVIDERS: tuple[Provider, ...] = (
              key_envs=("ORCAROUTER_API_KEY",), base_url_env="ORCAROUTER_BASE_URL",
              model_env="ORCAROUTER_MODEL",
              signup_url="https://www.orcarouter.ai"),
+    Provider("cheaperinference", "Cheaper Inference",
+             "https://api.cheaperinference.com/v1", "gpt-5.4-mini",
+             key_envs=("CHEAPER_INFERENCE_API_KEY",),
+             base_url_env="CHEAPER_INFERENCE_BASE_URL",
+             model_env="CHEAPER_INFERENCE_MODEL",
+             signup_url="https://cheaperinference.com/signup",
+             notes="A single gateway that reaches models from several AI labs."),
+    # No base_url_env: Opper's own SDKs read OPPER_BASE_URL as the API root,
+    # not this OpenAI-compatible path. The URL can still be changed in Settings.
+    Provider("opper", "Opper", "https://api.opper.ai/v3/compat",
+             "claude-sonnet-4-6",
+             key_envs=("OPPER_API_KEY",), model_env="OPPER_MODEL",
+             signup_url="https://platform.opper.ai"),
+    Provider("api-route", "API Route", "https://global.api-route.com/v1",
+             "deepseek-v4.1-flash",
+             key_envs=("API_ROUTE_API_KEY",), base_url_env="API_ROUTE_BASE_URL",
+             model_env="API_ROUTE_MODEL",
+             signup_url="https://www.api-route.com"),
     Provider("groq", "Groq", "https://api.groq.com/openai/v1",
              "llama-3.3-70b-versatile",
              key_envs=("GROQ_API_KEY",), base_url_env="GROQ_BASE_URL",
@@ -98,7 +118,7 @@ _PROVIDERS: tuple[Provider, ...] = (
              notes="Fastest Llama inference. Free tier."),
     Provider("google-ai", "Google AI (Gemini)",
              "https://generativelanguage.googleapis.com/v1beta/openai",
-             "gemini-2.0-flash",
+             "gemini-3.8-flash",
              key_envs=("GOOGLE_AI_API_KEY",), base_url_env="GOOGLE_AI_BASE_URL",
              model_env="GOOGLE_AI_MODEL",
              signup_url="https://aistudio.google.com/app/apikey",
@@ -149,7 +169,7 @@ _PROVIDERS: tuple[Provider, ...] = (
              model_env="SILICONFLOW_MODEL", signup_url="https://siliconflow.com",
              notes="Qwen/DeepSeek and more. Strong for CJK."),
     Provider("ollama", "Ollama (local)", "http://localhost:11434/v1",
-             "llama3.1", local=True,
+             "llama3.1", local=True, key_envs=("OLLAMA_API_KEY",),
              base_url_env="OLLAMA_BASE_URL", model_env="OLLAMA_MODEL",
              signup_url="https://ollama.com",
              notes="Fully offline. Run `ollama pull llama3.1` first."),
@@ -159,10 +179,57 @@ _PROVIDERS: tuple[Provider, ...] = (
     # a real name people actually pull) worked on the same machine (#1332).
     # resolve_model asks the server instead of shipping a guess.
     Provider("lmstudio", "LM Studio (local)", "http://localhost:1234/v1",
-             "local-model", local=True, model_is_placeholder=True,
+             "local-model", local=True, model_is_placeholder=True, key_envs=("LMSTUDIO_API_KEY",),
              base_url_env="LMSTUDIO_BASE_URL", model_env="LMSTUDIO_MODEL",
              signup_url="https://lmstudio.ai",
              notes="Fully offline. Start the LM Studio local server and load a model."),
+    Provider("anthropic", "Anthropic (Claude)", "", "claude-sonnet-4-6",
+             key_envs=("ANTHROPIC_API_KEY",), model_env="ANTHROPIC_MODEL",
+             transport="sdk", sdk_provider="anthropic", signup_url="https://console.anthropic.com"),
+    Provider("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat",
+             key_envs=("DEEPSEEK_API_KEY",), model_env="DEEPSEEK_MODEL"),
+    Provider("xai", "xAI (Grok)", "https://api.x.ai/v1", "grok-4",
+             key_envs=("XAI_API_KEY",), model_env="XAI_MODEL"),
+    Provider("together", "Together AI", "https://api.together.xyz/v1", "",
+             key_envs=("TOGETHER_API_KEY",), model_env="TOGETHER_MODEL"),
+    Provider("fireworks", "Fireworks AI", "https://api.fireworks.ai/inference/v1", "",
+             key_envs=("FIREWORKS_API_KEY",), model_env="FIREWORKS_MODEL"),
+    Provider("perplexity", "Perplexity", "https://api.perplexity.ai", "sonar",
+             key_envs=("PERPLEXITY_API_KEY",), model_env="PERPLEXITY_MODEL"),
+    Provider("qwen", "Alibaba Cloud (Qwen)", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "qwen-plus",
+             key_envs=("DASHSCOPE_API_KEY",), model_env="QWEN_MODEL"),
+    Provider("moonshot", "Moonshot (Kimi)", "https://api.moonshot.ai/v1", "",
+             key_envs=("MOONSHOT_API_KEY",), model_env="MOONSHOT_MODEL"),
+    Provider("minimax", "MiniMax", "https://api.minimax.io/v1", "",
+             key_envs=("MINIMAX_API_KEY",), model_env="MINIMAX_MODEL"),
+    Provider("zai", "Z.AI (GLM)", "https://api.z.ai/api/paas/v4", "",
+             key_envs=("ZAI_API_KEY",), model_env="ZAI_MODEL"),
+    # No default model: MaaS model IDs come from each service's model card and
+    # can differ per deployment. Token Plan keys only work on maas-token-api.
+    Provider("iflytek", "iFLYTEK Astron MaaS", "https://maas-api.cn-huabei-1.xf-yun.com/v2", "",
+             key_envs=("IFLYTEK_API_KEY",), base_url_env="IFLYTEK_BASE_URL",
+             model_env="IFLYTEK_MODEL", signup_url="https://maas.xfyun.cn",
+             notes="Spark X2.5 and hosted open models. Use the model ID from the "
+                   "model card; for a Token Plan key, set the Base URL to "
+                   "https://maas-token-api.cn-huabei-1.xf-yun.com/v2."),
+    Provider("azure", "Azure OpenAI", "", "",
+             key_envs=("AZURE_API_KEY",), base_url_env="AZURE_OPENAI_BASE_URL", model_env="AZURE_DEPLOYMENT"),
+    Provider("bedrock", "Amazon Bedrock", "", "",
+             key_envs=("AWS_BEARER_TOKEN_BEDROCK",), model_env="BEDROCK_MODEL",
+             key_optional=True, transport="sdk", sdk_provider="bedrock"),
+    Provider("vertex", "Google Vertex AI", "", "",
+             model_env="VERTEX_MODEL", key_optional=True, transport="sdk", sdk_provider="vertex_ai",
+             needs_account=True, account_env="VERTEXAI_PROJECT"),
+    Provider("sdk", "LiteLLM (other providers)", "", "",
+             key_envs=("LITELLM_API_KEY",), model_env="LITELLM_MODEL", transport="sdk"),
+    Provider("claude-code", "Claude Code (CLI)", "", "",
+             transport="cli", sdk_provider="claude", model_env="VOICESTUDIO_CLAUDE_MODEL"),
+    Provider("codex-cli", "Codex (CLI)", "", "",
+             transport="cli", sdk_provider="codex", model_env="VOICESTUDIO_CODEX_MODEL"),
+    Provider("pi-cli", "Pi (CLI)", "", "",
+             transport="cli", sdk_provider="pi", model_env="VOICESTUDIO_PI_MODEL"),
+    Provider("opencode-cli", "OpenCode (CLI)", "", "",
+             transport="cli", sdk_provider="opencode", model_env="VOICESTUDIO_OPENCODE_MODEL"),
     Provider("custom", "Custom (OpenAI-compatible)", "", "",
              key_envs=("TRANSLATE_API_KEY",), base_url_env="TRANSLATE_BASE_URL",
              model_env="TRANSLATE_MODEL", key_optional=True,
@@ -269,76 +336,57 @@ def _cached_discovery(pid: str) -> tuple[bool, Optional[str]]:
     return True, value
 
 
-#: LM Studio's native endpoint, unlike the OpenAI-compatible ``/v1/models``,
-#: reports which checkpoints are actually resident in memory. On a laptop only
-#: one usually is, and asking for any other makes LM Studio evict and reload
-#: multi-GB weights mid-request (or fail outright when they don't fit), so the
-#: loaded one is the only sane discovery answer.
 _LMSTUDIO_PROBE_TIMEOUT_S = 3.0
 
 
-def _probe_lmstudio_loaded_model(base_url: str, api_key: str = "local") -> Optional[str]:
-    """Return the id of a model LM Studio currently holds in memory, if any.
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-    Best-effort and never raises: LM Studio not running, an older build without
-    ``/api/v0``, or any other host on that URL simply yields ``None`` and the
-    caller keeps its configured/default model without guessing from untyped IDs.
-    Only ever called through
-    :func:`discover_model`, which caches both outcomes — probing per request
-    would cost an HTTP round trip on every translated segment.
-    """
-    import json
-    import urllib.request
-    from urllib.parse import urlsplit
 
+def _probe_lmstudio_loaded_model(
+    base_url: str, api_key: str = "local"
+) -> Optional[str]:
+    """Return a typed, resident LM Studio chat model without following redirects."""
     if not base_url:
         return None
     try:
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return None
-        clean_base = base_url.rstrip("/")
-        if clean_base.endswith("/v1"):
-            clean_base = clean_base[: -len("/v1")]
-        headers = {"User-Agent": "VoiceStudio"}
+        root = base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        headers = {"User-Agent": "VoiceStudio LM Studio model probe"}
         if api_key and api_key != "local":
             headers["Authorization"] = f"Bearer {api_key}"
-        req = urllib.request.Request(f"{clean_base}/api/v0/models", headers=headers)
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                return None
-
-        # A configured API credential belongs only to the configured origin.
-        opener = urllib.request.build_opener(NoRedirect())
-        with opener.open(req, timeout=_LMSTUDIO_PROBE_TIMEOUT_S) as resp:  # nosec B310 — HTTP(S) validated above
-            data = json.loads(resp.read().decode("utf-8"))
-        loaded = [
-            str(m.get("id"))
-            for m in (data.get("data") or [])
-            if isinstance(m, dict)
-            and m.get("state") == "loaded"
-            and m.get("type") in {"llm", "vlm"}
-            and m.get("id")
+        request = urllib.request.Request(
+            f"{root}/api/v0/models", headers=headers, method="GET"
+        )
+        opener = urllib.request.build_opener(_RejectRedirects())
+        # The configured URL is validated above and redirects are disabled.
+        with opener.open(request, timeout=_LMSTUDIO_PROBE_TIMEOUT_S) as response:  # nosec B310
+            payload = json.load(response)
+        entries = payload["data"]
+        if not isinstance(entries, list):
+            return None
+        loaded_ids = [
+            entry["id"]
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("state") == "loaded"
+            and entry.get("type") in {"llm", "vlm"}
+            and isinstance(entry.get("id"), str)
+            and entry["id"]
         ]
-    except Exception as e:  # noqa: BLE001 — discovery is best-effort by design
-        logger.debug("LM Studio loaded-model probe failed: %s", e)
+        return sorted(loaded_ids)[0] if loaded_ids else None
+    except Exception as exc:
+        logger.debug("LM Studio loaded-model probe failed: %s", exc)
         return None
-    # Sorted for the same reason discover_model sorts: two runs on one machine
-    # must pick the same model when several are resident.
-    return sorted(loaded)[0] if loaded else None
 
 
 def discover_model(p: Provider) -> Optional[str]:
-    """Ask an OpenAI-compatible server which model it is actually serving.
-
-    Only used when we would otherwise send a placeholder. Never raises: a
-    server that is down or does not implement ``/v1/models`` leaves the caller
-    with the placeholder, which is exactly where it was before.
-
-    Both outcomes are cached — success for :data:`DISCOVERY_TTL_S`, failure for
-    :data:`DISCOVERY_FAILURE_TTL_S` — because this runs once per translated
-    segment, so an uncached failure costs a 5s timeout per segment.
-    """
+    """Best-effort model discovery with positive and negative caching."""
     hit, cached = _cached_discovery(p.id)
     if hit:
         return cached
@@ -347,55 +395,64 @@ def discover_model(p: Provider) -> Optional[str]:
         return None
 
     if p.id == "lmstudio":
-        loaded = _probe_lmstudio_loaded_model(base_url, resolve_api_key(p))
-        if loaded:
-            _DISCOVERED_MODEL[p.id] = (loaded, time.monotonic() + DISCOVERY_TTL_S)
-            return loaded
-        # /v1/models omits native types; opaque embedding IDs cannot be
-        # distinguished safely. Keep the user/default choice instead.
-        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
-        return None
+        loaded = _probe_lmstudio_loaded_model(base_url, resolve_api_key(p) or "local")
+        ttl = DISCOVERY_TTL_S if loaded else DISCOVERY_FAILURE_TTL_S
+        _DISCOVERED_MODEL[p.id] = (loaded, time.monotonic() + ttl)
+        return loaded
 
     try:
         from openai import OpenAI
 
-        # max_retries=0 + a short timeout: this runs in the request path, and a
-        # local server that is not running must fail fast rather than add the
-        # SDK's retry ladder to a translation the user is waiting on.
-        client = OpenAI(api_key=resolve_api_key(p) or "local",
-                        base_url=base_url, max_retries=0)
-        ids = [m.id for m in client.models.list(timeout=5)]
-    except Exception as e:  # noqa: BLE001 — discovery is best-effort by design
-        logger.debug("model discovery failed for %s: %s", p.id, e)
-        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
-        return None
-    if not ids:
+        client = OpenAI(
+            api_key=resolve_api_key(p) or "local",
+            base_url=base_url,
+            max_retries=0,
+        )
+        listed = client.models.list(timeout=5)
+        records = getattr(listed, "data", listed)
+        ids = [record.id for record in records if isinstance(getattr(record, "id", None), str)]
+    except Exception as exc:
+        logger.debug("Model discovery failed for %s: %s", p.id, exc)
         _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
         return None
 
-    # An embedding checkpoint cannot serve chat — picking one yields a 400 on
-    # every request — so never return them as a chat discovery result.
-    chat_ids = [mid for mid in ids if not any(k in mid.lower() for k in ("embed", "bert"))]
-    if not chat_ids:
+    candidates = [
+        model_id for model_id in ids
+        if "embed" not in model_id.lower() and "bert" not in model_id.lower()
+    ]
+    if not candidates:
         _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
         return None
-    candidate_ids = chat_ids
-
-    # Prefer a known instruct family over whatever else is loaded, then sort
-    # WITHIN the chosen bucket: deterministic rather than "whatever the server
-    # listed first", so two runs on the same machine pick the same model and a
-    # bug report is reproducible.
-    preferred = [mid for mid in candidate_ids if any(k in mid.lower() for k in ("qwen", "llama"))]
-    chosen = sorted(preferred or candidate_ids)[0]
-
+    preferred = [
+        model_id for model_id in candidates
+        if "qwen" in model_id.lower() or "llama" in model_id.lower()
+    ]
+    chosen = sorted(preferred or candidates)[0]
     if len(ids) > 1:
         logger.info(
             "%s has %d models loaded and no model is set in Settings; using %r. "
             "Pick one in Settings → LLM Providers to choose deliberately.",
-            p.display_name, len(ids), chosen,
+            p.display_name,
+            len(ids),
+            chosen,
         )
     _DISCOVERED_MODEL[p.id] = (chosen, time.monotonic() + DISCOVERY_TTL_S)
     return chosen
+
+
+def configured_model(p: Provider) -> str:
+    """Offline model setting for forms and inventory; blank means discovery.
+
+    Never put discovered IDs or the old LM Studio placeholder into an editable
+    form: saving that form would freeze automatic discovery to a stale model.
+    """
+    from services import settings_store
+    value = (
+        (p.model_env and os.environ.get(p.model_env))
+        or settings_store.get_text(_MODEL_KEY + p.id)
+        or p.default_model
+    ).strip()
+    return "" if p.model_is_placeholder and value == p.default_model else value
 
 
 def resolve_model(p: Provider) -> str:
@@ -404,19 +461,13 @@ def resolve_model(p: Provider) -> str:
     Discovery sits between the user's choice and the built-in default so it can
     never override an explicit setting, and only runs for providers whose
     default is a placeholder — everyone else keeps a pure, offline resolution.
-    For LM Studio, "discovered" means the model actually loaded in memory
-    (:func:`_probe_lmstudio_loaded_model`) rather than the alphabetically first
-    one the server lists — but it stays BELOW the stored override like every
-    other discovery: picking a model in Settings → LLM Providers has to win, or
-    the "pick one deliberately" line this module logs would be a lie. Probing
-    from here would also re-open the per-segment cost the discovery cache
-    exists to prevent (a 200-segment dub × one HTTP round trip each).
+
+    For LM Studio, discovery reports the model currently resident in memory,
+    rather than choosing the first advertised id. It remains below a stored
+    Settings choice, and its cache prevents repeating a network probe for every
+    segment in a large dub.
     """
-    from services import settings_store
-    explicit = (
-        (p.model_env and os.environ.get(p.model_env))
-        or settings_store.get_text(_MODEL_KEY + p.id)
-    )
+    explicit = configured_model(p)
     if explicit:
         return explicit
     if p.model_is_placeholder:
@@ -435,7 +486,7 @@ def resolve_api_key(p: Provider) -> Optional[str]:
     stored = settings_store.get_secret(SECRET_PREFIX + p.id)
     if stored:
         return stored
-    if p.local or (p.key_optional and resolve_base_url(p)):
+    if p.local or (p.transport == "openai" and p.key_optional and resolve_base_url(p)):
         return "local"  # self-hosted OpenAI-compatible servers ignore the key
     return None
 
@@ -446,7 +497,7 @@ def has_key(p: Provider) -> bool:
         return True
     if _env_first(p.key_envs) or _key_in_store(p.id):
         return True
-    return bool(p.key_optional and resolve_base_url(p))
+    return bool(p.transport == "openai" and p.key_optional and resolve_base_url(p))
 
 
 def _key_in_store(pid: str) -> bool:
@@ -454,11 +505,85 @@ def _key_in_store(pid: str) -> bool:
     return (SECRET_PREFIX + pid) in settings_store.list_secret_names()
 
 
+def credential_transport_error(p: Provider) -> Optional[str]:
+    """Never send provider credentials over remote plaintext transport."""
+    from ipaddress import ip_address
+    from urllib.parse import urlsplit
+
+    base = resolve_base_url(p)
+    if not base or p.transport == "cli":
+        return None
+    key = resolve_api_key(p)
+    if p.transport != "sdk" and (not key or key == "local"):
+        return None
+    try:
+        url = urlsplit(base)
+        if url.scheme == "https" and url.hostname:
+            return None
+        host = (url.hostname or "").lower()
+        loopback = host == "localhost"
+        if not loopback:
+            try:
+                loopback = ip_address(host).is_loopback
+            except ValueError:
+                pass
+        if url.scheme == "http" and loopback:
+            return None
+    except ValueError:
+        pass
+    return "Use HTTPS for a credentialed provider, or HTTP on localhost."
+
+
+def configuration_error(p: Provider, *, require_model: bool = True) -> Optional[str]:
+    """Check local configuration only; never claim a successful network probe."""
+    from urllib.parse import urlsplit
+
+    if p.transport == "cli":
+        from services.llm_cli import executable
+        return None if executable(p.sdk_provider) else "Install and sign in to the selected CLI, then restart VoiceStudio."
+    if p.transport == "sdk":
+        import importlib.util
+        if importlib.util.find_spec("litellm") is None:
+            return "Install the LiteLLM SDK in the VoiceStudio backend."
+        if require_model and not configured_model(p):
+            return "Set the Model in Settings > Models > LLM."
+        if p.id == "sdk" and require_model and "/" not in configured_model(p):
+            return "Use a provider/model identifier for LiteLLM."
+        if p.id == "vertex":
+            if not resolve_account_id(p):
+                return "Set the Vertex AI project as Account ID and configure Google application credentials."
+        elif p.id not in {"sdk", "bedrock"} and not has_key(p):
+            return "Add an API key in Settings > Models > LLM."
+        # Generic SDK and Bedrock also support provider environment keys and
+        # workload identities. The explicit Connect request validates them;
+        # catalogue/config checks must not initiate identity-network probes.
+        if not resolve_base_url(p):
+            return None
+
+    raw_url = resolve_base_url(p, substitute=False)
+    if "{account_id}" in raw_url and not resolve_account_id(p).strip():
+        return "Set the Account ID in Settings > Models > LLM."
+    try:
+        url = urlsplit(resolve_base_url(p))
+        valid_url = url.scheme in {"http", "https"} and bool(url.hostname)
+        # Access validates malformed/out-of-range ports too.
+        _ = url.port
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        return "Set a valid HTTP(S) Base URL in Settings > Models > LLM."
+    transport_error = credential_transport_error(p)
+    if transport_error:
+        return transport_error
+    if p.transport == "openai" and not has_key(p):
+        return "Add an API key in Settings > Models > LLM."
+    if require_model and not p.model_is_placeholder and not configured_model(p):
+        return "Set the Model in Settings > Models > LLM."
+    return None
+
+
 def is_configured(p: Provider) -> bool:
-    """Usable end-to-end: has a base_url (custom needs one set) and a key."""
-    if not resolve_base_url(p):
-        return False
-    return has_key(p)
+    return configuration_error(p) is None
 
 
 # ── Active provider selection ─────────────────────────────────────────────
@@ -496,7 +621,7 @@ def active_provider_id() -> Optional[str]:
     # LM Studio) are *always* "configured" (no key needed) but we must NOT
     # assume their server is running — they require an explicit selection.
     for p in _PROVIDERS:
-        if not p.local and is_configured(p):
+        if not p.local and p.transport != "cli" and has_key(p) and is_configured(p):
             return p.id
     return None
 
@@ -569,16 +694,23 @@ def describe(p: Provider) -> dict:
         "id": p.id,
         "display_name": p.display_name,
         "local": p.local,
+        "transport": p.transport,
+        "supports_model_listing": p.transport == "openai",
         "needs_account": p.needs_account,
         "signup_url": p.signup_url,
         "notes": p.notes,
         "base_url": resolve_base_url(p, substitute=False),
-        "model": resolve_model(p),
+        "model": configured_model(p),
         "has_key": has_key(p),
+        "has_api_key": bool(_env_first(p.key_envs) or _key_in_store(p.id)),
         "key_from_env": bool(_env_first(p.key_envs)),
         "base_url_from_env": bool(p.base_url_env and os.environ.get(p.base_url_env)),
         "model_from_env": bool(p.model_env and os.environ.get(p.model_env)),
         "active_from_env": _active_env_pin() is not None,
+        "activation_blocked": bool(
+            (_active_env_pin() and _active_env_pin() != p.id)
+            or os.environ.get("OMNIVOICE_LLM_BACKEND") not in (None, "", "openai-compat")
+        ),
         "configured": is_configured(p),
     }
     if p.needs_account:

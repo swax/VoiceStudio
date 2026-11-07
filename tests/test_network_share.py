@@ -1,4 +1,5 @@
 import socket
+from types import SimpleNamespace
 from unittest.mock import patch
 from services import network_share as ns
 
@@ -26,6 +27,29 @@ def test_gen_pin_is_six_digits():
     assert pin.isdigit() and len(pin) == 6
 
 
+def test_mcp_lan_hosts_exist_only_while_pin_gated_sharing_is_enabled():
+    security = SimpleNamespace(
+        allowed_hosts=["localhost:*", "10.0.0.9:*"],
+        allowed_origins=["http://localhost:*", "http://10.0.0.9:*"],
+    )
+    app = SimpleNamespace(state=SimpleNamespace(mcp_transport_security=security))
+    ns._runtime.mcp_allowed_hosts = []
+    try:
+        ns._set_mcp_lan_hosts(app, ["192.168.1.42", "10.0.0.9"], enabled=True)
+        assert "192.168.1.42:*" in security.allowed_hosts
+        assert "http://192.168.1.42:*" in security.allowed_origins
+        assert "https://10.0.0.9:*" in security.allowed_origins
+
+        ns._set_mcp_lan_hosts(app, [], enabled=False)
+        # Entries supplied independently (for example through
+        # OMNIVOICE_MCP_ALLOWED_HOSTS) survive the sharing lifecycle.
+        assert security.allowed_hosts == ["localhost:*", "10.0.0.9:*"]
+        assert security.allowed_origins == ["http://localhost:*", "http://10.0.0.9:*"]
+    finally:
+        ns._runtime.mcp_allowed_hosts = []
+        ns._runtime.mcp_allowed_origins = []
+
+
 # ── Configurable ports (issue: user-configurable network ports) ──────────────
 
 def test_backend_port_defaults_to_3900(monkeypatch):
@@ -39,8 +63,9 @@ def test_backend_port_honors_env(monkeypatch):
 
 
 def test_backend_port_bad_env_falls_back(monkeypatch):
-    monkeypatch.setenv("OMNIVOICE_PORT", "not-a-number")
-    assert ns.backend_port() == 3900
+    for value in ("", "not-a-number"):
+        monkeypatch.setenv("OMNIVOICE_PORT", value)
+        assert ns.backend_port() == 3900
 
 
 def test_share_port_base_defaults_to_backend_plus_one(monkeypatch):
@@ -147,3 +172,50 @@ def test_set_env_share_port_accepts_valid(monkeypatch):
     # Clean up the process-level env mutation so other tests aren't affected.
     import os
     os.environ.pop("OMNIVOICE_SHARE_PORT", None)
+
+
+def test_system_info_reports_no_ui_port_for_the_packaged_desktop(monkeypatch):
+    """The packaged app serves app://voicestudio; there is no UI port to show."""
+    for name in ("OMNIVOICE_UI_PORT", "VOICESTUDIO_UI_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OMNIVOICE_DESKTOP_CONTAINED", "1")
+    assert _loopback_client().get("/system/info").json()["ui_port"] is None
+
+    # The Electron dev shell passes its renderer port explicitly.
+    monkeypatch.setenv("OMNIVOICE_UI_PORT", "3902")
+    assert _loopback_client().get("/system/info").json()["ui_port"] == 3902
+
+
+def test_system_info_reports_the_ui_port_alias(monkeypatch):
+    monkeypatch.delenv("OMNIVOICE_UI_PORT", raising=False)
+    monkeypatch.delenv("OMNIVOICE_DESKTOP_CONTAINED", raising=False)
+    monkeypatch.setenv("VOICESTUDIO_UI_PORT", "4100")
+    assert _loopback_client().get("/system/info").json()["ui_port"] == 4100
+
+
+def test_ports_bound_by_other_processes_are_not_persisted():
+    """The desktop shell, dev script and Docker bind these from their own
+    environment; a saved value only made the backend misreport its ports."""
+    c = _loopback_client()
+    for key in ("OMNIVOICE_PORT", "OMNIVOICE_UI_PORT"):
+        r = c.post("/system/set-env", json={"key": key, "value": "4000"})
+        assert r.status_code == 400
+
+
+def test_stale_saved_bound_ports_are_not_restored(monkeypatch):
+    from core import prefs
+
+    for key in ("OMNIVOICE_PORT", "OMNIVOICE_UI_PORT", "OMNIVOICE_SHARE_PORT"):
+        monkeypatch.delenv(key, raising=False)
+    prefs.restore_env({
+        "env.OMNIVOICE_PORT": "4000",
+        "env.OMNIVOICE_UI_PORT": "4100",
+        "env.OMNIVOICE_SHARE_PORT": "5050",
+    })
+    import os
+    try:
+        assert "OMNIVOICE_PORT" not in os.environ
+        assert "OMNIVOICE_UI_PORT" not in os.environ
+        assert os.environ["OMNIVOICE_SHARE_PORT"] == "5050"
+    finally:
+        os.environ.pop("OMNIVOICE_SHARE_PORT", None)

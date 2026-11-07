@@ -4,16 +4,14 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { KeyboardIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
 import { apiJson } from '@/lib/api/client';
 import {
   dictationPreferencesKey,
   nativeShortcutKey,
   useDictationPreferences,
 } from '@/hooks/use-native-dictation';
-import {
-  keyEventToAccelerator,
-  isPureModifierEvent,
-} from '@shared/utils/shortcutAccelerator';
+import { keyEventToAccelerator, isPureModifierEvent } from '@shared/utils/shortcutAccelerator';
 import { SettingsSection, SettingsRow } from './settings-layout';
 
 export function ShortcutSettings() {
@@ -32,6 +30,12 @@ export function ShortcutSettings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
   const [verifiedShortcut, setVerifiedShortcut] = useState<string | null>(null);
+  // `hintDraft` is null whenever the field simply mirrors the stored hint, so a
+  // refreshed stored value shows through; it holds text only for a real, unsaved edit.
+  const [hintDraft, setHintDraft] = useState<string | null>(null);
+  const [hintSaveFailed, setHintSaveFailed] = useState(false);
+  const storedHint = prefs.data?.prompt ?? '';
+  const hint = hintDraft ?? storedHint;
   useEffect(() => api?.onShortcutPressed?.(setVerifiedShortcut), [api]);
   useEffect(() => {
     if (!recording) return;
@@ -95,6 +99,23 @@ export function ShortcutSettings() {
       setBusy(false);
     }
   };
+  const storeHint = async () => {
+    setBusy(true);
+    setHintSaveFailed(false);
+    const request = apiJson('/dictation/prefs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: hint }),
+    });
+    try {
+      await request;
+      await client.invalidateQueries({ queryKey: dictationPreferencesKey });
+      setHintDraft(null);
+    } catch {
+      setHintSaveFailed(true);
+    }
+    setBusy(false);
+  };
   return (
     <>
       <DictationDemo />
@@ -116,6 +137,34 @@ export function ShortcutSettings() {
               {t('voicePanel.mode_' + value)}
             </Button>
           ))}
+        </SettingsRow>
+        <SettingsRow
+          id="dictation-prompt"
+          title={t('voicePanel.prompt_label')}
+          description={t('voicePanel.prompt_sub')}
+        >
+          <Textarea
+            aria-labelledby="dictation-prompt"
+            maxLength={1000}
+            className="min-h-20 w-full @2xl:w-96"
+            value={hint}
+            disabled={busy || !prefs.data}
+            onChange={(event) =>
+              setHintDraft(event.target.value === storedHint ? null : event.target.value)
+            }
+          />
+          <Button
+            size="sm"
+            disabled={busy || !prefs.data || hint.trim() === storedHint}
+            onClick={() => void storeHint()}
+          >
+            {t('common.save')}
+          </Button>
+          {hintSaveFailed && (
+            <span role="alert" className="text-xs text-destructive">
+              {t('common.error')}
+            </span>
+          )}
         </SettingsRow>
         {api && (
           <>

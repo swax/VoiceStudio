@@ -82,10 +82,10 @@ describe('short-lived admin session client', () => {
       }),
     );
     expect(localStorage.getItem(LEGACY_API_KEY_STORAGE_KEY)).toBeNull();
-    expect(sessionStorage.length).toBe(0);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
   });
 
-  it('stores only a backend-bound short-lived bearer session for cross-origin clients', async () => {
+  it('stores only a backend-bound bearer session that survives reloads and new tabs', async () => {
     localStorage.setItem(LEGACY_API_KEY_STORAGE_KEY, MASTER);
     const fetchImpl = vi
       .fn()
@@ -100,11 +100,18 @@ describe('short-lived admin session client', () => {
       }),
     ).resolves.toEqual({ transport: 'bearer', expiresAt: NOW_SECONDS + 3600 });
 
-    const persisted = sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ?? '';
+    const persisted = localStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ?? '';
     expect(persisted).toContain(SESSION);
     expect(persisted).toContain('https://gpu.test:3900');
     expect(persisted).not.toContain(MASTER);
     expect(localStorage.getItem(LEGACY_API_KEY_STORAGE_KEY)).toBeNull();
+    expect(getAdminSession('https://gpu.test:3900', { now: () => NOW_SECONDS * 1000 })).toEqual({
+      token: SESSION,
+      expiresAt: NOW_SECONDS + 3600,
+      apiBase: 'https://gpu.test:3900',
+    });
+
+    sessionStorage.clear();
     expect(getAdminSession('https://gpu.test:3900', { now: () => NOW_SECONDS * 1000 })).toEqual({
       token: SESSION,
       expiresAt: NOW_SECONDS + 3600,
@@ -178,9 +185,173 @@ describe('short-lived admin session client', () => {
     expect(String(error)).not.toContain(MASTER);
     expect(String(error)).not.toContain(reflected);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(sessionStorage.length).toBe(0);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
     // A failed exchange leaves the durable key for the next launch's retry.
     expect(localStorage.getItem(LEGACY_API_KEY_STORAGE_KEY)).toBe(MASTER);
+  });
+
+  it('preserves another tab session when an exchange fails', async () => {
+    const existing = {
+      token: `${SESSION}-existing`,
+      expiresAt: NOW_SECONDS + 1800,
+      apiBase: 'https://gpu.test:3900',
+    };
+    localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, JSON.stringify(existing));
+    const fetchImpl = vi.fn().mockResolvedValue(response(null, 401));
+
+    await expect(
+      exchangeApiKey(MASTER, {
+        apiBase: 'https://gpu.test:3900',
+        fetchImpl,
+        windowLike: crossOriginWindow,
+        now: () => NOW_SECONDS * 1000,
+      }),
+    ).rejects.toBeInstanceOf(AuthSessionError);
+
+    expect(JSON.parse(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ?? '')).toEqual(existing);
+  });
+
+  it('preserves a newer bearer session when an earlier cookie exchange succeeds', async () => {
+    let resolveFetch: (value: Response) => void = () => {};
+    const fetchImpl = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    const pending = exchangeApiKey(MASTER, {
+      apiBase: 'https://voice.test',
+      fetchImpl,
+      windowLike: sameOriginWindow,
+    });
+    const newer = {
+      token: `${SESSION}-newer`,
+      expiresAt: NOW_SECONDS + 1800,
+      apiBase: 'https://gpu.test:3900',
+    };
+    localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, JSON.stringify(newer));
+
+    resolveFetch(response(null, 204));
+    await pending;
+
+    expect(JSON.parse(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY) ?? '')).toEqual(newer);
+  });
+
+  it('rejects an older bearer response instead of replacing a newer session', async () => {
+    let resolveOlder: (value: Response) => void = () => {};
+    const olderFetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveOlder = resolve;
+        }),
+    );
+    const older = exchangeApiKey(MASTER, {
+      apiBase: 'https://old-gpu.test:3900',
+      fetchImpl: olderFetch,
+      windowLike: crossOriginWindow,
+      now: () => NOW_SECONDS * 1000,
+    });
+    const observedOlder = older.catch((error) => error);
+    const newerToken = `ovs_admin_session_${'N'.repeat(43)}`;
+
+    await expect(
+      exchangeApiKey(MASTER, {
+        apiBase: 'https://new-gpu.test:3900',
+        fetchImpl: vi
+          .fn()
+          .mockResolvedValue(response({ token: newerToken, expires_at: NOW_SECONDS + 3600 })),
+        windowLike: crossOriginWindow,
+        now: () => NOW_SECONDS * 1000,
+      }),
+    ).resolves.toEqual({ transport: 'bearer', expiresAt: NOW_SECONDS + 3600 });
+
+    resolveOlder(response({ token: SESSION, expires_at: NOW_SECONDS + 3600 }));
+    expect(await observedOlder).toBeInstanceOf(AuthSessionError);
+    expect(getAdminSession('https://new-gpu.test:3900', { now: () => NOW_SECONDS * 1000 })).toEqual({
+      token: newerToken,
+      expiresAt: NOW_SECONDS + 3600,
+      apiBase: 'https://new-gpu.test:3900',
+    });
+  });
+
+  it('accepts a bearer response when another tab only cleaned the expired snapshot', async () => {
+    const expiringToken = `ovs_admin_session_${'E'.repeat(43)}`;
+    localStorage.setItem(
+      ADMIN_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        token: expiringToken,
+        expiresAt: NOW_SECONDS + 1,
+        apiBase: 'https://old-gpu.test:3900',
+      }),
+    );
+    let currentTime = NOW_SECONDS * 1000;
+    let resolveFetch: (value: Response) => void = () => {};
+    const pending = exchangeApiKey(MASTER, {
+      apiBase: 'https://new-gpu.test:3900',
+      fetchImpl: vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+      windowLike: crossOriginWindow,
+      now: () => currentTime,
+    });
+
+    currentTime += 2000;
+    expect(
+      getAdminSession('https://old-gpu.test:3900', {
+        now: () => currentTime,
+      }),
+    ).toBeNull();
+    resolveFetch(response({ token: SESSION, expires_at: NOW_SECONDS + 3600 }));
+
+    await expect(pending).resolves.toEqual({
+      transport: 'bearer',
+      expiresAt: NOW_SECONDS + 3600,
+    });
+    expect(getAdminSession('https://new-gpu.test:3900', { now: () => currentTime })).toEqual({
+      token: SESSION,
+      expiresAt: NOW_SECONDS + 3600,
+      apiBase: 'https://new-gpu.test:3900',
+    });
+  });
+
+  it('rejects a pending exchange when disable intentionally invalidates an expired session', async () => {
+    localStorage.setItem(
+      ADMIN_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        token: `ovs_admin_session_${'E'.repeat(43)}`,
+        expiresAt: NOW_SECONDS + 1,
+        apiBase: 'https://old-gpu.test:3900',
+      }),
+    );
+    let currentTime = NOW_SECONDS * 1000;
+    let resolveFetch: (value: Response) => void = () => {};
+    const pending = exchangeApiKey(MASTER, {
+      apiBase: 'https://new-gpu.test:3900',
+      fetchImpl: vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+      windowLike: crossOriginWindow,
+      now: () => currentTime,
+    });
+    const observed = pending.catch((error) => error);
+
+    currentTime += 2000;
+    await expect(
+      revokeAdminSession('https://old-gpu.test:3900', {
+        fetchImpl: vi.fn(),
+        now: () => currentTime,
+      }),
+    ).resolves.toBe(true);
+    resolveFetch(response({ token: SESSION, expires_at: NOW_SECONDS + 3600 }));
+
+    expect(await observed).toBeInstanceOf(AuthSessionError);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
   });
 
   it('bounds a hung exchange and retains the durable master for the next migration attempt', async () => {
@@ -208,7 +379,7 @@ describe('short-lived admin session client', () => {
     expect(fetchImpl).toHaveBeenCalledOnce();
     // Unreachable/hung backend: the stored copy is the user's only copy.
     expect(localStorage.getItem(LEGACY_API_KEY_STORAGE_KEY)).toBe(MASTER);
-    expect(sessionStorage.length).toBe(0);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
     vi.useRealTimers();
   });
 
@@ -229,7 +400,7 @@ describe('short-lived admin session client', () => {
         now: () => NOW_SECONDS * 1000,
       }),
     ).rejects.toBeInstanceOf(AuthSessionError);
-    expect(sessionStorage.length).toBe(0);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
   });
 
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 40_000, '3600'])(
@@ -251,7 +422,7 @@ describe('short-lived admin session client', () => {
           now: () => NOW_SECONDS * 1000,
         }),
       ).rejects.toBeInstanceOf(AuthSessionError);
-      expect(sessionStorage.length).toBe(0);
+      expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
     },
   );
 
@@ -271,20 +442,20 @@ describe('short-lived admin session client', () => {
         now: () => NOW_SECONDS * 1000,
       }),
     ).rejects.toBeInstanceOf(AuthSessionError);
-    expect(sessionStorage.length).toBe(0);
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
   });
 
   it('drops malformed, expired, or wrong-backend session storage', () => {
-    sessionStorage.setItem(ADMIN_SESSION_STORAGE_KEY, '{bad json');
+    localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, '{bad json');
     expect(getAdminSession('https://gpu.test', { now: () => NOW_SECONDS * 1000 })).toBeNull();
 
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({ token: SESSION, expiresAt: NOW_SECONDS - 1, apiBase: 'https://gpu.test' }),
     );
     expect(getAdminSession('https://gpu.test', { now: () => NOW_SECONDS * 1000 })).toBeNull();
 
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -293,8 +464,9 @@ describe('short-lived admin session client', () => {
       }),
     );
     expect(getAdminSession('https://gpu.test', { now: () => NOW_SECONDS * 1000 })).toBeNull();
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toContain('https://other.test');
 
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -303,11 +475,11 @@ describe('short-lived admin session client', () => {
       }),
     );
     expect(getAdminSession('https://gpu.test', { now: () => NOW_SECONDS * 1000 })).toBeNull();
-    expect(sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
   });
 
   it('mints a path-bound WebSocket ticket with the session only in an HTTP header', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -339,7 +511,7 @@ describe('short-lived admin session client', () => {
   });
 
   it('accepts a ticket lifetime independent of server wall-clock skew', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -361,7 +533,7 @@ describe('short-lived admin session client', () => {
   });
 
   it('places only the one-use ticket in a bearer-authenticated WebSocket URL', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -386,7 +558,7 @@ describe('short-lived admin session client', () => {
   });
 
   it('preserves a reverse-proxy base path while binding the ticket to the logical WS route', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -421,7 +593,7 @@ describe('short-lived admin session client', () => {
   );
 
   it('requests a fresh ticket for every WebSocket connection attempt', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -463,7 +635,7 @@ describe('short-lived admin session client', () => {
   });
 
   it('clears an invalid session and raises the auth gate when ticket issuance is rejected', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -488,17 +660,54 @@ describe('short-lived admin session client', () => {
     );
   });
 
+  it('keeps a replacement session when an older ticket request is rejected late', async () => {
+    const replacement = `ovs_admin_session_${'C'.repeat(43)}`;
+    localStorage.setItem(
+      ADMIN_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        token: SESSION,
+        expiresAt: NOW_SECONDS + 3600,
+        apiBase: 'https://gpu.test:3900',
+      }),
+    );
+    let resolveFetch: (response: Response) => void = () => {};
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => (resolveFetch = resolve)));
+    const windowLike = { ...crossOriginWindow, dispatchEvent: vi.fn() };
+    const pending = requestWebSocketTicket('/ws/events', {
+      apiBase: 'https://gpu.test:3900',
+      fetchImpl,
+      windowLike,
+      now: () => NOW_SECONDS * 1000,
+    });
+
+    localStorage.setItem(
+      ADMIN_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        token: replacement,
+        expiresAt: NOW_SECONDS + 3600,
+        apiBase: 'https://gpu.test:3900',
+      }),
+    );
+    resolveFetch(response({ detail: 'expired' }, 401));
+    await expect(pending).rejects.toBeInstanceOf(AuthSessionError);
+
+    expect(getAdminSession('https://gpu.test:3900', { now: () => NOW_SECONDS * 1000 })?.token).toBe(
+      replacement,
+    );
+    expect(windowLike.dispatchEvent).not.toHaveBeenCalled();
+  });
+
   it('clears session state idempotently without touching unrelated storage', () => {
-    sessionStorage.setItem(ADMIN_SESSION_STORAGE_KEY, 'value');
-    sessionStorage.setItem('unrelated', 'keep');
+    localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, 'value');
+    localStorage.setItem('unrelated', 'keep');
     clearAdminSession();
     clearAdminSession();
-    expect(sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
-    expect(sessionStorage.getItem('unrelated')).toBe('keep');
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem('unrelated')).toBe('keep');
   });
 
   it('revokes a bearer session while clearing local state before the request settles', async () => {
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({
         token: SESSION,
@@ -514,7 +723,7 @@ describe('short-lived admin session client', () => {
       now: () => NOW_SECONDS * 1000,
     });
 
-    expect(sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
+    expect(localStorage.getItem(ADMIN_SESSION_STORAGE_KEY)).toBeNull();
     expect(fetchImpl).toHaveBeenCalledWith(
       'https://gpu.test:3900/api/auth/session',
       expect.objectContaining({
@@ -525,6 +734,44 @@ describe('short-lived admin session client', () => {
     );
     resolveFetch(response(null, 204));
     await expect(pending).resolves.toBe(true);
+  });
+
+  it('preserves a replacement session while revoking the captured session', async () => {
+    const original = JSON.stringify({
+      token: SESSION,
+      expiresAt: NOW_SECONDS + 3600,
+      apiBase: 'https://gpu.test:3900',
+    });
+    const replacement = JSON.stringify({
+      token: `${SESSION.slice(0, -1)}B`,
+      expiresAt: NOW_SECONDS + 3600,
+      apiBase: 'https://backup.test:3900',
+    });
+    let current: string | null = original;
+    const storage = {
+      getItem: vi
+        .fn()
+        .mockImplementationOnce(() => {
+          current = replacement;
+          return original;
+        })
+        .mockImplementation(() => current),
+      setItem: vi.fn(),
+      removeItem: vi.fn(() => {
+        current = null;
+      }),
+    };
+
+    await expect(
+      revokeAdminSession('https://gpu.test:3900', {
+        fetchImpl: vi.fn().mockResolvedValue(response(null, 204)),
+        storage,
+        now: () => NOW_SECONDS * 1000,
+      }),
+    ).resolves.toBe(true);
+
+    expect(current).toBe(replacement);
+    expect(storage.removeItem).not.toHaveBeenCalled();
   });
 
   it('revokes a same-origin cookie session with the CSRF marker', async () => {

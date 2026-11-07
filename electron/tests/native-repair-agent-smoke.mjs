@@ -14,6 +14,8 @@ const executable =
         'electron/node_modules/electron/dist',
         process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : 'electron',
       );
+const launchEnvironment = { ...process.env };
+delete launchEnvironment.ELECTRON_RUN_AS_NODE;
 const app = await electron.launch({
   executablePath: executable,
   args: [
@@ -21,9 +23,9 @@ const app = await electron.launch({
     '--user-data-dir=' + mkdtempSync(join(tmpdir(), 'voicestudio-repair-')),
   ],
   env: {
-    ...process.env,
+    ...launchEnvironment,
     ELECTRON_RENDERER_URL: '',
-    VOICESTUDIO_ELECTRON_PROXY_PORT: '49303',
+    VOICESTUDIO_ELECTRON_PROXY_PORT: '0',
     VOICESTUDIO_SKIP_BACKEND: '1',
     VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES: '1',
   },
@@ -31,6 +33,7 @@ const app = await electron.launch({
 
 try {
   const page = await app.firstWindow();
+  page.setDefaultTimeout(15000);
   await page.waitForFunction(() => Boolean(window.voicestudio?.repair));
   const state = await page.evaluate(() => window.voicestudio.repair.getState());
   assert.equal(state.workspaceAvailable, true);
@@ -46,7 +49,7 @@ try {
   await page.evaluate(() => {
     window.location.hash = '/settings/updates';
   });
-  const launcher = page.getByRole('button', { name: 'Repair with an agent' });
+  const launcher = page.getByRole('button', { name: 'Ask VoiceStudio Agent' });
   const launcherBounds = await launcher.boundingBox();
   const viewport = await page.evaluate(() => ({
     width: window.innerWidth,
@@ -57,13 +60,18 @@ try {
   assert.ok(viewport.width - launcherBounds.x - launcherBounds.width >= 12);
   assert.ok(viewport.width - launcherBounds.x - launcherBounds.width <= 20);
   await launcher.click();
-  await page.getByRole('region', { name: 'Repair with an agent' }).waitFor();
+  await page.getByRole('region', { name: 'Ask VoiceStudio Agent' }).waitFor();
   for (const agent of agents) {
     const choice = page.getByRole('button', { name: agent.label, exact: true });
     await choice.waitFor();
     assert.equal(await choice.isDisabled(), !agent.available);
   }
 
+  await page.getByRole('button', { name: 'Autopilot', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Audiobook', exact: true }).click();
+  assert.ok((await page.getByRole('textbox').inputValue()).includes('Audiobook'));
+  assert.equal(await page.getByRole('button', { name: 'Send', exact: true }).isEnabled(), true);
+  if (process.env.VOICESTUDIO_AGENT_SCREENSHOT) await page.screenshot({ path: process.env.VOICESTUDIO_AGENT_SCREENSHOT });
   await page.evaluate(() => localStorage.setItem('voicestudio.locale', 'fr'));
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.getByText('Canal de mise à jour', { exact: true }).first().waitFor();

@@ -15,41 +15,29 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from core.browser_guard import reject_cross_site_get
 
 logger = logging.getLogger("omnivoice.setup.models")
 router = APIRouter()
 
-# ── Model Catalog (loaded from YAML) ──────────────────────────────────────
+# ── Model Catalog (loaded from YAML; services/model_catalogue.py) ─────────
 
-_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "models.yaml"
+from services.model_catalogue import (  # noqa: F401 — re-exported API
+    KNOWN_MODELS,
+    _hub_cache_roots,
+    _repo_dir_name,
+    _snapshot_dirs,
+    hf_cache_dir,
+    model_key,
+    package_cache_usage,
+    shares_repo,
+    snapshot_is_complete,
+)
 
-
-def _load_models_from_yaml() -> list[dict]:
-    """Load model catalog from config/models.yaml.
-
-    Falls back to an empty list if the file is missing or unreadable.
-    The YAML file is read once at import time — restart to pick up edits.
-    """
-    try:
-        import yaml  # PyYAML is already a transitive dep of huggingface_hub
-        with open(_YAML_PATH, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        models = data.get("models", [])
-        logger.info("Loaded %d models from %s", len(models), _YAML_PATH)
-        return models
-    except FileNotFoundError:
-        logger.warning("models.yaml not found at %s — using empty catalog", _YAML_PATH)
-        return []
-    except Exception:
-        logger.exception("Failed to load models.yaml — using empty catalog")
-        return []
-
-
-KNOWN_MODELS = _load_models_from_yaml()
 
 # Back-compat tuple view for code that expects (repo_id, label) pairs.
-REQUIRED_MODELS = [(m["repo_id"], m["label"]) for m in KNOWN_MODELS if m.get("required")]
+REQUIRED_MODELS = [(model_key(m), m["label"]) for m in KNOWN_MODELS if m.get("required")]
 
 
 # ── Dependency Injection ───────────────────────────────────────────────────
@@ -61,11 +49,12 @@ class ModelCatalog:
 
     def __init__(self, models: list[dict] | None = None):
         self.models = models if models is not None else KNOWN_MODELS
-        self._by_id = {m["repo_id"]: m for m in self.models}
-        self._required = [(m["repo_id"], m["label"]) for m in self.models if m.get("required")]
+        self._by_id = {model_key(m): m for m in self.models}
+        self._required = [(model_key(m), m["label"]) for m in self.models if m.get("required")]
 
-    def get(self, repo_id: str) -> dict | None:
-        return self._by_id.get(repo_id)
+    def get(self, key: str) -> dict | None:
+        """Entry by catalogue identity (the repo id for whole-repo entries)."""
+        return self._by_id.get(key)
 
     @property
     def required(self) -> list[tuple[str, str]]:
@@ -90,36 +79,6 @@ def get_model_catalog() -> ModelCatalog:
 
 # ── Platform Detection ─────────────────────────────────────────────────────
 
-def _target_worker():
-    """Selected live remote worker, or None when the catalog targets local."""
-    try:
-        from worker import routing, service  # noqa: PLC0415
-
-        decision = routing.decide()
-        plane = service.control_plane
-        return plane.pool.get(decision.worker_id) if decision.remote and plane.pool else None
-    except Exception:
-        return None
-
-
-def _target_host() -> dict | None:
-    """Selected remote worker host, or None when the catalog targets local."""
-    live = _target_worker()
-    return dict(live.record.host or {}) if live is not None else None
-
-
-def _target_repo_inventory() -> tuple[str, set[str]] | None:
-    """Selected worker id and the catalog repositories it reports on disk."""
-    live = _target_worker()
-    if live is None:
-        return None
-    downloaded: set[str] = set()
-    for capability in live.record.capabilities or []:
-        if capability.get("downloaded"):
-            downloaded.update(str(repo) for repo in capability.get("repo_ids") or [])
-    return live.worker_id, downloaded
-
-
 def _current_platform_tags() -> list[str]:
     """Return platform tags that the current host supports.
 
@@ -130,25 +89,6 @@ def _current_platform_tags() -> list[str]:
     ``rocm`` (AMD HIP builds), and ``cpu`` (no GPU acceleration at all —
     Apple Silicon is NOT tagged cpu; it curates via ``darwin-arm64``).
     """
-    target = _target_host()
-    if target is not None:
-        target_os = {"windows": "win32", "darwin": "darwin"}.get(
-            str(target.get("os") or "").lower(), "linux"
-        )
-        arch = str(target.get("arch") or "").lower()
-        arch = {"amd64": "x86_64", "aarch64": "arm64"}.get(arch, arch)
-        tags = [target_os, f"{target_os}-{arch}"]
-        backend = ""
-        if target.get("gpus"):
-            backend = str(target["gpus"][0].get("backend") or "").lower()
-        if backend:
-            tags.append(backend)
-            if backend == "rocm":
-                tags.append("cuda")
-        if not backend and not (target_os == "darwin" and arch == "arm64"):
-            tags.append("cpu")
-        return tags
-
     tags = [sys.platform]
     arch = _platform.machine()
     tags.append(f"{sys.platform}-{arch}")
@@ -207,15 +147,6 @@ def _model_curated(model: dict, tags: "set[str] | None" = None) -> bool:
 
 # ── HF Cache Helpers ───────────────────────────────────────────────────────
 
-def hf_cache_dir() -> str:
-    return (
-        os.environ.get("HF_HUB_CACHE")
-        or os.environ.get("HUGGINGFACE_HUB_CACHE")
-        or os.environ.get("HF_HOME")
-        or os.path.expanduser("~/.cache/huggingface")
-    )
-
-
 # ── Disk-space guard (shared, single-sourced) ──────────────────────────────
 # MIN_FREE_GB is the headroom we insist on keeping free on the model-cache
 # volume — the wizard's absolute pre-install floor AND the extra buffer the
@@ -225,6 +156,10 @@ def hf_cache_dir() -> str:
 # install endpoint can't drift apart (mirrors the weight-floor single-sourcing).
 _GIB = 1024 ** 3
 MIN_FREE_GB = 10
+# Headroom the per-install check keeps free on top of the download, and the
+# preflight's hard floor. Smaller than MIN_FREE_GB (the comfortable-library
+# warning level) so a small model still installs on a nearly full disk.
+INSTALL_HEADROOM_GB = 2
 
 
 def disk_free_bytes(path: "str | None" = None) -> int:
@@ -248,7 +183,7 @@ def disk_free_bytes(path: "str | None" = None) -> int:
 
 
 def disk_space_error(to_download_bytes: "int | None", *, cache_dir: "str | None" = None) -> "str | None":
-    """Actionable message when *to_download_bytes* (+ MIN_FREE_GB headroom) won't
+    """Actionable message when *to_download_bytes* (+ INSTALL_HEADROOM_GB) won't
     fit on the cache volume; ``None`` when it fits, the size is unknown, or the
     volume can't be probed (never block on missing information).
 
@@ -262,7 +197,7 @@ def disk_space_error(to_download_bytes: "int | None", *, cache_dir: "str | None"
     free = disk_free_bytes(cache)
     if free <= 0:
         return None  # couldn't probe the volume → don't block on missing info
-    required = int(to_download_bytes) + MIN_FREE_GB * _GIB
+    required = int(to_download_bytes) + INSTALL_HEADROOM_GB * _GIB
     if free >= required:
         return None
 
@@ -271,122 +206,22 @@ def disk_space_error(to_download_bytes: "int | None", *, cache_dir: "str | None"
 
     return (
         f"Not enough disk space to install: this download needs {_gb(int(to_download_bytes))} "
-        f"plus {MIN_FREE_GB} GB free headroom ({_gb(required)} total), but only {_gb(free)} "
+        f"plus {INSTALL_HEADROOM_GB} GB free headroom ({_gb(required)} total), but only {_gb(free)} "
         f"is free at {cache}. Free up space (or move the model cache to a bigger volume) and retry."
     )
 
 
-def _repo_dir_name(repo_id: str) -> str:
-    """HF cache dir name for a repo: 'k2-fsa/OmniVoice' → 'models--k2-fsa--OmniVoice'."""
-    return "models--" + repo_id.replace("/", "--")
-
-
-def _hub_cache_roots() -> list[str]:
-    """Candidate roots that directly contain ``models--*`` dirs.
-
-    HF stores repos under ``$HF_HUB_CACHE`` (== ``$HF_HOME/hub`` by default). When
-    only ``HF_HOME`` (or the ``~/.cache/huggingface`` default) is known, the repos
-    live under the ``hub`` subdir — so we probe both ``<dir>`` (the
-    ``HF_HUB_CACHE``-is-set case, e.g. VoiceStudio's Windows short cache) and
-    ``<dir>/hub`` (the ``HF_HOME``-only case). Without this the WinError-448
-    fallback would look one level too high and miss the cache (CodeRabbit #137).
-    """
-    base = hf_cache_dir()
-    roots = [base]
-    hub = os.path.join(base, "hub")
-    if hub not in roots:
-        roots.append(hub)
-    return roots
-
-
-# ── Weight-presence (truncated-cache) detection ─────────────────────────────
-# A cache that downloaded config/tokenizer files but not the weight shard still
-# occupies bytes on disk, so a size-only "installed" check (#352/#581/#606) reads
-# it as installed and the first-run wizard hides the re-download button, stranding
-# the user (#622). These helpers tell a *complete* snapshot from a truncated one by
-# checking for a plausible weight file — the same class `download.py` guards at
-# install time and `model_manager.py` repairs at load time. Shared here (the lowest
-# module in the setup import graph; `download.py` imports from this module) so the
-# floors live in exactly one place and can't drift between the three call sites.
-
-_MIN_WEIGHT_BYTES = 5 * 1024 * 1024  # tensor formats: a real shard is ≥ a few MB
-
-# Per-extension floors. ONNX graphs are legitimately small (a complete model can be
-# well under 5 MB), so they get a lower floor that still rejects a bytes-only partial.
-_WEIGHT_FLOORS = {
-    ".safetensors": _MIN_WEIGHT_BYTES,
-    ".bin": _MIN_WEIGHT_BYTES,
-    ".ckpt": _MIN_WEIGHT_BYTES,
-    ".pt": _MIN_WEIGHT_BYTES,
-    ".pth": _MIN_WEIGHT_BYTES,
-    ".gguf": _MIN_WEIGHT_BYTES,
-    ".onnx": 64 * 1024,
-}
-
-
-def snapshot_has_weights(snapshot_path: str) -> bool:
-    """True when a finished snapshot dir holds a plausible weight file.
-
-    A snapshot is complete if it contains a recognized weight file meeting its
-    per-extension floor OR any file ≥ the global 5 MB floor (the lenient catch for
-    non-standard weight names). Returns True when the path can't be inspected — an
-    un-walkable dir must never be reported as truncated, only a confirmed weight-less
-    one. `getsize` follows symlinks, so HF's snapshot→blob links resolve correctly;
-    a broken link (missing blob) raises OSError and is skipped, i.e. counts as absent.
-    """
-    try:
-        for root, _dirs, files in os.walk(snapshot_path, followlinks=True):
-            for f in files:
-                try:
-                    size = os.path.getsize(os.path.join(root, f))
-                except OSError:
-                    continue
-                ext = os.path.splitext(f)[1].lower()
-                floor = _WEIGHT_FLOORS.get(ext)
-                if floor is not None and size >= floor:
-                    return True
-                if size >= _MIN_WEIGHT_BYTES:
-                    return True
-    except OSError:
-        return True  # can't inspect — don't mislabel as truncated
-    return False
-
-
-def _snapshot_dirs(repo_id: str) -> list[str]:
-    """Existing snapshot revision dirs for a repo across the candidate cache roots."""
-    name = _repo_dir_name(repo_id)
-    dirs: list[str] = []
-    for root in _hub_cache_roots():
-        snaps = os.path.join(root, name, "snapshots")
-        try:
-            for rev in os.listdir(snaps):
-                rev_dir = os.path.join(snaps, rev)
-                if os.path.isdir(rev_dir):
-                    dirs.append(rev_dir)
-        except OSError:
-            continue
-    return dirs
-
-
-def snapshot_is_complete(model: dict, snapshot_path: str) -> bool:
-    """Apply the same catalogue requirements during installation and listing."""
-    config_only = bool(model.get("config_only"))
-    required = tuple(str(name) for name in (
-        model.get("config_required_files") if config_only else model.get("required_files")
-    ) or ())
-    if config_only and not required:
-        return False
-    try:
-        present = all(
-            os.path.isfile(os.path.join(snapshot_path, name))
-            and os.path.getsize(os.path.join(snapshot_path, name)) >= (
-                1 if config_only else _WEIGHT_FLOORS.get(os.path.splitext(name)[1].lower(), 1)
-            )
-            for name in required
-        )
-        return present and (config_only or snapshot_has_weights(snapshot_path))
-    except OSError:
-        return False
+def disk_full_message(*, cache_dir: "str | None" = None) -> str:
+    """Actionable text for a download that ran out of space *mid-flight*
+    (the preflight guard can't see other writers or an unknown plan size)."""
+    cache = cache_dir or hf_cache_dir()
+    free = disk_free_bytes(cache)
+    have = f"only {free / _GIB:.1f} GB is free" if free > 0 else "the disk is full"
+    return (
+        f"The disk filled up while downloading: {have} at {cache}. Free up space "
+        "(or move the model cache to a bigger volume) and retry; the download "
+        "resumes from the part that already finished."
+    )
 
 
 def cache_is_complete(model: dict) -> bool:
@@ -406,6 +241,38 @@ def cache_is_complete(model: dict) -> bool:
     if not dirs:
         return True
     return any(snapshot_is_complete(model, snapshot) for snapshot in dirs)
+
+
+def installed_snapshot_path(repo_id: str) -> "str | None":
+    """Complete local snapshot directory of an installed catalogue repo, else None.
+
+    Loading an installed model by *repo id* makes huggingface_hub ask the Hub
+    which commit ``main`` is before touching the cache — with no timeout on that
+    call, so a network that drops packets stalls the load, and a pinned-revision
+    install (no ``refs/main``) cannot load offline at all (#2583). A concrete
+    snapshot directory loads with no network. Prefers the recorded installed
+    revision, then the newest complete snapshot. Never raises.
+    """
+    try:
+        meta = get_model_catalog().get(repo_id)
+        if meta is None:
+            return None
+        hub_repo = meta["repo_id"]
+        snapshots = [path for path in _snapshot_dirs(hub_repo) if snapshot_is_complete(meta, path)]
+        if not snapshots:
+            return None
+        try:
+            from services.hf_cache_repair import hf_cache_home
+            from services.hf_revisions import installed_revision
+            pinned = installed_revision(hub_repo, hf_cache_home())
+        except Exception:  # noqa: BLE001 — uncurated repo: newest snapshot wins
+            pinned = None
+        for path in snapshots:
+            if os.path.basename(path) == pinned:
+                return path
+        return max(snapshots, key=os.path.getmtime)
+    except Exception:  # noqa: BLE001 — callers keep loading by name
+        return None
 
 
 def _is_cached_on_disk(repo_id: str) -> bool:
@@ -531,7 +398,7 @@ def invalidate_cache() -> None:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
-@router.get("/models/access/status")
+@router.get("/models/access/status", dependencies=[Depends(reject_cross_site_get)])
 def model_access_status(repo_id: str = Query(...)):
     """Check gated Hub access without downloading model files.
 
@@ -552,7 +419,7 @@ def model_access_status(repo_id: str = Query(...)):
     from services import token_resolver
 
     resolved = token_resolver.resolve()
-    repositories = [repo_id]
+    repositories = [model["repo_id"]]
     prerequisite = str(model.get("prerequisite_repo_id") or "").strip()
     if prerequisite:
         repositories.append(prerequisite)
@@ -568,12 +435,15 @@ def model_access_status(repo_id: str = Query(...)):
         }
 
     from huggingface_hub import get_hf_file_metadata, hf_hub_url
+    from services.hf_auth import CANONICAL_ENDPOINT
 
     results = []
     for current in repositories:
         try:
-            url = hf_hub_url(current, filename=".gitattributes")
-            get_hf_file_metadata(url, token=resolved.token)
+            # Access is an account verdict on Hugging Face itself; a configured
+            # mirror (HF_ENDPOINT) must never receive the token.
+            url = hf_hub_url(current, filename=".gitattributes", endpoint=CANONICAL_ENDPOINT)
+            get_hf_file_metadata(url, token=resolved.token, endpoint=CANONICAL_ENDPOINT)
             access = "granted"
         except Exception as exc:  # Hub exception types vary across releases.
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -587,6 +457,16 @@ def model_access_status(repo_id: str = Query(...)):
     }
 
 
+def _model_license_info(repo_id: str) -> dict:
+    from services.model_licenses import safe_disclosure
+    return safe_disclosure(repo_id)
+
+
+def _model_licence_acceptance(repo_id: str) -> dict:
+    from services import model_acceptance
+    return model_acceptance.status(repo_id)
+
+
 @router.get("/models")
 def list_models():
     """Catalogue every known model + its on-disk install state.
@@ -595,56 +475,52 @@ def list_models():
     walks when the frontend polls.
     """
     platform_tags = _current_platform_tags()
-    remote_inventory = _target_repo_inventory()
-    target_key = remote_inventory[0] if remote_inventory else "local"
-    cache_key = "models:" + target_key + ":" + ",".join(sorted(platform_tags))
+    cache_key = "models:local:" + ",".join(sorted(platform_tags))
     cached_response = _cached(cache_key)
     if cached_response is not None:
         return cached_response
 
     cached_by_repo: dict[str, dict] = {}
-    if remote_inventory is not None:
-        for model in KNOWN_MODELS:
-            if model["repo_id"] in remote_inventory[1]:
-                cached_by_repo[model["repo_id"]] = {
-                    "size_on_disk": int(float(model.get("size_gb") or 0) * _GIB),
-                    "last_accessed": None,
-                    "nb_files": 0,
-                }
-    else:
-        try:
-            from huggingface_hub import scan_cache_dir
-            info = scan_cache_dir()
-            for entry in info.repos:
-                cached_by_repo[entry.repo_id] = {
-                    "size_on_disk": entry.size_on_disk,
-                    "last_accessed": entry.last_accessed,
-                    "nb_files": entry.nb_files,
-                }
-        except Exception as e:
-            if _cache_dir_missing(e):
-                cached_by_repo = {}
-            else:
-                # WinError-448 fallback (#117/#118): use a direct disk scan so installed
-                # models still show as installed instead of offering a re-download.
-                logger.warning("scan_cache_dir failed (%s); using disk fallback", e)
-                cached_by_repo = _scan_cache_on_disk()
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        for entry in info.repos:
+            cached_by_repo[entry.repo_id] = {
+                "size_on_disk": entry.size_on_disk,
+                "last_accessed": entry.last_accessed,
+                "nb_files": entry.nb_files,
+            }
+    except Exception as e:
+        if _cache_dir_missing(e):
+            cached_by_repo = {}
+        else:
+            # WinError-448 fallback (#117/#118): use a direct disk scan so installed
+            # models still show as installed instead of offering a re-download.
+            logger.warning("scan_cache_dir failed (%s); using disk fallback", e)
+            cached_by_repo = _scan_cache_on_disk()
 
     out = []
     host_tags = set(platform_tags)
     for m in KNOWN_MODELS:
         cached = cached_by_repo.get(m["repo_id"])
-        on_disk = (
-            m["repo_id"] in remote_inventory[1]
-            if remote_inventory is not None
-            else cached is not None and cached["size_on_disk"] > 0
-        )
-        # A size-positive cache can still be a truncated download (config landed,
-        # weight shard didn't). Treat that as not-installed + incomplete so the
-        # wizard re-offers the download instead of stranding the user (#622).
-        incomplete = on_disk and remote_inventory is None and not cache_is_complete(m)
+        if cached is not None and shares_repo(m):
+            # The repository also holds other entries' packages: only this
+            # entry's own files decide whether it is installed and its size.
+            cached = package_cache_usage(m)
+            on_disk = cached is not None
+            incomplete = False
+        else:
+            on_disk = cached is not None and cached["size_on_disk"] > 0
+            # A size-positive cache can still be a truncated download (config
+            # landed, weight shard didn't). Treat that as not-installed +
+            # incomplete so the wizard re-offers the download (#622).
+            incomplete = on_disk and not cache_is_complete(m)
+        key = model_key(m)
         out.append({
             **m,
+            # Rows are addressed by catalogue identity; hf_repo is the Hub repo.
+            "repo_id": key,
+            "hf_repo": m["repo_id"],
             "installed": on_disk and not incomplete,
             "incomplete": incomplete,
             "size_on_disk_bytes": cached["size_on_disk"] if cached else 0,
@@ -653,16 +529,22 @@ def list_models():
             # Curated "best for your system" pick (curated_on in models.yaml) —
             # drives the recommended badge in the wizard and Settings model store.
             "curated": _model_curated(m, host_tags),
+            "license_info": _model_license_info(key),
+            "license_acceptance": _model_licence_acceptance(key),
         })
     response = {
-        "target": target_key,
+        "target": "local",
         "models": out,
         "total_installed_bytes": sum(m["size_on_disk_bytes"] for m in out),
-        "hf_cache_dir": "" if remote_inventory is not None else hf_cache_dir(),
+        "hf_cache_dir": hf_cache_dir(),
         # Free space on the cache volume, so the Model Store header can warn
         # BEFORE an "Install all" overruns the disk (pairs with the per-install
         # disk_space_error guard in setup/download.py).
-        "disk_free_gb": None if remote_inventory is not None else round(disk_free_bytes() / _GIB, 1),
+        "disk_free_gb": round(disk_free_bytes() / _GIB, 1),
+        # The headroom disk_space_error keeps free on top of every download, so
+        # the UI warns with the same rule (and names it) instead of a raw
+        # "needs 4.8 GB, 10.2 GB free" that contradicts its own refusal (#2597).
+        "disk_headroom_gb": INSTALL_HEADROOM_GB,
         "platform_tags": platform_tags,
     }
     _set_cache(cache_key, response)
@@ -706,6 +588,16 @@ def recommendations():
         if _model_curated(m, tags) and _model_supported(m)
     ]
 
+    if not (is_mac_arm or has_cuda or has_rocm):
+        # CPU-only preset: lead with the light Whisper (small) so a user working
+        # down the list meets the cheap download before large-v3 / Turbo. Only
+        # the ASR slots are reordered (smallest first); every other entry keeps
+        # its catalog position.
+        asr_slots = [i for i, m in enumerate(curated) if m.get("role") == "ASR"]
+        ordered = sorted((curated[i] for i in asr_slots), key=lambda m: m.get("size_gb") or 0)
+        for slot, model in zip(asr_slots, ordered):
+            curated[slot] = model
+
     if is_mac_arm:
         rationale = (
             "Apple Silicon preset: VoiceStudio (required) covers multilingual TTS + "
@@ -730,38 +622,35 @@ def recommendations():
     else:
         rationale = (
             "CPU preset: VoiceStudio (required) runs standalone. Optional picks favour "
-            "speed on CPU — Whisper large-v3 (int8) for accuracy, Turbo when speed "
-            "matters, Whisper Tiny (ONNX) for live dictation, KittenTTS for "
-            "instant English TTS."
+            "speed on CPU — Whisper small (int8) as the light default, large-v3 for "
+            "accuracy and Turbo when you can spare the time and RAM, Whisper Tiny "
+            "(ONNX) for live dictation, KittenTTS for instant English TTS."
         )
 
-    remote_inventory = _target_repo_inventory()
     cached_ids: set[str] = set()
-    if remote_inventory is not None:
-        cached_ids = remote_inventory[1]
-    else:
-        try:
-            from huggingface_hub import scan_cache_dir
-            info = scan_cache_dir()
-            cached_ids = {
-                entry.repo_id for entry in info.repos if entry.size_on_disk > 0
-            }
-        except Exception as e:
-            if _cache_dir_missing(e):
-                cached_ids = set()
-            else:
-                # WinError-448 fallback (#117/#118): recommend based on the disk scan.
-                logger.debug("scan_cache_dir failed (%s); using disk fallback", e)
-                cached_ids = set(_scan_cache_on_disk().keys())
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        cached_ids = {
+            entry.repo_id for entry in info.repos if entry.size_on_disk > 0
+        }
+    except Exception as e:
+        if _cache_dir_missing(e):
+            cached_ids = set()
+        else:
+            # WinError-448 fallback (#117/#118): recommend based on the disk scan.
+            logger.debug("scan_cache_dir failed (%s); using disk fallback", e)
+            cached_ids = set(_scan_cache_on_disk().keys())
 
     entries = []
     for meta in curated:
-        rid = meta["repo_id"]
+        rid = model_key(meta)
         # Mirror /models: a truncated cache (weights missing) is not installed, so
         # the wizard counts it toward the remaining download instead of "all set".
-        installed = rid in cached_ids and (
-            remote_inventory is not None or cache_is_complete(meta)
-        )
+        if shares_repo(meta):
+            installed = package_cache_usage(meta) is not None
+        else:
+            installed = meta["repo_id"] in cached_ids and cache_is_complete(meta)
         entries.append({
             "repo_id": rid,
             "label": meta.get("label", rid),
@@ -776,7 +665,7 @@ def recommendations():
     all_installed = all(e["installed"] for e in entries)
 
     return {
-        "target": remote_inventory[0] if remote_inventory is not None else "local",
+        "target": "local",
         "device": {
             "os": target_os,
             "arch": target_arch,
@@ -793,3 +682,4 @@ def recommendations():
         "total_gb": round(sum(e["size_gb"] for e in entries), 2),
         "all_installed": all_installed,
     }
+

@@ -27,7 +27,9 @@ import json
 import logging
 import os
 import secrets
+import sys
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 
@@ -82,9 +84,9 @@ def auth(tmp_path, monkeypatch):
     return _Auth(mod, str(d))
 
 
-@pytest.mark.parametrize("kind", ["models_dir", "ffmpeg", "ffprobe", "dub_export", "soni_input", "soni_output_dir"])
+@pytest.mark.parametrize("kind", ["models_dir", "ffmpeg", "ffprobe", "dub_export", "soni_input", "soni_output_dir", "sidecar_dir"])
 def test_consume_returns_the_authorized_path_for_every_capability_kind(auth, kind):
-    # All six authorize_host_path kinds share ONE resolution path (_AUTH_DIR)
+    # Every authorize_host_path kind shares ONE resolution path (_AUTH_DIR)
     # — this is the "whole class" #1781 must fix, not just dub_export.
     assert kind in auth.kinds
     token = _token()
@@ -98,6 +100,47 @@ def test_consume_is_one_shot(auth):
     assert auth.consume(token, "dub_export") == "/out.wav"
     with pytest.raises(auth.Error):
         auth.consume(token, "dub_export")
+
+
+def test_bundled_backend_refreshes_its_own_scopes_only_after_a_valid_native_grant(auth, monkeypatch):
+    module = ModuleType("_voicestudio_sandbox_bookmarks")
+    module.restore = Mock(return_value=True)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("VOICESTUDIO_BUNDLED_CODE_ONLY", "1")
+    token = _token()
+    auth.write(token, "models_dir", "/selected-models")
+    assert auth.consume(token, "models_dir") == "/selected-models"
+    module.restore.assert_called_once_with('/selected-models')
+    with pytest.raises(auth.Error):
+        auth.consume(token, "models_dir")
+    module.restore.assert_called_once()
+
+
+@pytest.mark.parametrize('throws', [False, True])
+def test_failed_sandbox_scope_is_an_authorization_error_and_never_returns_a_path(auth, monkeypatch, throws):
+    module = ModuleType("_voicestudio_sandbox_bookmarks")
+    module.restore = Mock(return_value=False)
+    if throws:
+        module.restore.side_effect = RuntimeError('native grant failed')
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("VOICESTUDIO_BUNDLED_CODE_ONLY", "1")
+    token = _token()
+    auth.write(token, "models_dir", "/selected-models")
+    with pytest.raises(auth.Error, match="Invalid or expired desktop authorization"):
+        auth.consume(token, "models_dir")
+
+
+def test_bundled_models_folder_reset_does_not_require_unrelated_folder_grants(auth, monkeypatch):
+    module = ModuleType("_voicestudio_sandbox_bookmarks")
+    module.restore = Mock(return_value=False)  # An external drive is no longer mounted.
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("VOICESTUDIO_BUNDLED_CODE_ONLY", "1")
+    token = _token()
+    auth.write(token, "models_dir", "")
+    assert auth.consume(token, "models_dir") == ""
+    module.restore.assert_not_called()
+    with pytest.raises(auth.Error):
+        auth.consume(token, "models_dir")
 
 
 def test_wrong_kind_is_rejected(auth):

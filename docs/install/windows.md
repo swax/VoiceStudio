@@ -1,264 +1,207 @@
 # VoiceStudio — Install on Windows
 
-## Electron desktop (current)
+VoiceStudio's Windows desktop app is built with Electron. The archived Tauri
+app (MSI installers) is no longer maintained; if you still run it, follow the
+[migration guide](../electron-migration.md).
 
-From the repository root, install Bun and uv, then run:
+## Requirements
 
-```sh
-bun install
-bun run setup:api  # prepare Python dependencies before starting Electron
-bun run dev
-```
-
-Use `bun run desktop-prod` to build and launch Electron, or `bun run dist`
-to create local installers without publishing. The app manages its backend.
-See [Electron setup](../../electron/README.md) and [migration notes](../electron-migration.md).
-
-## Legacy Tauri installation and troubleshooting
-
-The instructions below apply to the sunset Tauri app and existing Tauri installers.
-
-This page is self-contained: follow it top to bottom and you'll end up with a
-working VoiceStudio install on Windows 10 / 11 (x64).
-
-## Prerequisites
-
-### Using the MSI installer
-
-- **Windows 10 (21H2 or newer) or Windows 11**, x64.
+- **Windows 10 or 11**, x64 — or Windows on ARM (experimental, see below).
 - **~10 GB free disk** for the app, its Python environment, and model weights.
 - Optional: an **NVIDIA GPU + driver** for CUDA acceleration — see
-  [GPU support on Windows](#gpu-support). AMD GPUs run CPU-only on Windows.
+  [GPU support on Windows](#gpu-support).
 
-That's it — Python, FFmpeg, and the model weights are bundled or bootstrapped
-by the app itself on first launch. No toolchain needed.
+Python, FFmpeg, and model weights are bootstrapped by the app itself on first
+launch; no toolchain is needed for the installer.
 
-### Building from source
+## Keep engine environments off `C:`
 
-Everything above, plus the toolchain:
+Engine environments (IndexTTS, CosyVoice, MOSS-TTS and other sidecars, plus the
+audio.cpp runtime) install under `<app data>\engines` and can reach several GB
+each. To place them on another drive, set `OMNIVOICE_ENGINES_DIR` before
+launching VoiceStudio, for example in PowerShell:
 
-- **Git for Windows** — `winget install --id Git.Git -e`. Needed for
-  `git clone`, and it includes **Git Bash**, which `bun run tauri:desktop-prod`
-  uses to run its build-and-launch script. Without it, `desktop-prod` stops
-  with an error telling you to install it.
-- **Python 3.11+** — `winget install Python.Python.3.11` (or download from
-  [python.org](https://www.python.org/downloads/windows/)).
-- **Microsoft C++ Build Tools** — required by some PyPI source distributions
-  (`pyannote.audio`, occasional torch wheel rebuild). Install via the
-  [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-  with the **"Desktop development with C++"** workload checked.
-- **Bun** — `powershell -c "irm bun.sh/install.ps1 | iex"`.
-- **FFmpeg** — `winget install Gyan.FFmpeg`.
-- **Rust / Cargo** — `winget install Rustlang.Rustup` or download `rustup-init.exe` from [rustup.rs](https://rustup.rs/).
-  After installing Rustup, close and reopen PowerShell before running `bun run tauri:desktop-prod`.
+```powershell
+[Environment]::SetEnvironmentVariable('OMNIVOICE_ENGINES_DIR', 'D:\VoiceStudio\engines', 'User')
+```
+
+Restart VoiceStudio afterwards. Voices, projects and settings stay in the data
+folder (`OMNIVOICE_DATA_DIR` moves that too). Engines already installed under the
+old folder are not moved: reinstall them from Engines, or move the
+`engines\<engine>` folder yourself and delete the old copy.
+
+## Install
+
+Download the installer matching your PC from the
+[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest):
+
+| PC | Installer |
+|---|---|
+| Intel / AMD (x64) | `VoiceStudio-<version>-win-x64.exe` |
+| Windows on ARM (Snapdragon X etc., experimental) | `VoiceStudio-<version>-win-arm64.exe` (releases without it: the x64 installer also works, under emulation) |
+
+The setup wizard installs for the current user by default (no administrator
+rights needed) and lets you choose the installation folder. Compare the download with the
+release's `SHA256SUMS.txt` before running it.
+
+During an update, the installer closes processes running inside the selected
+installation folder. Processes in similarly named sibling folders and the
+installer itself are excluded. If an older installer leaves a running copy
+open, exit that copy before retrying. If it keeps saying VoiceStudio
+cannot be closed when the app is stopped, run the installer from a different
+folder (for example Downloads) and retry; keep your existing runtime, model
+cache and data folders.
+
+Or, from a regular (non-admin) PowerShell, let the
+[install script](script.md) pick the right installer, verify it, and open the
+wizard:
+
+```powershell
+irm https://voicestudio.sh/install.ps1 | iex
+```
+
+### PCs without an NVIDIA GPU
+
+VoiceStudio is fully usable without a dedicated GPU: laptops with Intel or AMD
+integrated graphics, Ryzen/Ryzen AI parts and older desktops all run the whole
+app on the CPU, just slower (integrated graphics are not used for AI work).
+On first run the runtime installer detects that no NVIDIA driver is present and
+installs the small CPU build of PyTorch instead of the multi-GB CUDA one, so
+the download is much smaller and needs about 5 GiB free instead of 9 GiB. For
+the best experience on a CPU, pick a light voice engine (KittenTTS,
+Supertonic-3, PocketTTS) and a small Whisper model in the Model Catalogue; the
+setup screen lists them as its CPU preset. Set `OMNIVOICE_TORCH_VARIANT=cuda`
+(or `cpu`) before launching to override the detection.
+Source setup (`bun run setup:api`) also selects locked CPU wheels when NVIDIA
+is absent. See [CPU setup and overrides](../../electron/README.md#running-without-a-gpu).
+
+### Windows on ARM (Snapdragon X etc.)
+
+> [!NOTE]
+> **Experimental.** The ARM64 installer and the emulated runtime are built by
+> CI but have not yet passed an end-to-end validation on real hardware. Expect
+> rough edges and please report them.
+
+The app shell is native ARM64. PyTorch has no ARM64 Windows wheels for
+torchaudio/torchvision, so the AI backend runs as an **x64 Python under
+Windows' built-in emulation, on the CPU only** (no GPU or NPU acceleration).
+It is designed to work but will be slower than on an x64 PC; Windows 11 24H2
+or newer gives the emulator the AVX2 support PyTorch benefits from. Setup shows
+a "Windows on ARM" notice and applies the same light-engine advice as above.
+
+### Everything on an external drive
+
+The Electron app has no single-file portable build. To keep it all on another
+drive (for example an external SSD):
+
+1. Run the installer and choose the external drive on its **Installation
+   Folder** page.
+2. On the setup screen, press **Change…** beside **App environment** and pick
+   the drive. That one folder then holds the Python environment, uv's download
+   cache, managed Python, your data (`data`), the model cache (`models`) and
+   scratch files (`tmp`), so nothing is staged on `C:`. The setup screen lists
+   each effective location. Variables you set yourself (`OMNIVOICE_DATA_DIR`,
+   `OMNIVOICE_CACHE_DIR`, `TEMP`) win over the folder.
+3. An existing installation is never moved. To relocate its data or model cache
+   later, use **Settings > Storage**.
+
+The drive must be connected when VoiceStudio starts.
 
 ## GPU support on Windows
 
 <a id="gpu-support"></a>
 
-**GPU acceleration on Windows is NVIDIA/CUDA-only.** The Windows install
-ships the CUDA build of PyTorch; with an NVIDIA GPU and a regular NVIDIA
-driver it's picked up automatically (no CUDA Toolkit install needed).
+**NVIDIA GPUs** use CUDA automatically when a compatible driver is installed.
+**AMD GPUs** use CPU PyTorch by default; supported Radeon and Ryzen AI hardware
+can explicitly opt into the matched Windows 11 ROCm 7.2.1 installation for
+source and Electron with `OMNIVOICE_TORCH_VARIANT=rocm`.
 
-**AMD GPUs — including Ryzen / Ryzen AI integrated Radeon graphics — run
-CPU-only on Windows.** ROCm is not supported on Windows: PyTorch publishes no
-Windows ROCm wheels, and VoiceStudio's ROCm option is Linux-only. (The Ryzen AI
-NPU is likewise not used.) Everything still works on CPU, just slower. If you
-have an AMD GPU and want GPU acceleration, run VoiceStudio on Linux instead —
-see [linux.md — AMD GPU (ROCm)](linux.md#amd-gpu-rocm).
+Follow the [Windows ROCm guide](windows-rocm.md) for AMD's exact driver/hardware
+matrices, setup commands, offline verification, local speech smoke, repair and
+CPU rollback. Python 3.12 and the pinned Windows HIP CTranslate2 build are
+installed together. Main runtime readiness does not certify optional engines:
+WhisperX/pyannote GPU execution and GPU forced alignment remain explicitly
+gated pending MIOpen compatibility evidence; their CPU paths remain available.
+Existing sidecar Python/Torch pins are preserved. Windows ARM64, Windows 10,
+unlisted Radeon hardware and the Ryzen AI NPU are outside this recipe.
 
-## Install (from source)
+Engines with their own runtime remain separate: [audio.cpp](../engines/audio-cpp.md)
+can use its Vulkan build, subject to its own installation/capability checks.
+Linux ROCm setup remains documented in [linux.md](linux.md#amd-gpu-rocm).
+Unsupported community alternative: a WSL2 distro with ROCm 7.2.4 and AMD's
+`librocdxg` bridge, validated on an RX 7800 XT with the `v0.5.6` tag, is
+recorded in [wsl-amd-rocm.md](wsl-amd-rocm.md).
 
-One-liner from a regular (non-admin) PowerShell — installs Git, FFmpeg, uv,
-and bun via winget, then clones and builds:
+**Intel Arc GPUs (XPU) — experimental.** The Windows install does not ship the
+Intel XPU build of PyTorch, so out of the box an Arc card is not used. If you run
+VoiceStudio with a PyTorch `+xpu` build, the main OmniVoice engine and PyTorch
+Whisper ASR run on the card. Engines that install their own PyTorch (CosyVoice,
+VoxCPM2, IndexTTS and similar) still run on the CPU. Two Windows driver quirks
+are handled for you:
+
+- The Arc driver cannot report free GPU memory. VoiceStudio estimates it as total
+  memory minus what PyTorch has reserved, so model loads no longer fail with
+  "doesn't support querying the available free memory".
+- An out-of-memory error (`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` or
+  `XPU out of memory`) is reported as one and its memory is released, so the next
+  generation can run without restarting the app.
+
+**Settings → Performance → GPU acceleration** shows exactly what applies to your
+machine: the GPUs Windows reports, which PyTorch build is installed, and a
+verdict for every engine (uses the GPU, runs on the CPU and why, or CPU by
+design). Manually installed HIP sidecars are recognized in Windows virtual
+environments too. If HIP cannot enumerate a GPU, diagnostics point to AMD's
+supported GPU, driver and wheel combination; an SDK directory on PATH alone
+does not prove a working PyTorch runtime. **Settings → About → Run self-check** names the card instead of just
+saying "no GPU acceleration detected".
+
+## Building from source
+
+Use this for development or to run current `main`. The install script's
+`main` mode (`$env:VOICESTUDIO_INSTALL_MODE='main'; irm https://voicestudio.sh/install.ps1 | iex`)
+builds and installs a desktop package from `main` without a checkout; see
+[the install script guide](script.md).
+
+Prerequisites:
+
+- **Git for Windows** — `winget install --id Git.Git -e`.
+- **Bun** — `powershell -c "irm bun.sh/install.ps1 | iex"`.
+- **uv** — `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (it
+  provides the managed Python 3.11 the backend uses).
+- **Node.js 22.12.0 or newer** (a current LTS release is recommended). Source
+  startup checks this before setup or Electron downloads; if your Node is too
+  old, install a supported release from https://nodejs.org and reopen the terminal.
+- **Rust / Cargo** — `winget install Rustlang.Rustup`; close and reopen
+  PowerShell afterwards.
+- **Microsoft C++ Build Tools** — the
+  [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with the **"Desktop development with C++"** workload (plus the ARM64 build
+  tools on Windows on ARM).
 
 ```powershell
-irm https://voicestudio.sh/install | iex
-```
-
-Or manually:
-
-```bash
 git clone https://github.com/debpalash/VoiceStudio.git
 cd VoiceStudio
+node electron/scripts/node-version.mjs
+```
+
+If the Node check fails, stop here, upgrade Node.js, and reopen your terminal
+before continuing. Then install dependencies and prepare the local backend
+(skip API setup when using an external backend or an Intel Mac):
+
+```powershell
 bun install
-bun run tauri:desktop-prod
+bun run setup:api   # create the Python environment with uv
+bun run dev         # Electron with hot reload; it starts and supervises the backend
 ```
 
-The first launch creates the Python venv via `uv`, syncs deps, and downloads
-model weights. The splash screen shows progress.
-
-> **Note:** `bun run tauri:desktop-prod` runs a bash script under the hood. You can
-> launch it from PowerShell or cmd as shown — it finds Git Bash automatically
-> (installed with Git for Windows, see Prerequisites). If no Git Bash is
-> found, it prints instructions instead of failing silently. Alternatives
-> that don't need bash: `bun run tauri` (dev mode) or the pre-built MSI
-> below.
-
-## Install (pre-built MSI)
-
-Download the latest MSI from the
-[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest).
-
-| Artifact name | Scope | Administrator required | Default location |
-|---|---|---|---|
-| `VoiceStudio_<version>_x64_en-US.msi` | All users (per-machine) | Yes | `%ProgramFiles%\VoiceStudio` |
-| `VoiceStudio_Current_User_<version>_x64_en-US.msi` | Current user only | No | `%LOCALAPPDATA%\VoiceStudio (Current User)` |
-
-Run the artifact matching the required scope and follow the wizard. The
-per-user artifact can be installed, updated, and removed by a standard Windows
-account. It has a separate Windows Installer upgrade identity, shortcut name,
-and signed updater manifest, so it cannot upgrade or uninstall the per-machine
-copy (or vice versa). Both copies use the same VoiceStudio data directory; do
-not run them simultaneously against the same projects.
-
-Automatic updates preserve the installed scope. Managed deployments should
-continue to use the per-machine MSI. Users without elevation should choose the
-artifact containing `Current_User`.
-
-### Installing to a different drive
-
-<a id="install-other-drive"></a>
-
-The wizard's **directory picker** lets you install the app to any **local**
-drive (D:, E:, …). Two caveats:
-
-- **Mapped network drives (Z: → a share) are not supported** — this is a
-  Windows Installer limitation, not a VoiceStudio bug: MSI custom actions run
-  as a service account that doesn't see per-user drive mappings, so the
-  install fails or rolls back. Install to a local drive instead.
-- The install location only moves the ~200 MB app itself. The big data
-  (models, voices, projects — tens of GB) lives in the **data directory**,
-  which you move independently: **Settings → Storage → Models directory**
-  in-app, or `OMNIVOICE_DATA_DIR` / [Portable mode](#portable-install) for
-  the whole data tree.
-
-When the Python **environment folder** (first-run setup → Advanced, or
-portable mode) is on a different drive than Windows, the installer keeps
-uv's package cache and managed Python **inside the environment folder**
-(`uv-cache/`, `uv-python/`) instead of `%LOCALAPPDATA%\uv`. Without that,
-every wheel (PyTorch alone is several GB) would be staged on `C:` and then
-copied across drives — filling the system drive you were trying to spare.
-The same applies to engine sidecar installs when the data directory is on
-another drive (`engines\.uv-cache`). An explicit `UV_CACHE_DIR` /
-`UV_PYTHON_INSTALL_DIR` you set yourself always wins.
-
-If an install to a local non-C: drive fails anyway, capture a log with
-`msiexec /i VoiceStudio*.msi /L*V install.log` and
-[open an issue](https://github.com/debpalash/VoiceStudio/issues) with it
-— that log shows exactly which step rolled back.
-
-## Managed WebView2 installation
-
-The MSI checks the `pv` version value in both the machine-wide and current-user
-Edge Update registry keys for the WebView2 Runtime product
-`{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`. When no `pv` version is detected and
-the bootstrapper was not explicitly allowed (or was explicitly disabled), the
-install fails without making a network request and directs the operator to the
-offline runtime. `ALLOWWEBVIEW2BOOTSTRAP=1` instead selects the opt-in path
-documented below.
-
-Managed or offline deployments can prohibit that network action:
-
-```powershell
-msiexec /i VoiceStudio_0.5.2_x64_en-US.msi DISABLEWEBVIEW2BOOTSTRAP=1 AUTOLAUNCHAPP=0 /qn /L*V "%TEMP%\VoiceStudio-install.log"
-```
-
-The per-user artifact never contains a WebView2 download or installer action.
-It does not require an elevated terminal, and fails closed when the runtime is
-absent:
-
-```powershell
-msiexec /i VoiceStudio_Current_User_0.5.2_x64_en-US.msi DISABLEWEBVIEW2BOOTSTRAP=1 AUTOLAUNCHAPP=0 /qn /L*V "%TEMP%\VoiceStudio-user-install.log"
-```
-
-For the per-machine artifact, `DISABLEWEBVIEW2BOOTSTRAP=1` leaves detection
-enabled but prevents every WebView2 PowerShell, download, and installer action.
-For the per-user artifact that property is redundant because those actions are
-omitted from the MSI. If the runtime is absent, either MSI fails before copying
-VoiceStudio and tells the operator to deploy the
-[Microsoft Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/#download-section)
-first. `/L*V` records detection and action selection in the named Windows
-Installer log.
-
-An interactive administrator may explicitly permit Microsoft's network
-bootstrapper for the per-machine artifact by setting
-`ALLOWWEBVIEW2BOOTSTRAP=1`. Only then does that MSI download
-`https://go.microsoft.com/fwlink/p/?LinkId=2124703` with PowerShell and invoke
-it silently with `/install`; `DISABLEWEBVIEW2BOOTSTRAP=1` always wins if both
-properties are supplied. `ALLOWWEBVIEW2BOOTSTRAP` has no effect on the
-per-user artifact.
-
-`AUTOLAUNCHAPP=0` is independent: it prevents VoiceStudio from launching after
-a successful silent install. It does not change WebView2 detection; on the
-per-machine artifact it also does not disable an otherwise permitted setup.
-
-## Portable install (Windows)
-
-<a id="portable-install"></a>
-
-VoiceStudio has a **Portable** mode: instead of scattering data across
-`%APPDATA%` and `%LOCALAPPDATA%`, the whole install — Python env, model
-weights, voices, projects, settings — lives in a single folder. By **default**
-that is `OmniVoiceStudio-Data` next to the executable; you can put it anywhere
-writable from the setup screen (see below). Moving or copying the app folder
-(exe + that data folder together) relocates the entire install, USB-stick
-style.
-
-The first-run setup screen offers Portable, and the folder is **yours to
-choose** — press **Change…** on the Portable folder row and point it at any
-writable location (an external SSD, a second drive, a USB stick).
-
-Where the folder lives decides how far it travels, and the setup screen tells
-you which of these you're getting:
-
-- **Inside the app's own folder** (e.g. `D:\Apps\VoiceStudio\MyData`, with the
-  exe in `D:\Apps\VoiceStudio`) — the `portable.path` marker records it as a
-  **relative** path. Move the app folder as a unit, to another machine or a
-  different drive letter, and the install still finds itself. This is the
-  USB-stick case Portable exists for.
-- **Somewhere else, app folder writable** (e.g. exe in `D:\Apps`, data on
-  `E:\VoiceStudio`) — the marker can only record an **absolute** path, so the
-  install is tied to that exact path. Change the drive letter or the mount
-  point and you'll have to point the app at it again.
-- **App folder read-only** (a default `C:\Program Files` MSI install) — no
-  marker can be written at all, so the location is remembered for **your user
-  account only** on this machine.
-
-That second case used to be a hard block: Portable was greyed out entirely
-after a default install
-([#766](https://github.com/debpalash/VoiceStudio/issues/766)). It no longer
-is — you just get the machine-bound variant unless the app itself sits
-somewhere writable.
-
-If you want the fully-portable version, install to a user-writable folder:
-
-- Re-run the MSI and choose a custom destination folder in the setup wizard
-  (e.g. `D:\Apps\VoiceStudio`), or
-- From a terminal:
-  `msiexec /i VoiceStudio.Studio_<version>_x64_en-US.msi INSTALLDIR="D:\Apps\VoiceStudio"`
-
-On the next launch, pick **Portable** on the first-run setup screen. With the
-default folder, what lives next to the exe afterwards:
-
-<!-- validate: skip -->
-```
-D:\Apps\VoiceStudio\
-├── VoiceStudio.exe        ← the app
-└── OmniVoiceStudio-Data\       ← the whole install, self-contained
-    ├── config.json             ← install-mode + app settings
-    ├── env\                    ← Python venv + backend code
-    └── data\                   ← voices, projects, settings DB
-        └── models\             ← model weights (HF cache)
-```
-
-Prefer the default Program Files install? **Installed** mode is the same app —
-data just lives in `%APPDATA%\OmniVoice` and the model cache in
-`%LOCALAPPDATA%\OmniVoice\hf_cache`.
+Use `bun run desktop-prod` to build and launch the production bundle, or
+`bun run dist` to create a local NSIS installer in `electron/release/` without
+publishing. See [Electron setup](../../electron/README.md) for backend
+configuration.
 
 ## HF_TOKEN persistence
 
-The **recommended path** is the in-app **Settings → API Keys** panel: it
+The **recommended path** is the in-app **Settings → Credentials** panel: it
 writes the token to VoiceStudio's encrypted SQLite store *and* to the canonical
 `huggingface_hub` location, so every subprocess the app spawns picks it up.
 
@@ -291,26 +234,16 @@ synthesise call. On machines with <16 GB VRAM, that compile step can OOM
 `OutOfMemoryError: CUDA out of memory` or `RuntimeError: Triton compilation
 failed`.
 
-**The one-click fix:** open **Settings → Performance** in the app and toggle
-**"Disable torch.compile"** on. That sets the `TORCH_COMPILE_DISABLE=1` env var
-on every engine subprocess VoiceStudio spawns and forces the in-process engine
-to eager mode as well. You'll lose a few percent of peak throughput in exchange
-for the engine actually loading.
+For the built-in remedy, open **Settings → Performance** and turn on **Disable torch.compile**. In-process generation then follows the eager path, while every engine child launched by VoiceStudio receives `TORCH_COMPILE_DISABLE=1`. The tradeoff is a modest loss of maximum throughput.
 
 **From the CLI / from source:** set the env var manually before launching:
 
 ```powershell
 $env:TORCH_COMPILE_DISABLE = "1"
-bun run tauri:desktop-prod
+bun run dev
 ```
 
-The OOM this section describes is Windows-specific, but the toggle itself works
-on **every** platform — it used to be greyed out elsewhere, which left Linux and
-macOS users with no way to switch off a `torch.compile` that was breaking their
-engine. Tracking issues:
-[#65](https://github.com/debpalash/VoiceStudio/issues/65) (this OOM) and
-[#2135](https://github.com/debpalash/VoiceStudio/issues/2135) (the same toggle
-on Linux/CUDA).
+Although [#65](https://github.com/debpalash/VoiceStudio/issues/65) describes a Windows-only memory problem, the control is intentionally not restricted to Windows. Other hosts can need the same eager fallback for compiler failures, including the older-NVIDIA crash tracked in [#2135](https://github.com/debpalash/VoiceStudio/issues/2135).
 
 ## Hugging Face token (optional but recommended)
 
@@ -319,38 +252,5 @@ See [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
 ## Troubleshooting
 
 Hit a wall? See [docs/install/troubleshooting.md](troubleshooting.md).
-
-### Building the current-user MSI
-
-Build the system MSI first. `scripts/render-per-user-wix.py` requires
-`--system-wxs` pointing to its fully rendered `release/wix/x64/main.wxs`,
-in addition to the canonical `--source` template and `--output` destination.
-The renderer preserves Tauri resource destinations while assigning distinct,
-stable per-user component identities, HKCU registry keypaths, and uninstall
-cleanup for nested resource folders. Missing or unrendered resources fail the
-build. The canonical system installer retains its per-machine authoring.
-
-The per-user build reuses the system build's frontend output: its config clears
-`beforeBuildCommand` so a second Vite build cannot replace the hashed files
-referenced by the rendered WiX template. Keep using `tauri build` for the
-per-user stage; it still recompiles the shell with its own product configuration.
-
-CI builds both scopes with a tiny executable, an external helper, and nested
-resources using the CLI version locked in `bun.lock`. Its frontend-like build
-hook rotates resource filenames, verifying the per-user build preserves the
-system build's resource snapshot. The Windows MSI authoring
-job runs after the test suite and preserves verbose WiX logs and rendered XML.
-For focused diagnosis, dispatch CI with `windows_wix_diagnostic=true`; it skips
-the other jobs and never signs, publishes, or installs the fixture bundles.
-
-The release smoke installs and removes the current-user MSI using a standard
-Windows account. On disposable GitHub-hosted Windows Server runners, it explicitly
-allows unmanaged MSI installations for the duration of this test, then restores
-the previous Installer policy value and type (or its absence), even on failure.
-This test-host preparation does not change installer privileges or user machines.
-Verbose MSI logs are printed if installation or removal fails. The Windows CI
-job also rejects an invalid MSI and verifies policy absence, value types, account
-cleanup, and verbose failure logs using Windows PowerShell 5.1.
-
 
 Migration configuration is kept ASCII so Alembic can read it under Windows locale code pages as well as UTF-8. This applies to source installs and direct Alembic commands.

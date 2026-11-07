@@ -44,12 +44,15 @@ export const PREF_KEYS = [
  *  - 'ov_last_backend_contact': crash diagnostics (#1164) — sessionStorage
  *    timestamp of the backend's last response; not a preference, and wiping
  *    it would erase the "was it ever answering?" evidence mid-incident.
- *  - 'ov_admin_session': short-lived sessionStorage connection state. It is
- *    cleared by logout/backend switching, not by localStorage preference reset.
- *  - 'ov_stale_chunk_reload': sessionStorage timestamp of the one automatic
- *    reload ErrorBoundary performs when a lazy chunk went missing (dev-server
- *    restart / new build under an open tab). Per-tab loop guard, not a
- *    preference — and clearing it mid-incident would re-arm the reload.
+ *  - 'ov_admin_session': backend-bound, short-lived localStorage connection
+ *    state. It is cleared by logout/backend switching or server expiry, not by
+ *    the local preference reset.
+ *  - 'ov_admin_session_epoch': cross-tab ordering marker for that connection
+ *    state. Preserving it prevents a preference reset from reviving an older
+ *    in-flight authentication response.
+ *  - 'ov_stale_chunk_reload': per-tab sessionStorage timestamp guarding the
+ *    one reload ErrorBoundary performs for a missing lazy chunk. It is not a
+ *    preference; clearing it during an incident would arm the reload again.
  */
 export const PRESERVED_KEYS = [
   'ov_backend_url',
@@ -57,6 +60,7 @@ export const PRESERVED_KEYS = [
   'omni_transcriptions',
   'ov_last_backend_contact',
   'ov_admin_session',
+  'ov_admin_session_epoch',
   'ov_stale_chunk_reload',
 ];
 

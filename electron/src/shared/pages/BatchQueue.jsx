@@ -1,3 +1,4 @@
+import { splitRoundedMinutes } from '../utils/timeFormat';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -37,6 +38,7 @@ import { absoluteTime, timeAgo } from '../utils/relativeTime';
  * Shows real-time progress (extract → transcribe → translate → generate → mix).
  */
 
+// Badge styling per job status; `label` is an i18n key.
 const STATUS_TONE = {
   queued: { tone: 'neutral', icon: Circle, label: 'batch.status_queued' },
   running: { tone: 'brand', icon: Activity, label: 'batch.status_running' },
@@ -51,6 +53,7 @@ const CARD_BORDER = {
   failed: 'border-transparent',
 };
 
+// i18n key for each pipeline stage the backend reports.
 const STAGE_LABELS = {
   extract: 'batch.stage_extract',
   transcribe: 'batch.stage_transcribe',
@@ -425,9 +428,8 @@ function JobCard({ job, onCancel, onDelete, t }) {
 }
 
 function formatDuration(secs) {
-  if (secs < 60) return `${secs.toFixed(1)}s`;
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs % 60);
+  if (secs < 59.95) return `${secs.toFixed(1)}s`;
+  const { minutes: m, seconds: s } = splitRoundedMinutes(secs);
   if (m < 60) return `${m}m ${s}s`;
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;

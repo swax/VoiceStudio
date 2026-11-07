@@ -33,7 +33,7 @@ describe('the compact support page', () => {
     render(<SupportPage onBack={() => {}} />);
     expect(screen.getAllByRole('tab')).toHaveLength(3);
     expect(screen.getByRole('tab', { name: 'Support' })).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByRole('heading', { name: 'Support VoiceStudio' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Donate to VoiceStudio Project' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Report a bug' })).toBeNull();
   });
 
@@ -42,7 +42,7 @@ describe('the compact support page', () => {
     rerender(<SupportPage onBack={() => {}} initialView="contact" />);
     expect(screen.getByRole('tab', { name: 'Contact' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByRole('heading', { name: 'Report a bug' })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Support VoiceStudio' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Donate to VoiceStudio Project' })).toBeNull();
   });
 
   it('opens the licence tab for the enterprise route', () => {
@@ -52,7 +52,7 @@ describe('the compact support page', () => {
       'true',
     );
     expect(
-      screen.getByRole('heading', { name: 'Ship AI voices in production' }),
+      screen.getByRole('heading', { name: 'License VoiceStudio for your organization' }),
     ).toBeInTheDocument();
   });
 
@@ -61,6 +61,6 @@ describe('the compact support page', () => {
     clickTab('Contact');
     expect(screen.getByRole('heading', { name: 'Report a bug' })).toBeInTheDocument();
     clickTab('Support');
-    expect(screen.getByRole('heading', { name: 'Support VoiceStudio' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Donate to VoiceStudio Project' })).toBeInTheDocument();
   });
 });

@@ -10,11 +10,20 @@ start once VoiceStudio is open.
 
 | Tool | What it does |
 |---|---|
-| `generate_speech` | text → WAV by default. Uses the agent's bound voice unless a `profile_id` is passed. In `files`/`both` mode, pass `format="opus"` or `format="ogg"` for Ogg/Opus audio at both `audio_url` and `output_path`; requires an installed ffmpeg. |
+| `generate_speech` | Turns text into WAV by default, using the agent-bound voice unless `profile_id` is supplied. An omitted `language` uses the profile language; explicit `Auto` overrides it. In `files` or `both` mode, `format="opus"` or `"ogg"` provides Ogg/Opus at both `audio_url` and `output_path`; ffmpeg must be installed. |
 | `clone_voice` | reference audio (base64, or a `ref_audio_path` under the base path) → new voice profile. Returns a `profile_id` for use with `generate_speech`. |
+| `describe_voice` | Maps free text to design attributes (gender, age, pitch, style, accent) and reports words it could not map, without saving anything. |
+| `design_voice` | Creates a **design** profile from a matching description and returns its `profile_id` for `generate_speech`. Its stable, fixed-seed identity sample renders while saving, or on first use if the engine is not ready. Descriptions mapping to no attribute are refused. |
 | `transcribe` | audio (base64, or an `audio_path` under the base path) → text (646 languages). |
 | `list_voices` / `list_personalities` / `list_languages` | enumerate what's available. |
 | `check_health` | backend status + active GPU device. |
+
+`list_voices`, `list_personalities`, `transcribe`, and `check_health` return
+JSON-encoded text in their MCP tool responses. The `voice://{profile_id}`
+and `history://recent` resources also return JSON text; recent history
+contains at most 20 items. Parse the returned text with a JSON parser
+(for example, Python's `json.loads`). A missing voice returns a JSON object
+with an `error` message.
 
 ## Output mode and file inputs
 
@@ -90,12 +99,54 @@ http_headers = { "X-OmniVoice-Client-Id" = "codex-cli" }
 This follows the [Codex MCP configuration](https://developers.openai.com/codex/mcp):
 a `url` key selects Streamable HTTP and `http_headers` adds static headers.
 
+**Hermes Agent** ([Nous Research](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp))
+connects with no extra VoiceStudio setup. Add the server to
+`~/.hermes/config.yaml` and restart Hermes:
+
+```yaml
+mcp_servers:
+  voicestudio:
+    url: "http://127.0.0.1:3900/mcp/"
+    headers:
+      X-OmniVoice-Client-Id: "hermes"
+```
+
+Any MCP client that speaks Streamable HTTP works the same way; the desktop app
+has no Hermes-specific card because the generic **Model Context Protocol** card
+already covers it. Bind the `hermes` client id to a saved voice under
+[per-agent voices](#per-agent-voices).
+
 To bind this agent to a specific voice, send an
 `X-OmniVoice-Client-Id` header (e.g. `claude-code`). See
 [per-agent voices](#per-agent-voices).
 
-**Agents in Docker or on another machine:** the MCP SDK rejects non-localhost
-Host headers by default (DNS-rebinding guard). Set
+**Agents on another machine:** turn on **Settings → Sharing → Local network**.
+Use the displayed LAN address and share port with `/mcp/`, and send the shown
+access PIN as `X-OmniVoice-Pin`. Use the following HTTP example **only on a
+trusted LAN**: HTTP sends the PIN and MCP traffic without encryption, so a
+network observer could capture and reuse the PIN. On an untrusted or shared
+network, use an encrypted tunnel or HTTPS (for example, Tailscale Serve or a
+TLS reverse proxy) instead.
+
+A reverse proxy must enforce its own authentication: loopback requests with an
+accepted Host bypass the sharing PIN gate, so forwarding `/mcp/` through a
+local proxy does not make the share PIN an access-control boundary. HTTPS
+encrypts the connection but does not replace that proxy-side authentication.
+
+```toml
+[mcp_servers.voicestudio]
+url = "http://192.168.1.50:3901/mcp/"
+http_headers = { "X-OmniVoice-Pin" = "123456", "X-OmniVoice-Client-Id" = "codex-cli" }
+```
+
+VoiceStudio admits its current LAN addresses to the MCP DNS-rebinding guard
+only while PIN-gated sharing is enabled, and removes them when sharing stops.
+Overlapping enable/disable requests are serialized so a listener or temporary
+MCP allowlist cannot be left behind by competing lifecycle changes.
+The same PIN protects both ordinary API requests and MCP sessions.
+
+**Docker, a hostname, or a manually bound server:** the MCP SDK rejects
+non-localhost Host headers by default (DNS-rebinding guard). Set
 `OMNIVOICE_MCP_ALLOWED_HOSTS` to a comma-separated list of host patterns the
 agent connects from (e.g. `host.containers.internal:*,192.168.1.50:*`).
 Keep this on a trusted LAN or behind TLS (Tailscale Serve, a reverse proxy
@@ -142,8 +193,7 @@ in Scarlett". Voice resolution precedence on every `generate_speech` call:
 
 1. an explicit `profile_id` argument, else
 2. the calling agent's binding, else
-3. the global default voice, else
-4. VoiceStudio's default voice.
+3. VoiceStudio's default voice.
 
 Manage bindings over the loopback REST API (the Settings UI uses these):
 

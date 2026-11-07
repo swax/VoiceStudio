@@ -788,8 +788,8 @@ def test_server_spawn_uses_contained_owner(tmp_path, monkeypatch, app_modules):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
     monkeypatch.setattr(app_modules.bootstrap, "resolve_server_binary", lambda: binary)
-    monkeypatch.setattr(app_modules.bootstrap, "resolve_model_file", lambda: model)
-    monkeypatch.setattr(app_modules.bootstrap, "server_port", lambda: 17860)
+    monkeypatch.setattr(app_modules.bootstrap, "resolve_model_file", lambda *_: model)
+    monkeypatch.setattr(app_modules.bootstrap, "server_port", lambda *_: 17860)
     devices = app_modules.bootstrap.parse_device_list('CPU:0 "Test CPU" [CPU]')
     monkeypatch.setattr(
         app_modules.bootstrap, "resolve_compute_selection",
@@ -841,7 +841,7 @@ def test_generate_timeout_terminates_owned_server(monkeypatch, app_modules):
     monkeypatch.setattr(model_manager, "report_generate_progress", progress)
     monotonic = iter((10.0, 30.0))
     monkeypatch.setattr(
-        app_modules.audiocpp.time, "monotonic", lambda: next(monotonic),
+        app_modules.audiocpp, "time", SimpleNamespace(monotonic=lambda: next(monotonic)),
     )
 
     with pytest.raises(RuntimeError, match="timed out"):
@@ -884,7 +884,7 @@ def test_generate_uses_progress_lease_after_first_download(
     progress = Mock()
     monkeypatch.setattr(model_manager, "report_generate_progress", progress)
     monkeypatch.setattr(
-        app_modules.audiocpp.time, "monotonic", lambda: next(monotonic),
+        app_modules.audiocpp, "time", SimpleNamespace(monotonic=lambda: next(monotonic)),
     )
 
     with pytest.raises(RuntimeError, match="timed out"):
@@ -944,7 +944,7 @@ def test_is_available_requires_explicitly_installed_model(
     binary = tmp_path / "audiocpp_server"
     monkeypatch.setattr(bootstrap, "resolve_server_binary", lambda: binary)
 
-    def missing_model():
+    def missing_model(*_):
         raise RuntimeError(
             "Breeze-TTS-2 is not installed. Install it from the engine's Weights list in Model Catalogue."
         )
@@ -962,7 +962,7 @@ def test_is_available_requires_binary_and_model(tmp_path, monkeypatch, app_modul
     binary = tmp_path / "audiocpp_server"
     model = tmp_path / "breeze-tts-2-q8_0.gguf"
     monkeypatch.setattr(bootstrap, "resolve_server_binary", lambda: binary)
-    monkeypatch.setattr(bootstrap, "resolve_model_file", lambda: model)
+    monkeypatch.setattr(bootstrap, "resolve_model_file", lambda *_: model)
     selection = Mock(side_effect=AssertionError("availability probed devices"))
     monkeypatch.setattr(bootstrap, "resolve_compute_selection", selection)
 

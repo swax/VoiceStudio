@@ -1,14 +1,14 @@
 # Install with a coding agent
 
 Instructions for a coding agent (Claude Code, Codex, Cursor, …) asked to install
-VoiceStudio. The short prompt in the [README](../../README.md#install-with-prompt)
+VoiceStudio. The short prompt in the [README](../../README.md#get-started)
 points here. Complete the setup, not just a plan.
 
 ## Rules
 
 - Install the **Electron** desktop app. Tauri is archived; never install or launch it.
 - Reuse existing data, settings and models. Ask before downloading a model: state its size and license.
-- Keep cloud services and analytics opt-in.
+- Keep cloud services and analytics opt-in. Leave the first-run analytics consent prompt to the user; never answer it for them.
 - Verify the actual compute device; do not assume GPU support.
 - Name any permission or manual step you cannot perform instead of skipping it.
 
@@ -22,10 +22,12 @@ points here. Complete the setup, not just a plan.
 2. **Inspect the device.** OS, CPU architecture, GPU, RAM/VRAM, free disk, and any
    existing VoiceStudio install, backend or downloaded models.
 3. **Install.**
-   - Default: the latest stable release asset named `VoiceStudio-Electron-*` for this
-     OS and architecture, or the [install script](script.md).
+   - Default: the latest stable release asset named `VoiceStudio-<version>-*` for this
+     OS and architecture (`VoiceStudio-Electron-*` up to v0.5.7-beta.3) (macOS `.dmg`, Windows `.exe`, Linux `.AppImage` or `.deb`),
+     or the [install script](script.md).
    - From source: follow [`electron/README.md`](../../electron/README.md) —
-     `bun install`, `bun run setup:api`, `bun run dev` from the repository root. Let
+     run `bun run dev` from the repository root. It installs the JavaScript and,
+     for a supported local backend, Python dependencies before launch. Let
      Electron supervise the backend; do not start a second one.
    - Migrating from Tauri: back up first and follow the
      [migration guide](../electron-migration.md).

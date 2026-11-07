@@ -3,12 +3,14 @@
  *
  * The configured master key is accepted only as an input to `exchangeApiKey`.
  * It is never written to storage and never placed in a WebSocket URL. Browser
- * clients retain only a backend-bound, short-lived session in sessionStorage;
+ * clients retain only a backend-bound, short-lived session in localStorage so
+ * it survives reloads and new tabs; its server-enforced expiry remains bounded.
  * same-origin clients use an HttpOnly cookie that JavaScript cannot read.
  */
 
 export const LEGACY_API_KEY_STORAGE_KEY = 'ov_api_key';
 export const ADMIN_SESSION_STORAGE_KEY = 'ov_admin_session';
+const ADMIN_SESSION_EPOCH_STORAGE_KEY = 'ov_admin_session_epoch';
 export const CSRF_HEADER_NAME = 'X-VoiceStudio-CSRF';
 
 const ADMIN_SESSION_RE = /^ovs_admin_session_[A-Za-z0-9_-]{43}$/;
@@ -55,9 +57,9 @@ function defaultWindow(): AuthWindow | undefined {
   return typeof window === 'undefined' ? undefined : window;
 }
 
-function defaultSessionStorage(): StorageLike | null {
+function defaultAdminSessionStorage(): StorageLike | null {
   try {
-    return typeof sessionStorage === 'undefined' ? null : sessionStorage;
+    return typeof localStorage === 'undefined' ? null : localStorage;
   } catch {
     return null;
   }
@@ -113,19 +115,125 @@ function removeLegacyMaster(storage: StorageLike | null = defaultLocalStorage())
 }
 
 export function clearAdminSession({
-  storage = defaultSessionStorage(),
+  storage = defaultAdminSessionStorage(),
 }: { storage?: StorageLike | null } = {}): void {
   try {
     storage?.removeItem(ADMIN_SESSION_STORAGE_KEY);
+    advanceAdminSessionEpoch(storage);
   } catch {
     // Best effort; callers still stop using the in-memory value immediately.
+  }
+}
+
+function removeAdminSessionRecord(storage: StorageLike | null): void {
+  try {
+    storage?.removeItem(ADMIN_SESSION_STORAGE_KEY);
+  } catch {
+    // Best-effort cleanup does not represent a user-requested invalidation.
+  }
+}
+
+function storedAdminSessionEpoch(storage: StorageLike | null): string {
+  try {
+    return storage?.getItem(ADMIN_SESSION_EPOCH_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function advanceAdminSessionEpoch(storage: StorageLike | null): void {
+  try {
+    if (!storage) return;
+    const current = Number(storage.getItem(ADMIN_SESSION_EPOCH_STORAGE_KEY));
+    storage.setItem(
+      ADMIN_SESSION_EPOCH_STORAGE_KEY,
+      String(Number.isSafeInteger(current) && current >= 0 ? current + 1 : 1),
+    );
+  } catch {
+    // Best effort when persistent storage is unavailable.
+  }
+}
+
+function clearAdminSessionIfMatches(
+  expected: Pick<StoredAdminSession, 'token' | 'apiBase'>,
+  storage: StorageLike | null,
+): boolean {
+  try {
+    const raw = storage?.getItem(ADMIN_SESSION_STORAGE_KEY);
+    if (!raw) return false;
+    const current = JSON.parse(raw) as Partial<StoredAdminSession>;
+    if (current.token !== expected.token || current.apiBase !== expected.apiBase) return false;
+    storage?.removeItem(ADMIN_SESSION_STORAGE_KEY);
+    advanceAdminSessionEpoch(storage);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function storedAdminSessionRaw(storage: StorageLike | null): string | null {
+  try {
+    return storage?.getItem(ADMIN_SESSION_STORAGE_KEY) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function clearAdminSessionRawIfMatches(
+  expectedRaw: string | null,
+  storage: StorageLike | null,
+): void {
+  try {
+    if (expectedRaw !== null && storage?.getItem(ADMIN_SESSION_STORAGE_KEY) === expectedRaw) {
+      storage.removeItem(ADMIN_SESSION_STORAGE_KEY);
+    }
+    advanceAdminSessionEpoch(storage);
+  } catch {
+    // Best effort; a concurrent or inaccessible session must not be removed.
+  }
+}
+
+function storeAdminSessionIfUnchanged(
+  expectedRaw: string | null,
+  record: StoredAdminSession,
+  storage: StorageLike | null,
+  nowMs: number,
+  expectedEpoch: string,
+): boolean {
+  try {
+    if (!storage) return false;
+    if (storedAdminSessionEpoch(storage) !== expectedEpoch) return false;
+    const currentRaw = storage.getItem(ADMIN_SESSION_STORAGE_KEY);
+    const expiredSnapshotWasCleaned =
+      currentRaw === null && storedAdminSessionExpired(expectedRaw, nowMs);
+    if (currentRaw !== expectedRaw && !expiredSnapshotWasCleaned) return false;
+    storage.setItem(ADMIN_SESSION_STORAGE_KEY, JSON.stringify(record));
+    advanceAdminSessionEpoch(storage);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function storedAdminSessionExpired(raw: string | null, nowMs: number): boolean {
+  if (!raw || raw.length > 4096) return false;
+  try {
+    const parsed = JSON.parse(raw) as Partial<StoredAdminSession>;
+    return (
+      ADMIN_SESSION_RE.test(String(parsed.token ?? '')) &&
+      typeof parsed.expiresAt === 'number' &&
+      Number.isFinite(parsed.expiresAt) &&
+      parsed.expiresAt <= nowMs / 1000
+    );
+  } catch {
+    return false;
   }
 }
 
 export function getAdminSession(
   apiBase: string,
   {
-    storage = defaultSessionStorage(),
+    storage = defaultAdminSessionStorage(),
     now = Date.now,
   }: { storage?: StorageLike | null; now?: () => number } = {},
 ): StoredAdminSession | null {
@@ -133,7 +241,6 @@ export function getAdminSession(
   try {
     normalized = normalizedApiBase(apiBase);
   } catch {
-    clearAdminSession({ storage });
     return null;
   }
 
@@ -144,7 +251,7 @@ export function getAdminSession(
     return null;
   }
   if (!raw || raw.length > 4096) {
-    if (raw) clearAdminSession({ storage });
+    if (raw) removeAdminSessionRecord(storage);
     return null;
   }
 
@@ -156,19 +263,21 @@ export function getAdminSession(
       typeof parsed.expiresAt !== 'number' ||
       !Number.isFinite(parsed.expiresAt) ||
       parsed.expiresAt <= nowSeconds ||
-      parsed.expiresAt > nowSeconds + MAX_SESSION_LIFETIME_SECONDS ||
-      parsed.apiBase !== normalized
+      parsed.expiresAt > nowSeconds + MAX_SESSION_LIFETIME_SECONDS
     ) {
-      clearAdminSession({ storage });
+      removeAdminSessionRecord(storage);
       return null;
     }
+    // localStorage is shared by tabs. A tab still connected to backend A must
+    // not delete backend B's valid session after B authenticates in another tab.
+    if (parsed.apiBase !== normalized) return null;
     return {
       token: parsed.token as string,
       expiresAt: parsed.expiresAt,
       apiBase: normalized,
     };
   } catch {
-    clearAdminSession({ storage });
+    removeAdminSessionRecord(storage);
     return null;
   }
 }
@@ -259,26 +368,19 @@ export async function exchangeApiKey(
   {
     apiBase,
     fetchImpl = fetch,
-    storage = defaultSessionStorage(),
+    storage = defaultAdminSessionStorage(),
     windowLike = defaultWindow(),
     now = Date.now,
     legacyStorage = defaultLocalStorage(),
     timeoutMs = 10_000,
   }: CommonOptions & { legacyStorage?: StorageLike | null },
 ): Promise<{ transport: 'cookie' } | { transport: 'bearer'; expiresAt: number }> {
-  // A stale session must not outlive a new exchange attempt, but the
-  // historical durable master is deleted only after the backend ACCEPTS the
-  // exchange. Deleting it up front stranded remote-backend users whose box was
-  // unreachable at first launch after upgrade: the failed exchange consumed
-  // their only stored copy of OMNIVOICE_API_KEY. Keeping it on failure lets
-  // the next launch retry the migration; every success path below removes it,
-  // so the key never coexists with a live session.
-  clearAdminSession({ storage });
-
   const master = apiKey.trim();
   if (!master || master.length > 8192) throw new AuthSessionError();
   const base = normalizedApiBase(apiBase);
   const transport = isSameOriginApi(base, windowLike) ? 'cookie' : 'bearer';
+  const sessionAtStart = storedAdminSessionRaw(storage);
+  const sessionEpochAtStart = storedAdminSessionEpoch(storage);
 
   let response: Response;
   const controller = new AbortController();
@@ -305,6 +407,7 @@ export async function exchangeApiKey(
 
   if (transport === 'cookie') {
     if (response.status !== 204) throw new AuthSessionError(response.status);
+    clearAdminSessionRawIfMatches(sessionAtStart, storage);
     removeLegacyMaster(legacyStorage);
     return { transport };
   }
@@ -318,15 +421,29 @@ export async function exchangeApiKey(
   }
 
   const record: StoredAdminSession = { token, expiresAt, apiBase: base };
-  try {
-    if (!storage) throw new TypeError();
-    storage.setItem(ADMIN_SESSION_STORAGE_KEY, JSON.stringify(record));
-  } catch {
-    clearAdminSession({ storage });
+  if (!storeAdminSessionIfUnchanged(sessionAtStart, record, storage, now(), sessionEpochAtStart)) {
     throw new AuthSessionError();
   }
   removeLegacyMaster(legacyStorage);
   return { transport, expiresAt };
+}
+
+/** Revoke an unsaved connection-test session against its own validated base. */
+export async function revokeStoredAdminSession(
+  options: Omit<CommonOptions, 'apiBase'> = {},
+): Promise<boolean> {
+  const storage = options.storage === undefined ? defaultAdminSessionStorage() : options.storage;
+  try {
+    const raw = storage?.getItem(ADMIN_SESSION_STORAGE_KEY);
+    if (!raw || raw.length > 4096) return false;
+    const parsed = JSON.parse(raw) as Partial<StoredAdminSession>;
+    if (typeof parsed.apiBase !== 'string') return false;
+    const session = getAdminSession(parsed.apiBase, { storage, now: options.now });
+    if (!session) return false;
+    return await revokeAdminSession(session.apiBase, { ...options, storage });
+  } catch {
+    return false;
+  }
 }
 
 /** Best-effort server revocation used when switching away from a backend.
@@ -336,7 +453,7 @@ export async function revokeAdminSession(
   apiBase: string,
   {
     fetchImpl = fetch,
-    storage = defaultSessionStorage(),
+    storage = defaultAdminSessionStorage(),
     windowLike = defaultWindow(),
     now = Date.now,
     timeoutMs = 1500,
@@ -346,12 +463,12 @@ export async function revokeAdminSession(
   try {
     base = normalizedApiBase(apiBase);
   } catch {
-    clearAdminSession({ storage });
     return false;
   }
   const session = getAdminSession(base, { storage, now });
   const sameOrigin = isSameOriginApi(base, windowLike);
-  clearAdminSession({ storage });
+  advanceAdminSessionEpoch(storage);
+  if (session) clearAdminSessionIfMatches(session, storage);
   // Cross-origin cookie auth cannot work (the cookie is SameSite=Strict), and
   // without a bearer token there is nothing meaningful to revoke remotely.
   if (!session && !sameOrigin) return true;
@@ -419,7 +536,7 @@ export async function requestWebSocketTicket(
   {
     apiBase,
     fetchImpl = fetch,
-    storage = defaultSessionStorage(),
+    storage = defaultAdminSessionStorage(),
     windowLike = defaultWindow(),
     now = Date.now,
     timeoutMs = 5000,
@@ -461,8 +578,9 @@ export async function requestWebSocketTicket(
 
   if (response.status !== 201) {
     if (response.status === 401 || response.status === 403) {
-      clearAdminSession({ storage });
-      dispatchAuthRequired(windowLike);
+      // A late rejection belongs to the exact token sent above. Another tab
+      // may already have exchanged a replacement session in shared storage.
+      if (clearAdminSessionIfMatches(session, storage)) dispatchAuthRequired(windowLike);
     }
     throw new AuthSessionError(response.status);
   }

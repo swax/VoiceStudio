@@ -25,7 +25,6 @@ import StorageUsagePanel from '../components/settings/StorageUsagePanel';
 import HFMirrorPanel from '../components/settings/HFMirrorPanel';
 import SharingPanel from '../components/settings/SharingPanel';
 import RemoteBackendPanel from '../components/settings/RemoteBackendPanel';
-import WorkersPanel from '../components/settings/WorkersPanel';
 import MCPBindingsPanel from '../components/settings/MCPBindingsPanel';
 import OpenApiPanel from '../components/settings/OpenApiPanel';
 import PronunciationPanel from '../components/settings/PronunciationPanel';
@@ -242,11 +241,7 @@ export default function Settings() {
       `- **Outputs directory:** ${info?.outputs_dir || '—'}`,
       `- **Crash log:** ${info?.crash_log_path || '—'}`,
       `- **Update channel:** ${updateChannel}`,
-      `- **Update endpoint:** ${
-        updateChannel === 'preview'
-          ? 'https://github.com/debpalash/VoiceStudio/releases/download/preview/latest.json'
-          : 'https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json'
-      }`,
+      `- **Update endpoint:** https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json`,
       `- **User agent:** ${ua}`,
     ];
     try {
@@ -454,8 +449,6 @@ export default function Settings() {
             <MCPBindingsPanel />
           </>
         );
-      case 'workers':
-        return <WorkersPanel />;
       case 'openapi':
         return <OpenApiPanel />;
       case 'credentials':

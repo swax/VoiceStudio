@@ -30,7 +30,9 @@ handshake even on a cold filesystem.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
+import logging
 import os
 import struct
 import sys
@@ -92,7 +94,11 @@ def _recv(stream):
 def _measure_vram_mb() -> float:
     """This sidecar's own GPU memory in MB. 0 on CPU. Never raises."""
     try:
-        import torch
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
         mps = getattr(torch.backends, "mps", None)
@@ -113,6 +119,63 @@ def _ensure_backend_on_path() -> None:
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if root and root not in sys.path:
         sys.path.insert(0, root)
+
+
+def _prefetch_weights(checkpoint: str, stop: threading.Event) -> None:
+    """Read the installed checkpoint's weight files so the kernel caches them.
+
+    The ~8 s of torch/transformers imports leave the disk idle, and on a cold
+    cache the 3 GB of weights are read serially right after. Reading them
+    during the imports overlaps the two. Installed files only; never downloads,
+    never raises, and stops as soon as the real load starts.
+    """
+    try:
+        if os.path.isdir(checkpoint):
+            root = checkpoint
+        else:
+            from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+            root = snapshot_download(checkpoint, local_files_only=True)
+        for folder, _dirs, names in os.walk(root):
+            for name in sorted(names):
+                if not name.endswith(".safetensors"):
+                    continue
+                with open(os.path.join(folder, name), "rb", buffering=0) as handle:
+                    while not stop.is_set() and handle.read(8 * 1024 * 1024):
+                        pass
+            if stop.is_set():
+                return
+    except Exception:  # noqa: BLE001 - a warm-up hint must never fail a synthesis
+        return
+
+
+@contextlib.contextmanager
+def _skip_unused_heavy_imports():
+    """Keep transformers from importing sklearn and torchvision.
+
+    transformers imports sklearn (an assisted-decoding helper) and torchvision
+    (image utils) whenever they are installed. Speech synthesis uses neither,
+    and together they cost ~2 s of every cold start. They are blocked only for
+    the omnivoice import, then unblocked, so later code can still import them.
+
+    transformers decides once per process whether each optional package is
+    installed and caches the answer. If it is already imported (the reference
+    ASR probe imports it before a clone without reference text), it may have
+    cached "installed" and would then import a blocked stub and fail every
+    later synthesis, so nothing is blocked in that case (#3551).
+    """
+    if "transformers" in sys.modules:
+        yield
+        return
+    blocked = [m for m in ("sklearn", "torchvision") if m not in sys.modules]
+    for module in blocked:
+        sys.modules[module] = None
+    try:
+        yield
+    finally:
+        for module in blocked:
+            if sys.modules.get(module, False) is None:
+                del sys.modules[module]
 
 
 def _load_model(stdout):
@@ -161,12 +224,23 @@ def _load_model(stdout):
                 "percent": progress["percent"],
             })
 
-    torch = _lazy_torch()
-    OmniVoice = _lazy_omnivoice()
     checkpoint = resolve_omnivoice_checkpoint()
+    stop_prefetch = threading.Event()
+    threading.Thread(
+        target=_prefetch_weights,
+        args=(checkpoint, stop_prefetch),
+        name="omnivoice-weight-prefetch",
+        daemon=True,
+    ).start()
+    torch = _lazy_torch()
+    with _skip_unused_heavy_imports():
+        OmniVoice = _lazy_omnivoice()
     device = get_best_device()
+    from omnivoice.utils.dtype import tts_dtype_name
+
     preload_asr = should_preload_tts_asr()
 
+    stop_prefetch.set()
     lid = register_listener(_on_progress)
     heartbeat = threading.Thread(
         target=_heartbeat,
@@ -176,7 +250,8 @@ def _load_model(stdout):
     heartbeat.start()
     try:
         _model = OmniVoice.from_pretrained(
-            checkpoint, device_map=device, dtype=torch.float16, load_asr=preload_asr,
+            checkpoint, device_map=device,
+            dtype=getattr(torch, tts_dtype_name(device)), load_asr=preload_asr,
         )
     finally:
         stop_heartbeat.set()
@@ -186,7 +261,7 @@ def _load_model(stdout):
     return _model
 
 
-def _tensor_to_pcm_b64(audio, sample_rate: int) -> tuple[str, int, int]:
+def _tensor_to_pcm_b64(audio, sample_rate: int, audio_format="s16le") -> tuple[str, int, int]:
     """Convert a torch waveform tensor (1, N) in [-1, 1] to base64 int16 PCM."""
     import numpy as np
 
@@ -199,7 +274,10 @@ def _tensor_to_pcm_b64(audio, sample_rate: int) -> tuple[str, int, int]:
         # not a downmix but a destroyed waveform. (#1328)
         arr = arr.mean(axis=int(np.argmin(arr.shape)))
     arr = np.clip(arr, -1.0, 1.0)
-    pcm = (arr * 32767.0).astype(np.int16).tobytes()
+    if audio_format not in ("s16le", "f32le"):
+        raise ValueError("Unsupported audio transport format")
+    pcm = (arr.astype("<f4").tobytes() if audio_format == "f32le"
+           else (arr * 32767.0).astype("<i2").tobytes())
     return base64.b64encode(pcm).decode("ascii"), int(sample_rate), int(arr.shape[0])
 
 
@@ -209,10 +287,36 @@ def _handle_synthesize(msg: dict, stdout) -> None:
     if not text or not isinstance(text, str):
         raise ValueError("synthesize: missing or non-string 'text'")
 
-    model = _load_model(stdout)
-
     ref_audio = msg.get("ref_audio") or None
     ref_text = msg.get("ref_text") or None
+    # Outcome of the transcription below when it ran and found nothing, so the
+    # cached-prompt path does not run the same recognizers a second time.
+    reference_asr = None
+    if isinstance(ref_audio, str) and not (ref_text or "").strip():
+        # Keep native ASR inside the same killable process and synthesize
+        # deadline as TTS, rather than holding the API's GPU worker forever.
+        _ensure_backend_on_path()
+        from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
+        from services.tts_backend import (
+            has_unresolved_clone_prompt,
+            reference_duration_s,
+        )
+
+        duration = reference_duration_s(ref_audio)
+        if (duration is None or duration <= CLONE_REF_TEXT_MAX_SECONDS) and not (
+            has_unresolved_clone_prompt(ref_audio, msg.get("preprocess_prompt", True))
+        ):
+            from services.asr_backend import transcribe_reference
+
+            ref_text = None
+            try:
+                ref_text = transcribe_reference(ref_audio, release_after=True)
+                reference_asr = None if ref_text else "empty"
+            except Exception:  # noqa: BLE001 — preserve installed-only model fallback
+                reference_asr = "failed"
+                logging.getLogger(__name__).warning("reference transcript resolution failed")
+
+    model = _load_model(stdout)
     gen_kw = {k: msg[k] for k in _GEN_KW_ALLOWLIST if k in msg}
 
     seed = msg.get("seed")
@@ -221,16 +325,34 @@ def _handle_synthesize(msg: dict, stdout) -> None:
 
         torch.manual_seed(int(seed))
 
-    audios = model.generate(
-        text=text, ref_audio=ref_audio, ref_text=ref_text, **gen_kw
-    )
+    # One reference encode per sidecar lifetime, not per request: a long
+    # reference otherwise reloads the passage-selection Whisper on every
+    # line, and on 8 GB Macs that phase alone can outlast the recv deadline.
+    # Any reference still without a transcript takes this path, whatever its
+    # length: when resolution found no words, plain generate() would load the
+    # model's own ASR and (now) release it again on every line.
+    untranscribed = isinstance(ref_audio, str) and not (ref_text or "").strip()
+    if untranscribed:
+        _ensure_backend_on_path()
+        from services.tts_backend import generate_with_cached_ref  # noqa: PLC0415
+
+        audios = generate_with_cached_ref(
+            model, text=text, ref_audio=ref_audio, ref_text=None,
+            release_reference_asr=True, reference_asr=reference_asr, **gen_kw,
+        )
+    else:
+        audios = model.generate(
+            text=text, ref_audio=ref_audio, ref_text=ref_text, **gen_kw
+        )
     audio = audios[0] if isinstance(audios, (list, tuple)) else audios
     sample_rate = int(getattr(model, "sampling_rate", OMNIVOICE_SAMPLE_RATE))
 
-    pcm_b64, sr, n_samples = _tensor_to_pcm_b64(audio, sample_rate)
+    audio_format = msg.get("audio_format", "s16le")
+    pcm_b64, sr, n_samples = _tensor_to_pcm_b64(audio, sample_rate, audio_format)
     _send(stdout, {
         "op": "audio",
         "audio_pcm_b64": pcm_b64,
+        "audio_format": audio_format,
         "sample_rate": sr,
         "n_samples": n_samples,
     })

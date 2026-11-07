@@ -48,11 +48,38 @@ _entries: "OrderedDict[str, dict]" = OrderedDict()
 
 # Ordered: first match wins, most specific patterns up top.
 _CLASS_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Mirrors `failure._GPU_OOM_SIGNATURES`; pinned equal by
+    # tests/test_xpu_device_oom.py.
     ("GPU_OOM", (
         "cuda out of memory",
+        "cuda error: out of memory",
+        "cuda_error_out_of_memory",
         "mps backend out of memory",
         "hip out of memory",
         "out of memory on device",
+        "xpu out of memory",
+        "out_of_device_memory",
+    )),
+    # #2462: the host ran out of system RAM. Mirrors
+    # `failure._HOST_OOM_SIGNATURES` — kept as literals here so a journal
+    # classification never depends on importing the taxonomy, and pinned to
+    # agree with it by tests/test_host_memory_failure_2462.py. After GPU_OOM so
+    # a device OOM keeps its own class, exactly as `classify` orders them.
+    #
+    # NOT a bare "memoryerror" needle: that is a substring of torch's
+    # `OutOfMemoryError`, so it would claim every device OOM whose message the
+    # GPU rule above doesn't spell out (a custom allocator's wording) and
+    # advise a CPU host to free VRAM. Python's `MemoryError` is matched by TYPE
+    # below instead, which is the whole reason this class exists — a bare
+    # `MemoryError()` has an empty message and no signature to match on.
+    ("HOST_MEMORY_EXHAUSTED", (
+        "defaultcpuallocator: not enough memory",
+        "not enough memory: you tried to allocate",
+        "can't allocate memory",
+        "cannot allocate memory",
+        "std::bad_alloc",
+        "not enough memory to continue the execution of the program",
+        "[winerror 8]",
     )),
     ("PYANNOTE_LICENSE_REQUIRED", (
         "pyannote",  # only meaningful combined with an auth marker — see classify()
@@ -128,6 +155,20 @@ def classify_exception(exc: BaseException, trace: str = "") -> str:
             if "pyannote" in blob and any(m in blob for m in _AUTH_MARKERS):
                 return cls
             continue
+        if cls == "HOST_MEMORY_EXHAUSTED":
+            # Matched by TYPE, not by the "memoryerror" substring that appears
+            # in the blob above: `str(MemoryError())` is EMPTY, so a bare
+            # `MemoryError` — Python's own name for a failed host allocation,
+            # and the reason this class exists — carries no signature at all
+            # and used to journal as UNKNOWN. That substring would also claim
+            # torch's `OutOfMemoryError`, since it ends in the same letters,
+            # telling a GPU host to free system RAM. Exact type, exact intent.
+            if type(exc).__name__ == "MemoryError":
+                return cls
+            # WinError 8 by number: a localized OS message carries no English
+            # signature, but the errno-style attribute is language-neutral.
+            if getattr(exc, "winerror", None) == 8:
+                return cls
         if any(n in blob for n in needles):
             return cls
     return "UNKNOWN"

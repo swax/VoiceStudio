@@ -8,9 +8,11 @@ loaded model. The deterministic identity sample is rendered lazily on first
 preview/use instead.
 
 This module runs torch-free against an isolated data dir and drives the real
-`create_profile` / `get_profile_audio` endpoint coroutines directly. Each test
-uses `asyncio.run(...)` (NOT a shared/`get_event_loop()` loop) and the module
-lives at top-level `tests/` (not `tests/backend/`) to avoid the
+`create_profile` / `get_profile_audio` endpoint coroutines directly. Pass
+`design_recipe=None` and `engine=None` explicitly: FastAPI only unwraps
+`Form(None)` defaults during request injection, not direct Python calls.
+Each test uses `asyncio.run(...)` (NOT a shared/`get_event_loop()` loop) and
+the module lives at top-level `tests/` (not `tests/backend/`) to avoid the
 sys.modules-isolation collection-order leak.
 """
 from __future__ import annotations
@@ -19,6 +21,7 @@ import asyncio
 import importlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -67,7 +70,7 @@ def test_design_save_creates_row_when_model_unavailable(iso, monkeypatch):
             seed=None,
             personality="",
             kind="design",
-            vd_states=json.dumps(_VD),
+            vd_states=json.dumps(_VD), design_recipe=None, engine=None,
         )
     )
     assert result["kind"] == "design"
@@ -88,6 +91,103 @@ def test_design_save_creates_row_when_model_unavailable(iso, monkeypatch):
     assert stored == {**_VD, "Style": "Auto", "EnglishAccent": "Auto", "ChineseDialect": "Auto"}
 
 
+def test_cold_design_save_does_not_load_engine(iso, monkeypatch):
+    """An offline/cold renderer cannot hold the persistence request open."""
+    _, db, prof = iso
+    from api.routers import archetypes as arch
+    from services import model_manager
+    monkeypatch.setattr(model_manager, "get_model_status", lambda: {"loaded": False})
+    renders = []
+
+    async def blocked_render(*args):
+        renders.append(args)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(arch, "_render_archetype_wav", blocked_render)
+
+    async def save():
+        return await asyncio.wait_for(prof.create_profile(
+            name="Offline design", ref_audio=None, ref_text="", instruct="female",
+            language="English", seed=None, personality="", kind="design",
+            vd_states=json.dumps(_VD), design_recipe=None, engine=None, image=None,
+        ), timeout=1)
+
+    result = asyncio.run(save())
+    assert not renders
+    with db.db_conn() as conn:
+        row = conn.execute("SELECT ref_audio_path FROM voice_profiles WHERE id=?", (result["id"],)).fetchone()
+    assert row is not None and not row["ref_audio_path"]
+
+
+def test_warm_design_save_preserves_identity_sample(iso, monkeypatch):
+    """A resident engine still renders the reference used by later synthesis."""
+    cfg, db, prof = iso
+    from api.routers import archetypes as arch
+    from services import model_manager
+    monkeypatch.setattr(model_manager, "get_model_status", lambda: {"loaded": True})
+    renders = []
+
+    async def render(recipe, out_path, *, allow_model_load):
+        assert allow_model_load is False
+        renders.append(recipe)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"identity sample")
+
+    monkeypatch.setattr(arch, "_render_archetype_wav", render)
+    result = asyncio.run(prof.create_profile(
+        name="Warm design", ref_audio=None, ref_text="Sample line", instruct="female",
+        language="English", seed=None, personality="", kind="design",
+        vd_states=json.dumps(_VD), design_recipe=None, engine=None, image=None,
+    ))
+    assert len(renders) == 1 and renders[0]["sample_script"] == "Sample line"
+    with db.db_conn() as conn:
+        row = conn.execute("SELECT ref_audio_path FROM voice_profiles WHERE id=?", (result["id"],)).fetchone()
+    assert (Path(cfg.VOICES_DIR) / row["ref_audio_path"]).read_bytes() == b"identity sample"
+
+
+@pytest.mark.parametrize("on_gpu_worker", [False, True])
+def test_design_save_cannot_cold_load_after_residency_check(iso, monkeypatch, on_gpu_worker):
+    """ASR/idle unload between admission and rendering must keep save local."""
+    _, db, prof = iso
+    from api.routers import archetypes, generation
+    from services import model_manager
+    monkeypatch.setattr(model_manager, "model", object())
+    monkeypatch.setattr(model_manager, "get_model_status", lambda: {"loaded": True})
+    monkeypatch.setattr(model_manager, "running_on_gpu_pool", lambda: on_gpu_worker)
+    monkeypatch.setattr(generation, "get_model", model_manager.get_model)
+    real_render = archetypes._render_archetype_wav
+    loads = []
+
+    async def blocked_load():
+        loads.append(True)
+        await asyncio.Event().wait()
+
+    def inline_load():
+        loads.append(True)
+        raise RuntimeError("Unexpected cold load on GPU worker")
+
+    async def unload_then_render(*args, **kwargs):
+        model_manager.model = None
+        return await real_render(*args, **kwargs)
+
+    monkeypatch.setattr(model_manager, "_load_model_with_timeout", blocked_load)
+    monkeypatch.setattr(model_manager, "_load_model_exclusive", inline_load)
+    monkeypatch.setattr(archetypes, "_render_archetype_wav", unload_then_render)
+
+    async def save():
+        return await asyncio.wait_for(prof.create_profile(
+            name="Unloaded during save", ref_audio=None, ref_text="", instruct="female",
+            language="English", seed=None, personality="", kind="design",
+            vd_states=json.dumps(_VD), design_recipe=None, engine=None, image=None,
+        ), timeout=1)
+
+    result = asyncio.run(save())
+    assert not loads
+    with db.db_conn() as conn:
+        row = conn.execute("SELECT ref_audio_path FROM voice_profiles WHERE id=?", (result["id"],)).fetchone()
+    assert row is not None and not row["ref_audio_path"]
+
+
 def test_all_auto_design_is_saveable(iso, monkeypatch):
     """An all-Auto design (empty instruct) saves; it isn't gated on instruct."""
     _, db, prof = iso
@@ -103,7 +203,7 @@ def test_all_auto_design_is_saveable(iso, monkeypatch):
             seed=None,
             personality="",
             kind="design",
-            vd_states=json.dumps(_VD_AUTO),
+            vd_states=json.dumps(_VD_AUTO), design_recipe=None, engine=None,
         )
     )
     assert result["kind"] == "design"
@@ -133,15 +233,21 @@ def test_lazy_sample_renders_on_first_audio_request(iso, monkeypatch):
             seed=None,
             personality="",
             kind="design",
-            vd_states=json.dumps(_VD),
+            vd_states=json.dumps(_VD), design_recipe=None, engine=None,
         )
     )
     pid = result["id"]
 
     # Now the engine becomes available: the next /audio request renders + caches.
     async def _ok(a, out_path):
+        import wave
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(b"RIFF" + b"\x00" * 2048)
+        with wave.open(str(out_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24_000)
+            wav.writeframes(b"\x00\x01" * 64)
 
     from api.routers import archetypes as arch
     monkeypatch.setattr(arch, "_render_archetype_wav", _ok)

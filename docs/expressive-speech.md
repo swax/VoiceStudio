@@ -12,15 +12,23 @@ ignores.
 | You want | Do this | Works on |
 |---|---|---|
 | A pause | Type `[pause]`, `[pause 500ms]`, or `[pause 1.5s]` in the text | Every engine |
-| Laughter or a sigh | ⊕ Insert → `[laughter]` / `[sigh]` | Default engine (VoiceStudio) |
-| An audible breath **on demand** | `[breath]` in the text | CosyVoice 3 only (opt-in) — see [Breaths](#breaths-specifically) |
+| Laughter or a sigh | ⊕ Insert → `[laughter]` / `[sigh]` | Default engine (VoiceStudio), CosyVoice 3 (`[laughter]`) |
+| An audible breath **on demand** | ⊕ Insert → `[breath]` | CosyVoice 3 only (opt-in) — see [Breaths](#breaths-specifically) |
 | Whispering | Style → `whisper` (the voice-design/style field) | Default engine |
-| Emotion ("excited", "sad", graded intensity) | IndexTTS2's emotion controls — Audiobook tab's Production Overrides, or the `/ws/tts` API — or CosyVoice 3 instruct | Opt-in engines only |
+| Emotion ("scared, then excited", graded intensity) | **Voice Cloning → Emotion**: sliders or a description on IndexTTS2, a written delivery direction on CosyVoice 3 and VoxCPM2. Also Audiobook Production Overrides (IndexTTS2) and the `/generate` / `/ws/tts` APIs | Opt-in engines only |
 | The same take again | Pin the seed / lock the profile | Default engine |
+
+The **Emotion** button sits beside Synthesize on every engine. On an engine
+that can't take emotion it says so and names the engines that can, and the
+⊕ Insert menus (Voice Cloning's script and Audiobook's **Reactions**) gray out
+tags the active engine would read aloud as words. The first take you render
+shows a one-time tip pointing at both.
 
 ## Recovering an interrupted audiobook
 
-Switching away from the Audiobook tab explicitly interrupts synthesis at a chapter boundary. The Audiobook recovery card lets you resume with its cached chapters, and **Open chapter cache** reveals the chapter audio cache.
+Leaving the Audiobook tab interrupts synthesis at a chapter boundary. When you
+return, the recovery card can reuse completed chapters and render only the
+remainder; **Open chapter cache** reveals the cached audio folder.
 
 Cached chapters are matched by their script, voice and render settings, not by where the data folder lives, so they stay reusable after the folder is moved (in **Settings → Storage** or by hand) or the machine loses power. One exception: chapters cached by an earlier version render once more if the folder is moved by hand before this version has been launched from the old location. When a chapter you expected to reuse renders again, the backend log names the input that changed (for example a voice's reference text or the pronunciation lexicon); the diagnostic bundle includes that log.
 
@@ -32,8 +40,11 @@ the pipeline goes out of its way not to break tags:
 - Tilde-separated integer, signed, and decimal ranges get a spoken separator in
   English, Korean, Japanese, and Chinese; malformed chains and product codes
   are left unchanged.
-- The text-normalization pass (numbers, abbreviations) skips every `[…]` span
-  (`backend/services/text_normalization.py`).
+- Zero-width joiners and non-joiners used in Persian, Urdu, Indic text and
+  emoji survive normalization; unsafe invisible and direction controls are
+  still removed.
+- The text-normalization pass (numbers, abbreviations, markdown emphasis)
+  skips every `[…]` span (`backend/services/text_normalization.py`).
 - The long-text chunker never cuts inside a bracket tag
   (`backend/services/chunked_tts.py`, `_BRACKET_TAG_RE`).
 
@@ -46,11 +57,23 @@ for your engine below.
 
 ## What each engine can do today
 
+Clients read the same answer from `GET /engines/tts`: each engine carries
+`expression_caps` — `emotion` is `graded` (IndexTTS2), `direction` (written
+`instruct` steers a cloned voice: CosyVoice 3, VoxCPM2) or `none`, and `tags`
+lists the reaction tags its tokenizer renders.
+
 ### Every engine
 
 - **`[pause Nms]` markers** — `[pause]` (350 ms default), `[pause 500ms]`,
   `[pause 1s]`, up to 10 s. Rendered as real stitched silence, so it works
-  identically on all engines.
+  identically on all engines. **Settings → Pronunciation dictionary → Pauses →
+  Fill pauses with room tone** (off by default; `OMNIVOICE_PAUSE_FILL=room_tone`
+  wins over the switch) fills these gaps, and audiobook line and paragraph gaps,
+  with noise shaped like the take's own quiet background instead of digital
+  zeros, faded over 40 ms into the lines on each side, so the background no
+  longer cuts out at every pause. It is derived from the generated take, needs
+  no model, is reproducible, and falls back to silence when the take has no
+  usable quiet floor. Long-text chunk joins are not changed.
 - **Punctuation** — ellipses, dashes, exclamation marks, and short fragments
   genuinely shape pacing and intonation. Cheap, underrated.
 - **The reference clip is a performance direction.** Zero-shot cloning mirrors
@@ -62,11 +85,13 @@ for your engine below.
   dictionary. Not expression, but often what a "it says this weirdly" problem
   actually needs.
 
+Pronunciation dictionary matching uses Unicode case-insensitive literal matches. Each matched term uses its own respelling; distinct terms such as Straße and STRASSE can have different respellings. Longer terms win overlaps, and later equal-length case variants retain precedence. Because that precedence follows entry order, reordering such variants re-renders cached longform chapters; reordering unrelated entries does not.
+
 ### Default engine (VoiceStudio)
 
 **Non-verbal tags.** The bundled model natively tokenizes 13 reaction tags
 (`omnivoice/models/omnivoice.py`, `_NONVERBAL_PATTERN`) — the ⊕ Insert button
-at the corner of the Script box lists them all:
+at the corner of the Script box offers them all while this engine is active:
 
 `[laughter]` `[sigh]` `[confirmation-en]` `[question-en]` `[question-ah]`
 `[question-oh]` `[question-ei]` `[question-yi]` `[surprise-ah]`
@@ -101,30 +126,30 @@ parentheses; details in [generation-parameters.md](generation-parameters.md)):
 - `postprocess_output` (on) — removes long silences from the output. Turn it
   off when the silence *is* the performance.
 
-The Audiobook panel adds two longform-only controls on top of that surface:
-IndexTTS2 emotion (see below), and **Vary repeated lines** — a cache opt-out
+The Audiobook panel adds two additional production controls:
+IndexTTS2 emotion (also available in Voice Cloning; see below), and **Vary repeated lines** — a cache opt-out
 that gives every identical line its own take instead of replaying one recording
 (off by default, so books stay byte-reproducible unless you ask for variety).
 
-It also owns the **joins**. Every engine pads each rendered line with its own
-lead-in and tail silence (GPT-SoVITS ≈ 70 ms / 300 ms, others similar); joined
-raw, a book reads as a string of separate takes. By default the renderer trims
-that padding (**Trim engine silence**, −40 dBFS with 40 ms kept at each edge)
-and inserts deliberate silence instead: **Gap between lines** (250 ms) between
-consecutive lines that carry no `[pause]` of their own — an explicit `[pause]`
-replaces the gap rather than adding to it — and **Gap between paragraphs**
-(350 ms) at a blank line inside one line of script. A line that inline markup
-(`[slow]`, `[emphasis]`, `[spell]`) splits into several renders is still one
-line: no gap lands in the middle of it (and a blank line sitting on that split
-still gets the paragraph gap). A `[voice:NAME]` change is a line boundary and
-gets the line gap, blank line or not — the paragraph gap is for breaks inside
-one voice's text. With the paragraph gap at 0 a line is
-rendered in one engine call exactly as before, so setting both gaps to 0 and
-turning trimming off gives the pre-existing hard joins (and their cache keys)
-back, including cached renders with seed or emotion overrides. A chapter may
-request at most 15 minutes of added join silence; larger requests fail before
-synthesis or cache reads. Reduce the gaps or split the chapter to proceed.
-Accepted gaps retain their exact duration on fresh renders and cache reuse.
+**Joins between lines.** Every engine pads each render with its own lead-in and
+tail, from tens to hundreds of milliseconds, so the pauses you hear between lines
+are whatever the engine happened to add. The Audiobook and Stories production
+controls make that explicit: **Trim engine silence** cuts everything quieter than
+-40 dBFS from both ends of each render (keeping 40 ms), **Gap between lines**
+and **Gap between paragraphs** then insert exactly the silence you choose, up to
+5 seconds each. With both gaps at zero and trimming off, joins are the old hard
+joins and cache keys are unchanged, including renders that use a seed or
+emotion override, so existing books are not re-rendered. An explicit `[pause]`
+replaces the line gap after its line instead of adding to it. Markup that splits
+one line (`[slow]`, `[fast]`, `[emphasis]`, `[spell]`) is still one line: there
+is no gap inside it, except that a blank line at the split gets the paragraph gap.
+A `[voice:NAME]` change is a line boundary and gets the line gap. A paragraph gap
+above zero renders the paragraphs of a line as separate engine calls; at zero a
+line is one call, exactly as before. The join stage adds at most 15 minutes of
+silence to a chapter; a request beyond that fails before any synthesis or cache
+read, with a message to lower the gaps or split the chapter. Values around 250 ms
+for lines and 350 ms for paragraphs suit most narration, but they are explicit
+choices: the defaults are 0.
 
 **Longform-only tags.** Audiobook and Stories additionally parse SSML-lite —
 `[slow]…[/slow]`, `[fast]…[/fast]`, `[emphasis]…[/emphasis]`, `[spell]` —
@@ -144,9 +169,10 @@ install it. CosyVoice 3 honors, inline in the text:
 plus **natural-language instruct** ("speak with a Sichuan accent", "sound
 exhausted") — the backend appends the model's required `<|endofprompt|>`
 terminator for you (`backend/services/tts_backend.py`,
-`CosyVoiceBackend`). One catch: the Studio style field whitelists instruct to
-the default engine's taxonomy, so free-text instruct currently needs the API
-(`POST /generate` with an `instruct` form field, or `/ws/tts`).
+`CosyVoiceBackend`). In **Voice Cloning**, open **Emotion** and write the
+direction in **Delivery direction**; it reaches the model as written. The API
+takes the same text as the `instruct` form field of `POST /generate` (or
+`/ws/tts`).
 
 Setup: clone + install [CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
 (non-trivial: `git clone --recursive`, its requirements, SoX), then set
@@ -159,22 +185,37 @@ VoxCPM2's native convention is an instruct prefix inside the text itself:
 `(speaking fast, out of breath) I can't stop now.` The app maps the
 `instruct` field onto that prefix (`backend/services/tts_backend.py`,
 `VoxCPM2Backend.generate`), and because the convention is literally in-text,
-typing the parenthetical at the start of your text works too. Treat it as
-guidance, not a guarantee — adherence varies by voice and language.
+typing the parenthetical at the start of your text works too. In **Voice
+Cloning**, **Emotion → Delivery direction** fills that field for a cloned
+voice. Treat it as guidance, not a guarantee — adherence varies by voice and
+language.
 
 ### IndexTTS2 (opt-in)
 
 The only engine with **graded** emotion control: an 8-value emotion vector
 (happy, angry, sad, afraid, disgusted, melancholic, surprised, calm), an
 emotion *reference clip* whose delivery is mimicked (with a blend strength),
-or a natural-language emotion description. The **Audiobook tab's Production
-Overrides** expose the natural-language path — an *Emotion description* field
-plus an *Emotion strength* slider (`emo_alpha`), shown only when IndexTTS2 is
-the active engine so there are no dead controls. The full surface (the 8-float
-`emo_vector`, an `emo_audio` reference clip) is on the streaming WebSocket API
-(`/ws/tts` — `emo_vector`, `emo_audio`, `emo_alpha`, `emo_text` fields;
-`backend/api/routers/tts_stream.py`). The single-shot Voice page does not carry
-emotion controls yet.
+or a natural-language emotion description.
+
+In **Voice Cloning**, select IndexTTS2 and open the **Emotion** (heart-pulse)
+button beside Voice controls. The default is **Off**. Choose **Description**
+for a free-form emotion instruction with an intensity slider (0–0.6, the
+recommended maximum for text emotion in IndexTTS2), or choose **Sliders** for
+the eight individual emotion weights (0–1). The reference audio continues to
+define the speaker's voice.
+
+The **Audiobook** tab's Production Overrides also support the description and
+intensity; with any other engine those two fields stay visible but disabled. The multipart **`POST /generate`** API accepts either `emo_text`
+plus optional `emo_alpha`, or `emo_vector` as a JSON array of exactly eight
+finite numbers between 0 and 1. Mixing the two methods, supplying intensity
+without text, or choosing an unsupported engine returns HTTP 422 before
+loading any model. Classic audio responses and NDJSON streaming previews
+(`stream=true`) pass the same emotion controls to the engine.
+
+An independent **emotion reference clip** remains available via the WebSocket
+API `/ws/tts` (`emo_audio`, alongside the other controls;
+`backend/api/routers/tts_stream.py`). It is not yet exposed in Voice
+Cloning's Emotion popover.
 
 ## Breaths, specifically
 
@@ -247,11 +288,13 @@ engine-agnostic tag surface (`[excited]`, `[whispers]`, reaction tags like
 `[breath]`) that lowers to whatever the active engine can really do and
 **visibly degrades** where it can't, plus an Expression panel (emotion
 dropdown + intensity + emotion-reference clip) everywhere in the UI. The
-pronunciation phases have shipped (dictionary + `[[…]]` overrides), and the
-Audiobook tab now carries a first Expression surface — IndexTTS2 emotion
-description + strength, engine-gated. Still spec'd, not shipped: the
-engine-agnostic inline emotion/reaction tag grammar, the emotion-reference
-clip picker, and the Expression panel on the single-shot Voice page. No
+pronunciation phases have shipped (dictionary + `[[…]]` overrides), and so
+has the capability disclosure: Voice Cloning's **Emotion** button and the
+Audiobook emotion fields appear on every engine and say what the active one
+can do, and the Insert menus offer only the tags it renders. Still spec'd, not
+shipped: the engine-agnostic inline emotion/reaction tag grammar (per-span
+emotion inside one take), the emotion-reference clip picker, and a written
+direction for Audiobook renders. No
 promised date — when each lands, this page gets updated in the same PR.
 
 Omitted API join options keep legacy hard joins (zero gaps, no edge trim).

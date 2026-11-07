@@ -2,28 +2,28 @@ import { useSyncExternalStore } from 'react';
 type Layout = {
   expandedLibraryContext?: string | null;
   editingProfileId?: string | null;
-  panel: 'voice' | 'settings' | null;
+  panel: 'voice' | null;
   libraryOpen: boolean;
   libraryTab: 'voices' | 'takes';
-  /** Shrink the sidebar to a rail when a workspace opens its own side panel on a narrow window. */
+  /** Allow the sidebar to fold into an icon rail on its own (default on). */
   autoCollapseSidebar: boolean;
 };
 const key = 'voicestudio.workspace-layout';
 const defaults: Layout = {
-  panel: null,
+  autoCollapseSidebar: true,
   libraryOpen: true,
   libraryTab: 'voices',
-  autoCollapseSidebar: true,
+  panel: null,
 };
 function read(): Layout {
   try {
     const value = JSON.parse(localStorage.getItem(key) ?? '{}');
     return {
-      panel: value?.panel === 'voice' || value?.panel === 'settings' ? value.panel : null,
+      // Voice controls moved to a composer popover; a stored 'settings' pane is dropped.
+      panel: value?.panel === 'voice' ? 'voice' : null,
       libraryOpen: typeof value?.libraryOpen === 'boolean' ? value.libraryOpen : true,
       libraryTab: value?.libraryTab === 'takes' ? 'takes' : 'voices',
-      autoCollapseSidebar:
-        typeof value?.autoCollapseSidebar === 'boolean' ? value.autoCollapseSidebar : true,
+      autoCollapseSidebar: value?.autoCollapseSidebar !== false,
     };
   } catch {
     return defaults;

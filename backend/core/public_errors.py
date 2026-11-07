@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 _PROVIDER_DETAILS = {
@@ -14,14 +15,63 @@ _PROVIDER_DETAILS = {
 }
 
 
+def exception_origin(error: object) -> str:
+    """Where a failure was raised, as ``module:function:line`` plus the cause type.
+
+    The streaming/engine failure log line deliberately withholds the exception
+    message (it can carry a path or a secret), which left every auto-filed
+    "Generation failed" report (#2895, #2684, #2666, #2626, #2622, #2580)
+    without anything to triage: different faults wrote the same line. The
+    innermost frame's importable module name, function and line number are
+    source-code identifiers, and the exception types along the ``__cause__`` /
+    ``__context__`` chain are Python types; neither can contain user text.
+    Never raises.
+    """
+    try:
+        if not isinstance(error, BaseException):
+            return ""
+        tail = error.__traceback__
+        while tail is not None and tail.tb_next is not None:
+            tail = tail.tb_next
+        parts = []
+        if tail is not None:
+            module = str(tail.tb_frame.f_globals.get("__name__", "?"))
+            parts.append(f"at={module}:{tail.tb_frame.f_code.co_name}:{tail.tb_lineno}")
+        chain, seen, current = [], 0, error.__cause__ or error.__context__
+        while current is not None and seen < 4:
+            chain.append(type(current).__name__)
+            current = current.__cause__ or current.__context__
+            seen += 1
+        if chain:
+            parts.append("caused_by=" + ">".join(chain))
+        return "; ".join(parts)
+    except Exception:  # noqa: BLE001 - diagnostics must not replace the failure
+        return ""
+
+
 def provider_failure(kind: str) -> dict[str, str]:
     """Return a stable provider error class and remediation message."""
     safe_kind = kind if kind in _PROVIDER_DETAILS else "error"
     return {"kind": safe_kind, "detail": _PROVIDER_DETAILS[safe_kind]}
 
 
-def stream_failure(code: str) -> dict[str, object]:
-    """Return stable stream metadata selected only from an internal code."""
+_CPU_GENERATION_TIMEOUT_DETAIL = (
+    "Generation ran out of time on this computer's CPU, which renders much "
+    "more slowly than a GPU. The backend is still running. To get it through: "
+    "try a shorter passage, pick a CPU-tuned engine (OmniVoice GGUF or "
+    "Supertonic-3), or raise \"CPU budget\" in Settings → Performance & Device "
+    "and restart the backend."
+)
+
+
+def stream_failure(code: str, *, device: str | None = None) -> dict[str, object]:
+    """Return stable stream metadata selected only from an internal code.
+
+    ``device`` (the dispatch's effective device family) only selects between
+    fixed VoiceStudio-owned wordings — it is never echoed. A CPU timeout is
+    "this machine is slow", not "your passage is too long", so it names the
+    concrete remedies for that case (#2609).
+    """
     failures: dict[str, dict[str, object]] = {
         "generation_busy": {
             "code": "generation_busy",
@@ -70,8 +120,98 @@ def stream_failure(code: str) -> dict[str, object]:
             ),
             "retryable": True,
         },
+        "transcription_media_tool": {
+            "code": "transcription_media_tool",
+            "detail": (
+                "Transcription needs ffmpeg, which VoiceStudio could not find or "
+                "run. Open Settings → Audio tools and use Download/Repair, or "
+                "install ffmpeg (macOS: brew install ffmpeg; Windows: winget "
+                "install Gyan.FFmpeg; Linux: your package manager) and restart "
+                "VoiceStudio. You can also point FFMPEG_PATH at an ffmpeg binary."
+            ),
+            "retryable": True,
+        },
+        "transcription_disk_full": {
+            "code": "transcription_disk_full",
+            "detail": (
+                "Transcription stopped because the disk is full. Free space on "
+                "the drive that holds VoiceStudio's data, model cache or temp "
+                "folder (Settings → Storage shows disk usage and clears "
+                "temporary files), then try again."
+            ),
+            "retryable": True,
+        },
+        "transcription_pipe_lost": {
+            "code": "transcription_pipe_lost",
+            "detail": (
+                "The backend lost its output pipe to the app while transcribing "
+                "(broken pipe). Restart VoiceStudio and try again."
+            ),
+            "retryable": True,
+        },
     }
-    return dict(failures.get(code, failures["generation_failed"]))
+    failure = dict(failures.get(code, failures["generation_failed"]))
+    if code == "generation_timeout" and str(device or "").lower() == "cpu":
+        failure["detail"] = _CPU_GENERATION_TIMEOUT_DETAIL
+    return failure
+
+
+def _exception_chain(error: object, limit: int = 8):
+    """The exception, then its ``__cause__``/``__context__`` links (bounded)."""
+    seen: set[int] = set()
+    while isinstance(error, BaseException) and id(error) not in seen and len(seen) < limit:
+        seen.add(id(error))
+        yield error
+        error = error.__cause__ or error.__context__
+
+
+def transcription_failure_code(error: object) -> str:
+    """Stable ``stream_failure`` code for a private ASR chunk exception.
+
+    Only the exception's type, errno and filename are inspected locally; the
+    caller ships a VoiceStudio-owned message for the returned code, never the
+    exception text. A missing/unrunnable ffmpeg (``[Errno 2] ... 'ffmpeg'``,
+    ``[WinError 193]``, :class:`MediaToolUnavailableError`) and a closed stdio
+    pipe (``[Errno 32] Broken pipe``) each have a different remedy, so they must
+    not collapse into the generic "check the selected ASR engine" reply (#2404,
+    #2405).
+    """
+    import errno
+
+    from services.ffmpeg_utils import MediaToolUnavailableError
+
+    try:
+        from core.failure import is_disk_full_error
+
+        # Every chunk write (temp WAV, model cache) fails the same way until
+        # space is freed; "check the selected ASR engine" sends the user to the
+        # wrong place.
+        if is_disk_full_error(error if isinstance(error, BaseException) else str(error)):
+            return "transcription_disk_full"
+    except Exception:  # noqa: BLE001 — classification must never raise
+        pass
+    pipe = False
+    for exc in _exception_chain(error):
+        if isinstance(exc, MediaToolUnavailableError):
+            return "transcription_media_tool"
+        if isinstance(exc, OSError):
+            name = os.path.basename(str(exc.filename or "")).lower()
+            if name.startswith(("ffmpeg", "ffprobe")) and (
+                exc.errno in (errno.ENOENT, errno.ENOEXEC, errno.EACCES)
+                or getattr(exc, "winerror", None) in (2, 193)
+            ):
+                return "transcription_media_tool"
+        low = str(exc).lower()
+        try:
+            from core.failure import _is_missing_media_tool
+
+            if _is_missing_media_tool(low):
+                return "transcription_media_tool"
+        except Exception:  # noqa: BLE001 — classification must never raise
+            pass
+        if isinstance(exc, BrokenPipeError) or "broken pipe" in low or "[errno 32]" in low:
+            pipe = True
+    return "transcription_pipe_lost" if pipe else "transcription_failed"
 
 
 def stream_generation_failure(error: BaseException | object) -> dict[str, object]:
@@ -105,10 +245,10 @@ def stream_generation_failure(error: BaseException | object) -> dict[str, object
         # a Python type, not user text, and no substring of `error` is copied.
         payload["error_class"] = type(error).__name__
     try:
+        enriched = public_exception_response(error, fallback=str(payload["detail"]))
         from core.failure import is_terminal_failure_topic
 
-        enriched = public_exception_response(error, fallback=str(payload["detail"]))
-        terminal = is_terminal_failure_topic(enriched.get("docs_topic"))
+        is_terminal = is_terminal_failure_topic(enriched.get("docs_topic"))
     except Exception:
         return payload
     hint = enriched.get("hint")
@@ -118,12 +258,7 @@ def stream_generation_failure(error: BaseException | object) -> dict[str, object
         topic = enriched.get("docs_topic")
         if topic:
             payload["docs_topic"] = topic
-            # #2177: a build mismatch, a device selection or an OS policy does
-            # not change between two renders of the same text. Marking these
-            # terminal stops the floor message's "try again" from being the
-            # only advice, and stops the client re-rendering the whole passage
-            # on the classic path to reach the identical failure.
-            if terminal:
+            if is_terminal:
                 payload["terminal"] = True
                 payload["retryable"] = False
             try:
@@ -154,7 +289,11 @@ def public_failure(
     """
     del traceback
     error_class = type(error).__name__ if isinstance(error, BaseException) else "Failure"
-    logger.error("%s (class=%s; details withheld)", log_message, error_class)
+    origin = exception_origin(error)
+    logger.error(
+        "%s (class=%s%s; details withheld)",
+        log_message, error_class, f"; {origin}" if origin else "",
+    )
     return response
 
 
@@ -162,6 +301,24 @@ def public_engine_health(ok: bool, diagnostic: Any) -> str:
     """Map an engine-owned health diagnostic to a stable response message."""
     del diagnostic
     return "Healthy" if ok else "Engine unavailable; check the backend log for details."
+
+
+def classified_request_detail(message: str) -> dict[str, str] | None:
+    """Structured 400 detail for a request failure of a known class, else None.
+
+    ``{"docs_topic", "message", "hint"}`` lets the desktop app show its
+    localized copy and the class's in-app fix (#2929/#2678) instead of the
+    English sentence, and puts the topic in the bug report. Every classified
+    class qualifies, so a class added to the taxonomy needs no route change.
+    Values are VoiceStudio-owned constants only — never ``message`` itself.
+    """
+    from core.failure import classify, public_hint_for_topic
+
+    topic = classify(message)
+    hint = public_hint_for_topic(topic) if topic else ""
+    if not hint:
+        return None
+    return {"docs_topic": topic, "message": hint, "hint": hint}
 
 
 def public_exception_response(error: BaseException, *, fallback: str) -> dict[str, str]:
@@ -187,11 +344,18 @@ def public_exception_response(error: BaseException, *, fallback: str) -> dict[st
     HF_MIRROR_UNREACHABLE is allowed alongside it: its hint is dynamic (it
     names the configured mirror) and its trigger requires that a mirror is
     configured at all, so it cannot fire on an unrelated failure (#874).
+
+    The EXCEPTION is classified, not ``str(error)`` (#2462). The two memory
+    classes are the ones a message cannot carry — a bare ``MemoryError()`` has
+    an empty message, and the generate router re-raises OOMs as its own "ran
+    out of memory" prose — so stringifying first lost exactly the evidence that
+    identifies them. ``classify`` still accepts a plain string, so this is the
+    only behavior that changes.
     """
     from core.failure import _CONTEXT_FREE_HINT_CLASSES, classify, public_hint_for_topic
 
     try:
-        topic = classify(str(error))
+        topic = classify(error)
         if topic and topic not in _CONTEXT_FREE_HINT_CLASSES and topic != "HF_MIRROR_UNREACHABLE":
             topic = ""
         hint = public_hint_for_topic(topic) if topic else ""

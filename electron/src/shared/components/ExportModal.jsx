@@ -570,7 +570,7 @@ export default function ExportModal({
                 <PkgCard
                   icon={<Music size={14} />}
                   title={t('exportModal.pkg_audio_title')}
-                  body={t('exportModal.pkg_audio_body', { count: (dubTracks || []).length })}
+                  body={t('exportModal.pkg_audio_body', { count: selectedDubs.length })}
                   onClick={() => setTab('audio')}
                   cta={t('exportModal.pkg_audio_cta')}
                   ghost
@@ -579,7 +579,7 @@ export default function ExportModal({
             )}
           </div>
 
-          {/* Commercial license notice */}
+          {/* Application and model licence scope */}
           <div className="flex items-center gap-[6px] p-[5px_var(--space-3)] [font-family:var(--chrome-font-mono)] text-[length:var(--chrome-label-size)] tracking-[var(--chrome-label-track)] text-[var(--chrome-fg-dim)] [border-top:1px_solid_var(--chrome-border)]">
             <Building2 size={11} />
             <span>
@@ -594,7 +594,6 @@ export default function ExportModal({
               >
                 {t('exportModal.license_link')}
               </button>
-              .
             </span>
           </div>
         </div>

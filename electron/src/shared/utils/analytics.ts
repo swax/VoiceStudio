@@ -95,7 +95,7 @@ interface AnalyticsClient {
 
 const APP_ANALYTICS_ORIGIN = 'https://app.voicestudio.sh';
 const SAFE_SCREEN =
-  /^view:(?:home|clone|personas|stories|dub|batch|gallery|transcriptions|design|audiobook|projects|tools|calls|integrations|pro|other|settings\/(?:appearance|general|models|logs|media|pronunciation|network|sharing|credentials|performance|usage|workers|privacy|permissions|storage|support|updates|openapi|diagnostics|other))$/;
+  /^view:(?:home|clone|personas|stories|dub|batch|gallery|transcriptions|design|audiobook|projects|tools|calls|integrations|pro|other|settings\/(?:appearance|general|models|logs|media|pronunciation|network|sharing|credentials|performance|usage|privacy|permissions|storage|support|updates|openapi|diagnostics|other))$/;
 const URL_PROPERTIES = [
   '$current_url',
   '$pathname',

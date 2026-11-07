@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import filecmp
 import logging
 from core.logging_utils import log_safe
 import os
@@ -130,6 +131,81 @@ def bed_mix_filter(
     )
 
 
+# ── Local-only inputs ─────────────────────────────────────────────────────
+#
+# Media handed to ffmpeg/ffprobe is always a local file (or our own pipe), but
+# a file can *contain* URLs: an "x.mp4" upload that is really an HLS playlist,
+# a concat list or a DASH manifest makes ffmpeg fetch every URL inside it,
+# turning a media upload into requests to internal hosts. Restricting every
+# input to the file and pipe protocols closes that for every caller at once.
+# Not affected: ``-f lavfi`` sources (no protocol), concat lists of local
+# files (``file``) and ``pipe:`` stdin/stdout.
+LOCAL_INPUT_PROTOCOLS = "file,pipe"
+_WHITELIST_FLAG = "-protocol_whitelist"
+
+
+def _media_tool_kind(exe) -> "str | None":
+    """``"ffmpeg"``/``"ffprobe"`` when ``exe`` runs one of them, else None."""
+    name = os.path.basename(str(exe)).lower()
+    if "ffprobe" in name:
+        return "ffprobe"
+    if "ffmpeg" in name:
+        return "ffmpeg"
+    # Bundled, imageio and system binaries all carry the tool name; only a
+    # user override (FFMPEG_PATH / FFPROBE_PATH) may point at any file name.
+    # Compare against the overrides directly instead of running the full
+    # resolver, which probes binaries and warns when nothing is installed.
+    target = os.path.normcase(os.path.abspath(str(exe)))
+    for kind, keys in (
+        ("ffmpeg", ("FFMPEG_PATH",)),
+        ("ffprobe", ("OMNIVOICE_FFPROBE_PATH", "FFPROBE_PATH")),
+    ):
+        for key in keys:
+            value = os.environ.get(key)
+            resolved = value and (shutil.which(value) or value)
+            if resolved and os.path.normcase(os.path.abspath(resolved)) == target:
+                return kind
+    return None
+
+
+def local_inputs_only(cmd, tool: "str | None" = None) -> list:
+    """Return ``cmd`` with every ffmpeg/ffprobe input limited to local protocols.
+
+    Adds ``-protocol_whitelist file,pipe`` before each ffmpeg ``-i`` (input
+    options apply per input) or once for ffprobe's single input. Idempotent:
+    an input that already sets a whitelist keeps it. Any other command is
+    returned unchanged. ``tool`` skips name-based detection when the caller
+    knows which binary it runs.
+    """
+    cmd = list(cmd)
+    if not cmd:
+        return cmd
+    kind = tool or _media_tool_kind(cmd[0])
+    if kind == "ffprobe":
+        if _WHITELIST_FLAG not in cmd:
+            cmd[1:1] = [_WHITELIST_FLAG, LOCAL_INPUT_PROTOCOLS]
+        return cmd
+    if kind != "ffmpeg":
+        return cmd
+    out: list = [cmd[0]]
+    group_has_whitelist = False
+    i = 1
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg == _WHITELIST_FLAG:
+            group_has_whitelist = True
+        elif arg == "-i" and i + 1 < len(cmd):
+            if not group_has_whitelist:
+                out += [_WHITELIST_FLAG, LOCAL_INPUT_PROTOCOLS]
+            out += [arg, cmd[i + 1]]
+            group_has_whitelist = False
+            i += 2
+            continue
+        out.append(arg)
+        i += 1
+    return out
+
+
 def _get_semaphore() -> asyncio.Semaphore:
     global _FFMPEG_SEMAPHORE
     if _FFMPEG_SEMAPHORE is None:
@@ -190,6 +266,15 @@ def _binary_runs(path: str) -> bool:
     return ok
 
 
+class MediaToolUnavailableError(RuntimeError):
+    """ffmpeg/ffprobe is missing, or present but not runnable.
+
+    A ``RuntimeError`` so existing handlers keep working; the dedicated type
+    lets the transcription path pick the actionable "repair the media engine"
+    reply by class instead of by sniffing message text.
+    """
+
+
 def find_ffmpeg():
     """Locate an ffmpeg binary.
 
@@ -225,15 +310,15 @@ def find_ffmpeg():
     candidate = _acquired_bundled("ffmpeg")
     if candidate:
         return candidate
-    # 4. Well-known system paths + PATH lookup
-    common = [
+    # Check conventional installations before falling back to PATH.
+    candidates = [
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         *windows_tool_candidates("ffmpeg"),
         "ffmpeg",
     ]
-    for path in common:
-        resolved = shutil.which(path)
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
         if resolved and _binary_runs(resolved):
             return resolved
     logger.warning("ffmpeg not found (or not runnable) in env, imageio, or system PATH")
@@ -320,6 +405,55 @@ def find_ffprobe():
     return None
 
 
+def _bare_name_shim(real: str, tool: str) -> "str | None":
+    """Directory exposing *real* under the bare name ``<tool>[.exe]``, or None.
+
+    imageio-ffmpeg ships its binary as ``ffmpeg-<platform>-vN[.exe]``, so
+    publishing its directory on ``PATH`` never satisfies a dependency's literal
+    ``ffmpeg`` lookup (parakeet-mlx, openai-whisper, pydub, ...): they still die
+    with ``[Errno 2] No such file or directory: 'ffmpeg'``. A symlink (hardlink
+    or copy where Windows refuses symlinks) under the bare name closes that gap
+    on every platform without asking the user to install anything. Best-effort:
+    returns None when the name is already bare or the shim cannot be written.
+    """
+    exe = f"{tool}.exe" if os.name == "nt" else tool
+    if os.path.basename(real).lower() == exe:
+        return None
+    # An FFMPEG_PATH like ./tools/ffmpeg-custom is relative to the process cwd;
+    # a symlink resolves its target relative to the shims directory instead.
+    real = os.path.abspath(real)
+    try:
+        from core.config import DATA_DIR
+
+        directory = os.path.join(DATA_DIR, "media_tools", "shims")
+        link = os.path.join(directory, exe)
+        os.makedirs(directory, exist_ok=True)
+        if os.path.lexists(link):
+            try:
+                # Symlink/hardlink: same file. A copy must match byte for byte
+                # (a corrupt copy, or a changed binary of equal size, must not
+                # keep shadowing the validated one).
+                if os.path.samefile(link, real) or (
+                    not os.path.islink(link) and filecmp.cmp(link, real, shallow=False)
+                ):
+                    return directory
+            except OSError:
+                pass
+            os.unlink(link)
+        try:
+            os.symlink(real, link)
+        except (OSError, NotImplementedError):
+            try:
+                os.link(real, link)
+            except OSError:
+                shutil.copy2(real, link)
+        return directory
+    except OSError as e:
+        # errno only: the exception text carries absolute (home) paths.
+        logger.debug("bare-name %s shim unavailable (errno=%s)", tool, e.errno)
+        return None
+
+
 def ensure_media_tools_on_path() -> list[str]:
     """Put the resolved ffmpeg/ffprobe on ``PATH`` for third-party code (#1256).
 
@@ -341,16 +475,17 @@ def ensure_media_tools_on_path() -> list[str]:
     added: list[str] = []
     try:
         directories: list[str] = []
-        for resolve in (find_ffmpeg, find_ffprobe):
+        for tool, resolve in (("ffmpeg", find_ffmpeg), ("ffprobe", find_ffprobe)):
             try:
                 path = resolve()
             except Exception:
                 continue
             if not path:
                 continue
-            directory = os.path.dirname(os.path.abspath(path))
-            if directory and directory not in directories:
-                directories.append(directory)
+            shim = _bare_name_shim(path, tool)
+            for directory in (shim, os.path.dirname(os.path.abspath(path))):
+                if directory and directory not in directories:
+                    directories.append(directory)
 
         current = os.environ.get("PATH", "")
         entries = current.split(os.pathsep) if current else []
@@ -358,7 +493,9 @@ def ensure_media_tools_on_path() -> list[str]:
         # case-sensitive and "already present" must not depend on casing.
         normalize = os.path.normcase
         present = {normalize(e) for e in entries if e}
-        for directory in directories:
+        # Reversed so the first-listed directory (the validated shim) ends up
+        # first on PATH, ahead of any competing system ffmpeg/ffprobe.
+        for directory in reversed(directories):
             if normalize(directory) in present:
                 continue
             entries.insert(0, directory)
@@ -381,66 +518,74 @@ def ensure_media_tools_on_path() -> list[str]:
     return added
 
 
-async def _spawn_async(cmd, **kwargs):
-    """Try asyncio subprocess; fall back to thread-based subprocess on Windows
-    where ProactorEventLoop may not be available (e.g. under uvicorn --reload)."""
+class _ThreadProcess:
+    uses_sync_pipes = True
+
+    def __init__(self, popen):
+        self._popen = popen
+        self._returncode = popen.returncode
+
+    @property
+    def stdin(self):
+        return self._popen.stdin
+
+    @property
+    def stdout(self):
+        return self._popen.stdout
+
+    @property
+    def stderr(self):
+        return self._popen.stderr
+
+    @property
+    def pid(self):
+        return self._popen.pid
+
+    @property
+    def returncode(self):
+        return self._returncode
+
+    async def communicate(self, input=None):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, self._popen.communicate, input)
+        self._returncode = self._popen.returncode
+        return result
+
+    async def wait(self):
+        if self._returncode is None:
+            loop = asyncio.get_running_loop()
+            self._returncode = await loop.run_in_executor(None, self._popen.wait)
+        return self._returncode
+
+    def kill(self):
+        return self._popen.kill()
+
+    def terminate(self):
+        return self._popen.terminate()
+
+
+async def _spawn_in_thread(cmd, **kwargs):
+    popen_kwargs = dict(kwargs)
+    popen_kwargs.setdefault("stdin", None)
+    popen_kwargs.setdefault("stdout", asyncio.subprocess.PIPE)
+    popen_kwargs.setdefault("stderr", asyncio.subprocess.PIPE)
+    for pipe_name in ("stdin", "stdout", "stderr"):
+        if popen_kwargs[pipe_name] == asyncio.subprocess.PIPE:
+            popen_kwargs[pipe_name] = subprocess.PIPE
+
+    loop = asyncio.get_running_loop()
+    popen = await loop.run_in_executor(
+        None, lambda: subprocess.Popen(cmd, **popen_kwargs)
+    )
+    return _ThreadProcess(popen)
+
+
+async def _create_subprocess(cmd, **kwargs):
     try:
         return await asyncio.create_subprocess_exec(*cmd, **kwargs)
     except NotImplementedError:
-        logger.debug("asyncio subprocess not supported, falling back to thread-based subprocess")
-        return await _spawn_thread_fallback(cmd, **kwargs)
-
-
-async def _spawn_thread_fallback(cmd, **kwargs):
-    """Run a subprocess synchronously in a thread via subprocess.Popen."""
-    stdout = kwargs.pop("stdout", asyncio.subprocess.PIPE)
-    stderr = kwargs.pop("stderr", asyncio.subprocess.PIPE)
-    stdin = kwargs.pop("stdin", None)
-    loop = asyncio.get_running_loop()
-
-    def _run():
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE if stdout == asyncio.subprocess.PIPE else stdout,
-            stderr=subprocess.PIPE if stderr == asyncio.subprocess.PIPE else stderr,
-            stdin=subprocess.PIPE if stdin == asyncio.subprocess.PIPE else stdin,
-            **kwargs,  # forward cwd / env / etc. so the fallback matches the async call
-        )
-
-    proc = await loop.run_in_executor(None, _run)
-    # Wrap the Popen process to match asyncio.subprocess.Process interface
-    class _AsyncCompatProc:
-        def __init__(self, popen):
-            self._popen = popen
-            self.returncode = popen.returncode
-            self.stdin = popen.stdin
-            self.stdout = popen.stdout
-            self.stderr = popen.stderr
-            self.pid = popen.pid
-            # These are plain SYNC pipes (io.BufferedReader), NOT asyncio
-            # StreamReaders — so callers must not `await proc.stderr.read()` on
-            # this wrapper. `communicate()`/`wait()` below are the only async
-            # entry points. run_proc_streaming_stderr checks this flag and
-            # degrades to communicate() on the fallback loop instead of awaiting
-            # the sync pipe (which raised "a coroutine or an awaitable is
-            # required" and crashed the demucs step under uvicorn --reload).
-            self.uses_sync_pipes = True
-
-        async def communicate(self, input=None):
-            out, err = await loop.run_in_executor(None, self._popen.communicate, input)
-            self.returncode = self._popen.returncode
-            return out, err
-
-        async def wait(self):
-            return await loop.run_in_executor(None, self._popen.wait)
-
-        def kill(self):
-            self._popen.kill()
-
-        def terminate(self):
-            self._popen.terminate()
-
-    return _AsyncCompatProc(proc)
+        logger.debug("The active event loop cannot launch subprocesses; using a worker thread")
+        return await _spawn_in_thread(cmd, **kwargs)
 
 
 async def spawn_subprocess(*args, **kwargs):
@@ -458,12 +603,17 @@ async def spawn_subprocess(*args, **kwargs):
 
 
 async def _spawn_with_retry(cmd, **kwargs):
-    """Spawn a subprocess, retrying briefly on EAGAIN (posix_spawn resource pressure)."""
+    """Spawn a subprocess, retrying briefly on EAGAIN (posix_spawn resource pressure).
+
+    Every async ffmpeg/ffprobe spawn funnels through here, so inputs are
+    restricted to local protocols centrally (:func:`local_inputs_only`).
+    """
+    cmd = local_inputs_only(cmd)
     delay = 0.1
     last_err = None
     for _ in range(5):
         try:
-            return await _spawn_async(cmd, **kwargs)
+            return await _create_subprocess(cmd, **kwargs)
         except BlockingIOError as e:
             last_err = e
             if e.errno != errno.EAGAIN:
@@ -476,8 +626,6 @@ async def _spawn_with_retry(cmd, **kwargs):
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
-            raise
-        except Exception:
             raise
     raise last_err if last_err else RuntimeError("spawn failed")
 
@@ -643,8 +791,8 @@ def _probe_audio_stream(path: str) -> "bool | None":
     if ffprobe:
         try:
             proc = subprocess.run(
-                [ffprobe, "-v", "error", "-select_streams", "a",
-                 "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                local_inputs_only([ffprobe, "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", path], tool="ffprobe"),
                 capture_output=True, timeout=60, check=False,
             )
             if proc.returncode == 0:
@@ -659,7 +807,7 @@ def _probe_audio_stream(path: str) -> "bool | None":
     # for want of an output), which is enough to tell audio from no audio.
     try:
         proc = subprocess.run(
-            [ffmpeg, "-hide_banner", "-nostdin", "-i", path],
+            local_inputs_only([ffmpeg, "-hide_banner", "-nostdin", "-i", path], tool="ffmpeg"),
             capture_output=True, timeout=60, check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -680,6 +828,7 @@ def require_audio_stream(path: str) -> None:
     """
     from core.failure import NoAudioTrackError
 
+    refuse_manifest_media(path)
     if has_audio_stream(path) is False:
         logger.info(
             "Refusing %s: the file has no audio stream",
@@ -688,14 +837,63 @@ def require_audio_stream(path: str) -> None:
         raise NoAudioTrackError()
 
 
+def refuse_manifest_media(path: str) -> None:
+    """Raise ``InvalidMediaFileError`` when ``path`` is a playlist or manifest.
+
+    An upload named ``clip.mp4`` can hold an HLS playlist, concat list or DASH
+    manifest; ffmpeg would follow the URLs inside it. The same prefix check
+    URL imports use (:func:`core.url_safety.is_manifest_file`) refuses it
+    before any probe or decode.
+    """
+    from core.failure import InvalidMediaFileError
+    from core.url_safety import is_manifest_file
+
+    try:
+        manifest = is_manifest_file(path)
+    except OSError:
+        return  # Preserve the OS/FFmpeg missing-file diagnosis.
+    if manifest:
+        logger.info(
+            "Refusing %s: the file is a playlist or manifest, not media",
+            log_safe(os.path.basename(str(path))),
+        )
+        raise InvalidMediaFileError()
+
+
+def validate_media_source(path: str) -> None:
+    """Reject obviously incomplete media before expensive probe/extract work.
+
+    A file with a zeroed first block cannot have a usable container header,
+    and a playlist/manifest is not media at all. Read at most 4 KiB,
+    regardless of video size. Other formats are left to FFmpeg, which remains
+    the authority on whether their content can decode.
+    """
+    from core.failure import InvalidMediaFileError
+
+    if not os.path.isfile(path):
+        return  # Preserve the OS/FFmpeg missing-file diagnosis.
+    with open(path, "rb") as source:
+        header = source.read(4096)
+    if not header or not any(header):
+        raise InvalidMediaFileError()
+    refuse_manifest_media(path)
+
+
 def raise_for_audio_extract_failure(stderr, path: str) -> None:
     """After a failed audio decode, raise ``NoAudioTrackError`` when the cause
-    was a missing audio stream (ffmpeg's own wording, or a positive probe).
+    was a missing audio stream, or ``InvalidMediaFileError`` when the input
+    container could not be read.
 
     Returns normally for every other failure so the caller keeps its own
     diagnosis; the raw stderr stays in the log, never in the user message.
     """
-    from core.failure import NO_AUDIO_TRACK_MESSAGE, NoAudioTrackError, is_no_audio_stream_stderr
+    from core.failure import (
+        INVALID_MEDIA_FILE_MESSAGE,
+        NO_AUDIO_TRACK_MESSAGE,
+        InvalidMediaFileError,
+        NoAudioTrackError,
+        is_no_audio_stream_stderr,
+    )
 
     # An engine may already have raised NoAudioTrackError (via the ASR decoder's
     # stderr check) and the caller passes its text back here: keep that answer
@@ -704,10 +902,20 @@ def raise_for_audio_extract_failure(stderr, path: str) -> None:
     if already or is_no_audio_stream_stderr(stderr) or has_audio_stream(path) is False:
         text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
         logger.info(
-            "Audio decode of %s failed because it has no audio stream: %s",
-            log_safe(os.path.basename(str(path))), log_safe(text[-500:]),
+            "Audio decode failed because the source has no audio stream"
         )
         raise NoAudioTrackError()
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
+    low = text.lower()
+    if INVALID_MEDIA_FILE_MESSAGE.lower() in low or any(marker in low for marker in (
+        "ebml header parsing failed",
+        "moov atom not found",
+        "invalid data found when processing input",
+    )):
+        logger.info(
+            "Audio decode failed because the source container is unreadable"
+        )
+        raise InvalidMediaFileError()
 
 
 # Windows CreateProcess rejects command lines over 32,767 chars with
@@ -798,6 +1006,10 @@ async def run_ffmpeg(cmd, timeout: float = 1800.0, capture: bool = True,
     """
     stdout = asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
     stderr = asyncio.subprocess.PIPE
+    # Inputs are local files only, whatever the binary is named (an
+    # FFMPEG_PATH override may not say "ffmpeg").
+    if cmd:
+        cmd = local_inputs_only(cmd, tool=_media_tool_kind(cmd[0]) or "ffmpeg")
     # #1152: on Windows an oversized argv (multi-track mux filter graphs)
     # fails CreateProcess with WinError 206 before ffmpeg even starts —
     # move a long -filter_complex into a script file first.

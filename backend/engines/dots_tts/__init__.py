@@ -86,8 +86,9 @@ class DotsTTSBackend(SubprocessBackend):
         if sys.platform == "win32":
             return False, (
                 "dots.tts is not supported on Windows — upstream targets "
-                "Linux and macOS only. Run VoiceStudio under WSL2, or use a "
-                "Linux/macOS host. See docs/engines/dots-tts.md."
+                "Linux and macOS only. Use the audio.cpp dots.tts engine "
+                "(audiocpp-dots), which runs natively on Windows. See "
+                "docs/engines/audio-cpp.md."
             )
 
         # Do NOT import dots_tts here: it pins transformers==4.57, which can't

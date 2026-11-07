@@ -1,91 +1,182 @@
 import { app, BrowserWindow, ipcMain } from 'electron';
 import updaterPackage, { type ProgressInfo, type UpdateInfo } from 'electron-updater';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isTrustedRenderer } from './trusted-renderer';
-import type { UpdateChannel, UpdateReleaseInfo, UpdateState } from '../preload/index.d';
+import type { UpdateReleaseInfo, UpdateState } from '../preload/index.d';
 import { sendToLiveWindow } from './window-safety';
+import { applicationUpdatesUnsupportedReason, CURRENT_DISTRIBUTION } from './distribution';
+import type { DistributionTarget } from '../../../config/distributions.mjs';
 
 // electron-updater is CommonJS. Electron executes our main bundle as ESM, so
 // named runtime imports fail before the app can create a window.
 const { autoUpdater } = updaterPackage;
 
-const FEEDS: Record<UpdateChannel, string> = {
-  stable: 'https://github.com/debpalash/VoiceStudio/releases/latest/download',
-  preview: 'https://github.com/debpalash/VoiceStudio/releases/download/preview',
-};
+// Two update channels, both fed by tagged GitHub releases cut from main:
+// Stable follows `vX.Y.Z` (the `latest` release); Beta follows `vX.Y.Z-beta.N`
+// prereleases and rolls onto the next stable once it passes them. GitHub's
+// `latest/download` never serves a prerelease, so Beta resolves its release
+// through the releases API (see resolveBetaFeed).
+export type UpdateChannel = 'stable' | 'beta';
+const STABLE_FEED = 'https://github.com/debpalash/VoiceStudio/releases/latest/download';
 const RELEASES_API = 'https://api.github.com/repos/debpalash/VoiceStudio/releases?per_page=30';
 
 function feedChannelName(
-  channel: UpdateChannel,
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
+  distribution: DistributionTarget = CURRENT_DISTRIBUTION,
+  channel: UpdateChannel = 'stable',
 ): string {
-  return `electron-${channel}-${platform}-${arch}`;
+  // Store builds are stable-only: the Store listing is the beta gate.
+  const prefix =
+    distribution === 'microsoft-store' ? 'electron-microsoft-store-stable' : `electron-${channel}`;
+  return `${prefix}-${platform}-${arch}`;
 }
 
 export function feedManifestName(
-  channel: UpdateChannel,
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
+  distribution: DistributionTarget = CURRENT_DISTRIBUTION,
+  channel: UpdateChannel = 'stable',
 ): string {
   const suffix = platform === 'darwin' ? '-mac' : platform === 'linux' ? '-linux' : '';
-  return `${feedChannelName(channel, platform, arch)}${suffix}.yml`;
+  return `${feedChannelName(platform, arch, distribution, channel)}${suffix}.yml`;
 }
 
-function releaseVersion(value: string): [number, number, number, number | null] | null {
-  const match = /^(\d+)\.(\d+)\.(\d+)(?:-(\d+))?$/.exec(value.trim());
+const RELEASE_DOWNLOAD = 'https://github.com/debpalash/VoiceStudio/releases/download';
+const RELEASE_TAG = /^v(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?$/;
+
+/** Orders `vX.Y.Z-beta.N` below `vX.Y.Z`, as semver does. */
+function releaseRank(tag: string): number[] | null {
+  const match = RELEASE_TAG.exec(tag);
   if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3]), match[4] ? Number(match[4]) : null];
+  return [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+    match[4] === undefined ? Number.MAX_SAFE_INTEGER : Number(match[4]),
+  ];
 }
 
-export function compareReleaseVersions(left: string, right: string): number {
-  const a = releaseVersion(left);
-  const b = releaseVersion(right);
-  if (!a || !b) return 0;
-  for (let index = 0; index < 3; index += 1) {
-    if (a[index]! !== b[index]!) return a[index]! > b[index]! ? 1 : -1;
-  }
-  if (a[3] === b[3]) return 0;
-  if (a[3] === null) return 1;
-  if (b[3] === null) return -1;
-  return a[3] > b[3] ? 1 : -1;
-}
-
-async function feedVersion(
-  channel: UpdateChannel,
-  fetcher: typeof fetch,
-  platform: NodeJS.Platform,
-  arch: string,
-): Promise<string | null> {
-  try {
-    const response = await fetcher(
-      `${FEEDS[channel]}/${feedManifestName(channel, platform, arch)}`,
-      {
-        headers: { Accept: 'text/yaml', 'User-Agent': 'VoiceStudio' },
-        signal: AbortSignal.timeout(5_000),
-      },
-    );
-    if (!response.ok) return null;
-    const version = /^version:\s*['"]?([^'"\s]+)['"]?\s*$/m.exec(await response.text())?.[1];
-    return version && releaseVersion(version) ? version : null;
-  } catch {
-    return null;
-  }
-}
-
-export async function resolvePreviewFeed(
-  fetcher: typeof fetch = fetch,
+/**
+ * Beta follows the newest stable-or-beta release that publishes this platform's
+ * manifest. When a stable release is the newest, Beta reads the stable manifest
+ * from it, so beta users land on the final build instead of lingering on a beta.
+ */
+export async function resolveBetaFeed(
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
-): Promise<UpdateChannel> {
-  const [preview, stable] = await Promise.all([
-    feedVersion('preview', fetcher, platform, arch),
-    feedVersion('stable', fetcher, platform, arch),
-  ]);
-  if (!preview && stable) return 'stable';
-  if (preview && stable && compareReleaseVersions(stable, preview) > 0) return 'stable';
-  return 'preview';
+  fetcher: typeof fetch = fetch,
+): Promise<{ url: string; channel: string }> {
+  const response = await fetcher(RELEASES_API, {
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'VoiceStudio' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Beta update feed lookup failed (${response.status})`);
+  const releases: unknown = await response.json();
+  if (!Array.isArray(releases)) throw new Error('Beta update feed lookup returned invalid data');
+  const candidates = releases.flatMap((value) => {
+    if (!value || typeof value !== 'object') return [];
+    const item = value as Record<string, unknown>;
+    const tag = typeof item.tag_name === 'string' ? item.tag_name : '';
+    const rank = releaseRank(tag);
+    if (!rank || item.draft === true || !Array.isArray(item.assets)) return [];
+    const kind = rank[3] === Number.MAX_SAFE_INTEGER ? 'stable' : 'beta';
+    const manifest = feedManifestName(platform, arch, 'direct', kind);
+    const published = item.assets.some(
+      (asset) => asset && (asset as Record<string, unknown>).name === manifest,
+    );
+    return published
+      ? [{ tag, rank, channel: feedChannelName(platform, arch, 'direct', kind) }]
+      : [];
+  });
+  candidates.sort((left, right) => {
+    for (let index = 0; index < left.rank.length; index += 1) {
+      const difference = right.rank[index] - left.rank[index];
+      if (difference) return difference;
+    }
+    return 0;
+  });
+  const newest = candidates[0];
+  if (!newest)
+    throw new Error('No beta or stable release publishes an update feed for this device');
+  return { url: `${RELEASE_DOWNLOAD}/${encodeURIComponent(newest.tag)}`, channel: newest.channel };
+}
+
+const CHANNEL_FILE = 'updates.json';
+
+/** Anything but an explicit "beta" (including the retired "preview") is Stable. */
+export function readSavedUpdateChannel(userData: string = app.getPath('userData')): UpdateChannel {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(join(userData, CHANNEL_FILE), 'utf8'));
+    return saved && (saved as Record<string, unknown>).channel === 'beta' ? 'beta' : 'stable';
+  } catch {
+    return 'stable';
+  }
+}
+
+function saveUpdateChannel(channel: UpdateChannel, userData: string = app.getPath('userData')) {
+  try {
+    writeFileSync(join(userData, CHANNEL_FILE), JSON.stringify({ channel }));
+  } catch {
+    // Best effort: the choice still applies for this session.
+  }
+}
+
+export async function resolveUpdateFeedUrl(
+  distribution: DistributionTarget,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+  fetcher: typeof fetch = fetch,
+): Promise<string> {
+  if (distribution !== 'microsoft-store') return STABLE_FEED;
+  const manifest = feedManifestName(platform, arch, distribution);
+  const response = await fetcher(RELEASES_API, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'VoiceStudio',
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Store update feed lookup failed (${response.status})`);
+  const releases: unknown = await response.json();
+  if (!Array.isArray(releases)) throw new Error('Store update feed lookup returned invalid data');
+  const matchingReleases = releases.flatMap(
+    (
+      value,
+    ): Array<{
+      release: Record<string, unknown>;
+      version: [number, number, number];
+    }> => {
+      if (!value || typeof value !== 'object') return [];
+      const item = value as Record<string, unknown>;
+      const version =
+        typeof item.tag_name === 'string' ? item.tag_name.match(/^v(\d+)\.(\d+)\.(\d+)$/) : null;
+      const publishesManifest =
+        Array.isArray(item.assets) &&
+        item.assets.some(
+          (asset) =>
+            asset &&
+            typeof asset === 'object' &&
+            (asset as Record<string, unknown>).name === manifest,
+        );
+      return version && publishesManifest
+        ? [{ release: item, version: [Number(version[1]), Number(version[2]), Number(version[3])] }]
+        : [];
+    },
+  );
+  matchingReleases.sort((left, right) => {
+    for (let index = 0; index < left.version.length; index += 1) {
+      const difference = right.version[index] - left.version[index];
+      if (difference) return difference;
+    }
+    return 0;
+  });
+  const release = matchingReleases[0]?.release;
+  if (!release) throw new Error(`No Microsoft Store update feed publishes ${manifest}`);
+  return `https://github.com/debpalash/VoiceStudio/releases/download/${encodeURIComponent(
+    release.tag_name as string,
+  )}`;
 }
 
 export const UPDATE_CHANNELS = {
@@ -94,8 +185,8 @@ export const UPDATE_CHANNELS = {
   download: 'updates:download',
   dismiss: 'updates:dismiss',
   install: 'updates:install',
-  setChannel: 'updates:setChannel',
   listReleases: 'updates:listReleases',
+  setChannel: 'updates:setChannel',
   state: 'updates:state',
 } as const;
 
@@ -116,7 +207,8 @@ export async function listDesktopReleases(
     if (!value || typeof value !== 'object') return [];
     const item = value as Record<string, unknown>;
     const tag = typeof item.tag_name === 'string' ? item.tag_name.trim() : '';
-    if (!tag) return [];
+    // Only desktop releases: the phone apps publish `mobile-vX.Y.Z` prereleases too.
+    if (!RELEASE_TAG.test(tag)) return [];
     const name = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : tag;
     return [
       {
@@ -147,38 +239,28 @@ function releaseSize(info: UpdateInfo): number | undefined {
   return total > 0 ? total : undefined;
 }
 
-function readChannel(): UpdateChannel {
-  try {
-    const value = JSON.parse(readFileSync(join(app.getPath('userData'), 'updates.json'), 'utf8'));
-    return value?.channel === 'preview' ? 'preview' : 'stable';
-  } catch {
-    return 'stable';
-  }
-}
-
-function writeChannel(channel: UpdateChannel): void {
-  const path = join(app.getPath('userData'), 'updates.json');
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, JSON.stringify({ channel }, null, 2), {
-    encoding: 'utf8',
-    mode: 0o600,
-  });
-  renameSync(temporary, path);
-}
-
 export class DesktopUpdater {
   private listeners = new Set<(state: UpdateState) => void>();
   private state: UpdateState;
   private checkInFlight: Promise<UpdateState> | null = null;
   private downloadInFlight: Promise<UpdateState> | null = null;
+  private channel: UpdateChannel = 'stable';
 
-  constructor(private readonly fetcher: typeof fetch = fetch) {
-    const supported = app.isPackaged;
+  constructor(
+    private readonly distribution: DistributionTarget = CURRENT_DISTRIBUTION,
+    private readonly feedFetcher: typeof fetch = fetch,
+  ) {
+    const supported = this.updatesSupported();
+    // Store builds are stable-only, so they expose no channel to switch. A dev
+    // run cannot update itself but still shows and saves the channel.
+    const selectable = (supported || !app.isPackaged) && distribution !== 'microsoft-store';
+    if (selectable) this.channel = readSavedUpdateChannel();
     this.state = {
       status: supported ? 'idle' : 'unsupported',
-      currentVersion: app.getVersion(),
-      channel: readChannel(),
+      currentVersion: __APP_VERSION__,
       progress: 0,
+      channel: selectable ? this.channel : undefined,
+      unsupportedReason: this.unsupportedReason() ?? undefined,
     };
     if (!supported) return;
 
@@ -256,7 +338,7 @@ export class DesktopUpdater {
     autoUpdater.on('error', (error) =>
       this.patch({ status: 'error', error: error.message || String(error) }),
     );
-    this.configureFeed();
+    if (this.distribution !== 'microsoft-store') this.configureFeed(STABLE_FEED, feedChannelName());
   }
 
   snapshot(): UpdateState {
@@ -269,18 +351,49 @@ export class DesktopUpdater {
   }
 
   async check(quiet = false): Promise<UpdateState> {
-    if (!app.isPackaged || ['downloading', 'downloaded'].includes(this.state.status))
+    if (
+      !this.updatesSupported() ||
+      this.downloadInFlight ||
+      ['downloading', 'downloaded'].includes(this.state.status)
+    )
       return this.snapshot();
     if (this.checkInFlight) return this.checkInFlight;
+    const previousState = this.snapshot();
+    this.patch({
+      status: 'checking',
+      progress: 0,
+      transferredBytes: undefined,
+      totalBytes: undefined,
+      bytesPerSecond: undefined,
+      etaSeconds: undefined,
+      error: undefined,
+    });
     const operation = (async () => {
       try {
         const feed =
-          this.state.channel === 'preview' ? await resolvePreviewFeed(this.fetcher) : 'stable';
-        this.configureFeed(feed);
+          this.distribution === 'microsoft-store'
+            ? {
+                url: await resolveUpdateFeedUrl(
+                  this.distribution,
+                  process.platform,
+                  process.arch,
+                  this.feedFetcher,
+                ),
+                channel: feedChannelName(process.platform, process.arch, this.distribution),
+              }
+            : this.channel === 'beta'
+              ? await resolveBetaFeed(process.platform, process.arch, this.feedFetcher)
+              : { url: STABLE_FEED, channel: feedChannelName() };
+        this.configureFeed(feed.url, feed.channel);
         await autoUpdater.checkForUpdates();
+        if (this.state.status === 'checking') {
+          this.patch({ status: 'idle', lastCheckedAt: Date.now() });
+        }
       } catch (error) {
-        if (quiet) this.patch({ status: 'idle', error: undefined });
-        else
+        if (quiet) {
+          this.state = previousState;
+          this.emit();
+        } else
           this.patch({
             status: 'error',
             error: error instanceof Error ? error.message : String(error),
@@ -297,7 +410,8 @@ export class DesktopUpdater {
   }
 
   async download(): Promise<UpdateState> {
-    if (!app.isPackaged || this.state.status !== 'available') return this.snapshot();
+    if (!this.updatesSupported() || this.checkInFlight || this.state.status !== 'available')
+      return this.snapshot();
     if (this.downloadInFlight) return this.downloadInFlight;
     const operation = (async () => {
       this.patch({
@@ -331,47 +445,67 @@ export class DesktopUpdater {
     this.state = {
       status: 'idle',
       currentVersion: this.state.currentVersion,
-      channel: this.state.channel,
       progress: 0,
+      channel: this.state.channel,
       lastCheckedAt: this.state.lastCheckedAt,
     };
     this.emit();
     return this.snapshot();
   }
 
-  install(): void {
-    if (!app.isPackaged || this.state.status !== 'downloaded') return;
-    autoUpdater.quitAndInstall(false, true);
-  }
-
-  async setChannel(channel: UpdateChannel): Promise<UpdateState> {
-    if (channel !== 'stable' && channel !== 'preview') throw new Error('Invalid update channel');
-    writeChannel(channel);
+  /** Switches channel. Refused mid-download; clears any offer from the old channel. */
+  setChannel(channel: UpdateChannel): UpdateState {
+    if (
+      this.state.channel === undefined ||
+      channel === this.channel ||
+      this.downloadInFlight ||
+      ['checking', 'downloading', 'downloaded'].includes(this.state.status)
+    )
+      return this.snapshot();
+    this.channel = channel;
+    saveUpdateChannel(channel);
+    if (!this.updatesSupported()) {
+      this.patch({ channel });
+      return this.snapshot();
+    }
     this.state = {
-      status: app.isPackaged ? 'idle' : 'unsupported',
-      currentVersion: app.getVersion(),
-      channel,
+      status: 'idle',
+      currentVersion: this.state.currentVersion,
       progress: 0,
+      channel,
     };
-    this.configureFeed();
     this.emit();
-    if (app.isPackaged) await this.check();
     return this.snapshot();
   }
 
-  private configureFeed(feed: UpdateChannel = this.state.channel): void {
-    if (!app.isPackaged) return;
-    autoUpdater.allowPrerelease = this.state.channel === 'preview';
-    const feedChannel = feedChannelName(feed);
+  install(): void {
+    if (!this.updatesSupported() || this.state.status !== 'downloaded') return;
+    autoUpdater.quitAndInstall(false, true);
+  }
+
+  private configureFeed(url: string, feedChannel: string): void {
+    if (!this.updatesSupported()) return;
+    // Feeds are resolved per release and read through the generic provider, so
+    // electron-updater's own prerelease filtering never applies.
+    autoUpdater.allowPrerelease = false;
     autoUpdater.channel = feedChannel;
-    // electron-updater's channel setter silently enables downgrades. Keep the
-    // app monotonic even when Preview temporarily resolves to the Stable feed.
+    // electron-updater's channel setter silently enables downgrades; keep the
+    // app monotonic.
     autoUpdater.allowDowngrade = false;
+    // Explicit, so a build packaged with another feed URL follows the chosen channel.
     autoUpdater.setFeedURL({
       provider: 'generic',
-      url: FEEDS[feed],
+      url,
       channel: feedChannel,
     });
+  }
+
+  private updatesSupported(): boolean {
+    return this.unsupportedReason() === null;
+  }
+
+  private unsupportedReason() {
+    return applicationUpdatesUnsupportedReason(app.isPackaged, this.distribution);
   }
 
   private patch(value: Partial<UpdateState>): void {
@@ -422,13 +556,13 @@ export function registerUpdateIpc(
     await beforeInstall();
     updater.install();
   });
-  ipcMain.handle(UPDATE_CHANNELS.setChannel, (event, channel: UpdateChannel) => {
+  ipcMain.handle(UPDATE_CHANNELS.setChannel, (event, channel: unknown) => {
     trusted(event);
+    if (channel !== 'stable' && channel !== 'beta') throw new Error('Unknown update channel');
     return updater.setChannel(channel);
   });
-  ipcMain.handle(UPDATE_CHANNELS.listReleases, (event, channel: UpdateChannel) => {
+  ipcMain.handle(UPDATE_CHANNELS.listReleases, (event) => {
     trusted(event);
-    if (channel !== 'stable' && channel !== 'preview') throw new Error('Invalid update channel');
     return listDesktopReleases();
   });
   const unsubscribe = updater.subscribe((state) => {

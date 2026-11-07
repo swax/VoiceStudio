@@ -1,11 +1,18 @@
 # VoiceStudio — Electron desktop app
 
+![VoiceStudio in its default dark theme, using the demo workspace.](../docs/media/electron/overview.png)
+
 Electron is the only maintained desktop app for voice cloning, stories, dubbing,
 transcription, voice design, and workflows. Tauri is archived at v0.5.3. For
 existing installations, see [migration notes](../docs/electron-migration.md).
 
 The runtime supervisor manages the local FastAPI backend. Network integrations
-and remote workers require configuration; local generation stays on your machine.
+and remote-backend connections require configuration; local generation stays on your machine.
+Once setup and the required models are installed, saving cloned voice profiles
+works without internet access. Desktop API requests follow the supervisor's
+backend readiness rather than the browser's internet connectivity; they still
+pause during startup or a backend failure. Remote backend requests also wait
+for network connectivity before resuming queued operations.
 
 ## Stack
 
@@ -21,10 +28,15 @@ and remote workers require configuration; local generation stays on your machine
 
 ```sh
 # From the repository root
-bun install
-bun run setup:api  # prepare Python dependencies before starting Electron
-bun run dev        # electron-vite: main + preload + renderer with HMR
+bun run dev  # install dependencies, then start main + preload + renderer with HMR
 ```
+
+The root `predev` script prepares JavaScript and supported local Python
+dependencies before the development launcher resolves Electron's binary and
+starts Vite. It skips local API setup when an external backend is configured or
+on an Intel Mac, where local PyTorch wheels are unavailable.
+Electron 42+ downloads it on the first launch, so that launch needs network
+access; subsequent launches reuse the installed binary.
 
 On launch the shell probes `http://127.0.0.1:3900`. If a backend is already
 running (for example `bun run dev:api` from the repo root) it **attaches**;
@@ -32,10 +44,52 @@ otherwise it checks the prepared `.venv` imports, **spawns** its Python interpre
 supervises it (restart on crash, exit code 78 = port already in use). The
 child's stdin is the liveness signal — closing it makes the backend exit.
 
-Environment knobs: `OMNIVOICE_PORT` (backend port), `VOICESTUDIO_UI_PORT`
-(renderer dev server, default 3902), `VOICESTUDIO_SKIP_BACKEND=1` (never
+Environment knobs: `OMNIVOICE_PORT` (backend port), `OMNIVOICE_UI_PORT`
+(renderer dev server, default 3902; `VOICESTUDIO_UI_PORT` is still accepted), `VOICESTUDIO_SKIP_BACKEND=1` (never
 spawn, only attach), `OMNIVOICE_BACKEND_CMD` (argv override, JSON array or
-whitespace-separated), `OMNIVOICE_STARTUP_BUDGET_S` (default 300).
+whitespace-separated), `OMNIVOICE_STARTUP_BUDGET_S` (default 300, or 600 on a
+host with four or fewer cores or 8 GB of RAM or less; measured from the spawn so
+a slow launch never spends the backend's window, and extended while the backend
+is still printing, up to three times the budget).
+
+## Running without a GPU
+
+`bun run setup:api` and packaged setup choose CPU-only PyTorch on supported
+Linux/Windows hosts without an NVIDIA driver. Source setup also checks
+`nvidia-smi`. CPU setup avoids downloading CUDA libraries; macOS and Linux ARM
+keep their native wheels. Windows ARM source setup uses x64 Python under
+emulation, matching the packaged runtime.
+
+To choose CPU wheels explicitly on Linux:
+
+```sh
+OMNIVOICE_TORCH_VARIANT=cpu bun run setup:api
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:OMNIVOICE_TORCH_VARIANT = "cpu"
+bun run setup:api
+```
+
+Set the variant to `cuda` for an undetected NVIDIA GPU or a GPU-enabled
+container, or opt into `rocm` on Linux. Source setup also honors
+`OMNIVOICE_DEVICE=cpu` unless an explicit wheel variant overrides it. The
+Settings device selection still controls where inference runs.
+
+For direct uv use on Linux/Windows x64, choose the locked CPU graph with
+`uv sync --no-group cuda --group cpu`, then launch commands with
+`uv run --no-sync`. Plain `uv sync` keeps the CUDA default. Electron and
+`bun run dev:api` reuse the prepared environment without silently restoring
+CUDA wheels on startup or restart.
+
+CPU inference still needs model downloads and enough system RAM. OmniVoice
+uses float32 on CPU by default; the existing `OMNIVOICE_CPU_DTYPE` override
+is unchanged. An unusable NVIDIA driver produces a setup warning so
+CPU-capable engines remain available; GPU-only engines remain unavailable.
+Linux source setup applies the same CTranslate2 executable-stack compatibility
+repair as packaged setup, without changing operating-system security settings.
 
 ## Same-origin API
 
@@ -113,8 +167,8 @@ The workspace footer shows Integrations, Become a Sponsor, and a right-aligned X
 They open the integration directory, partner inquiry form, and dedicated
 VoiceStudio Pro page respectively. The sponsor hover/focus card shows dated
 GitHub reach data. The Pro page compares Free and Pro, opens website pricing,
-and offers licence activation and deactivation when the live product IDs are
-configured. Checkout remains gated until the paid tools and terms are ready.
+and leaves licence activation to the separate Pro distribution. Checkout remains
+gated until the paid tools and terms are ready.
 
 The composer groups language and generation options beside a single primary action.
 Its shortcut appears inline when the composer has space, and controls wrap in narrow panes.
@@ -217,9 +271,7 @@ Transcribe, Projects, Tools, and Integrations remain directly accessible.
 
 ### Desktop Pro licence configuration
 
-The Pro page opens the public pricing site. Licence activation requires the live
-Lemon Squeezy store, product, and variant IDs at build time:
-`VOICESTUDIO_PRO_STORE_ID`, `VOICESTUDIO_PRO_PRODUCT_ID`,
-`VOICESTUDIO_PRO_YEARLY_VARIANT_ID`, and `VOICESTUDIO_PRO_LIFETIME_VARIANT_ID`.
-Builds without all four IDs keep activation
-unavailable. See `docs/specs/desktop-pro-page.md` for the checkout release gates.
+The open-source Pro page opens the public pricing site. The open-source app
+contains no licence client and makes no licensing network calls; any licence
+activation belongs to a separate Pro distribution. See
+`docs/specs/desktop-pro-page.md` for the checkout release gates.

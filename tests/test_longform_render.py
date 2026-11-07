@@ -6,9 +6,12 @@ All unit-testable without ffmpeg/torch/GPU.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from services.longform_render import (
+    CacheLease,
     LOUDNESS_PRESETS,
     MeasuredLoudness,
     build_concat_list,
@@ -283,6 +286,116 @@ def test_prune_cache_missing_dir_is_safe(tmp_path):
     assert prune_cache_dir(str(tmp_path / "nope")) == (0, 0)
 
 
+def test_prune_keeps_leased_files_but_evicts_unused_audio(tmp_path):
+    chapter = _seed(tmp_path, "chapter.wav", 600, age_s=100)
+    unused = _seed(tmp_path, "unused.wav", 100, age_s=1)
+    lease = CacheLease()
+    try:
+        lease.hold(str(chapter))
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (600, 1)
+        assert chapter.is_file()
+        assert not unused.exists()
+    finally:
+        lease.release()
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 1)
+
+
+def test_cache_lease_counts_overlapping_jobs_and_normalizes_paths(tmp_path):
+    chapter = _seed(tmp_path, "chapter.wav", 100, age_s=1)
+    first, second = CacheLease(), CacheLease()
+    try:
+        first.hold(str(chapter))
+        first.hold(str(chapter))  # one render may repeat a chapter
+        second.hold(str(tmp_path / "unused" / ".." / chapter.name))
+        first.release()
+        first.release()
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (100, 0)
+    finally:
+        first.release()
+        second.release()
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 1)
+
+
+def test_cancelled_cache_lease_cannot_be_reopened_by_late_worker(tmp_path):
+    lease = CacheLease()
+    lease.release()
+    chapter = _seed(tmp_path, "late.wav", 100, age_s=1)
+    lease.hold(str(chapter))
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 1)
+
+
+def test_cache_lease_keeps_active_temporary_wavs_but_prunes_abandoned_ones(tmp_path):
+    lease = CacheLease()
+    try:
+        lease.hold(str(tmp_path / "chapter.wav"))
+        active = _seed(tmp_path, ".chapter.wav.active.wav", 100, age_s=2)
+        abandoned = _seed(tmp_path, ".other.wav.abandoned.wav", 50, age_s=1)
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (100, 1)
+        assert active.exists() and not abandoned.exists()
+    finally:
+        lease.release()
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 1)
+
+
+def test_cache_lease_reserves_a_file_before_publication(tmp_path):
+    lease = CacheLease()
+    path = tmp_path / "chapter.wav"
+    try:
+        lease.hold(str(path))
+        path.write_bytes(b"audio")
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (5, 0)
+    finally:
+        lease.release()
+
+
+def test_startup_cache_snapshot_hands_off_only_plan_inputs(tmp_path):
+    chapter = _seed(tmp_path, "chapter.wav", 100, age_s=1)
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    segment = _seed(segments, "segment.wav", 50, age_s=1)
+    unused = _seed(tmp_path, "unused.wav", 25, age_s=1)
+    startup, plan = CacheLease(), CacheLease()
+    try:
+        startup.hold_existing(str(tmp_path))
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (175, 0)
+        plan.hold(str(chapter))
+        plan.hold(str(segment))
+        startup.release()
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (150, 1)
+        assert chapter.exists() and segment.exists() and not unused.exists()
+    finally:
+        startup.release()
+        plan.release()
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 2)
+
+
+def test_segment_reservation_includes_legacy_and_varied_repeats(tmp_path):
+    from services.audiobook import Span
+    from services.longform_render import SegmentCache
+
+    span = Span(voice_id=None, text="Repeated.")
+    options = dict(sample_rate=24000, engine_id="stub", voice_sig={"": "current"},
+                   legacy_voice_sigs=[{"": "old"}], vary_repeats=True)
+    paths = SegmentCache(str(tmp_path), **options)
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    expected = []
+    for nonce in range(2):
+        for sigs in ({"": "current"}, {"": "old"}):
+            path = Path(paths._path(span, nonce, sigs=sigs))
+            path.write_bytes(b"audio")
+            expected.append(path)
+    unused = _seed(segments, "unused.wav", 25, age_s=1)
+    lease = CacheLease()
+    try:
+        SegmentCache(str(tmp_path), **options, lease=lease).reserve([span, span])
+        assert prune_cache_dir(str(tmp_path), max_bytes=0) == (20, 1)
+        assert all(path.exists() for path in expected) and not unused.exists()
+    finally:
+        lease.release()
+    assert prune_cache_dir(str(tmp_path), max_bytes=0) == (0, 4)
+
+
 # ── #28 two-pass loudnorm: measure filter ───────────────────────────────────
 
 def test_measure_filter_goldens():
@@ -348,7 +461,7 @@ def test_apply_filter_none_cases(preset, measured):
 def test_measure_cmd_exact_argv():
     assert build_loudnorm_measure_cmd("ffmpeg", "c.txt", "FILT") == [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "info",
-        "-f", "concat", "-safe", "0", "-i", "c.txt",
+        "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe", "-i", "c.txt",
         "-af", "FILT", "-f", "null", "-",
     ]
 

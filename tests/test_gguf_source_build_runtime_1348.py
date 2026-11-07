@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -161,6 +162,7 @@ def _run_linux_arm_build(
     scripts = checkout / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(REPO / "scripts/build-omnivoice-tts.sh", scripts)
+    shutil.copytree(REPO / "scripts/lib", scripts / "lib")
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -211,7 +213,7 @@ fi
     result = subprocess.run(
         [
             "bash",
-            str(scripts / "build-omnivoice-tts.sh"),
+            (scripts / "build-omnivoice-tts.sh").as_posix(),
             "--platform",
             "linux-aarch64",
             "--commit-sha",
@@ -226,6 +228,7 @@ fi
     return result, log
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Linux ARM bash build test requires POSIX environment")
 @pytest.mark.parametrize(
     ("prerequisites", "fail_configure", "fail_build"),
     [
@@ -268,15 +271,26 @@ def test_linux_arm_build_falls_back_to_cpu(
 def test_cuda_sources_exclude_both_linux_arm64_spellings():
     sources = tomllib.loads((REPO / "pyproject.toml").read_text())["tool"]["uv"]["sources"]
     for package in ("torch", "torchaudio", "torchvision"):
-        marker = Marker(sources[package][0]["marker"])
+        # Native PyPI and CPU sources can precede CUDA. Validate the named
+        # index rather than depending on incidental source-array ordering.
+        markers = [
+            Marker(source["marker"])
+            for source in sources[package]
+            if source.get("index") == "pytorch-cuda"
+        ]
+        assert markers, f"{package} has no CUDA source"
         for machine in ("aarch64", "arm64"):
             environment = default_environment()
             environment.update({"sys_platform": "linux", "platform_machine": machine})
-            assert not marker.evaluate(environment), f"{package} selected CUDA on {machine}"
+            assert not any(marker.evaluate(environment) for marker in markers), (
+                f"{package} selected CUDA on {machine}"
+            )
         for system in ("linux", "win32"):
             environment = default_environment()
             environment.update({"sys_platform": system, "platform_machine": "x86_64"})
-            assert marker.evaluate(environment), f"{package} skipped CUDA on {system}/x86_64"
+            assert any(marker.evaluate(environment) for marker in markers), (
+                f"{package} skipped CUDA on {system}/x86_64"
+            )
 
 
 def test_build_script_copies_shared_libs_on_every_platform_branch():
@@ -287,7 +301,7 @@ def test_build_script_copies_shared_libs_on_every_platform_branch():
     build_case = script.rsplit('case "$PLATFORM" in', 1)[1].split("\nesac", 1)[0]
     branches = dict(
         re.findall(
-            r"(?ms)^    ([a-z0-9_-]+)\)\n(.*?)(?=^    [a-z0-9_-]+\)\n|\Z)",
+            r"(?ms)^    ([a-z0-9_|-]+)\)\n(.*?)(?=^    [a-z0-9_|-]+\)\n|\Z)",
             build_case,
         )
     )
@@ -298,10 +312,11 @@ def test_build_script_copies_shared_libs_on_every_platform_branch():
         "darwin-x86_64",
         "darwin-arm64",
     ):
-        branch = branches[platform]
+        branch = next(body for names, body in branches.items()
+                      if platform in names.split("|"))
         copies = list(
             re.finditer(
-                r'cp -v build/(?:Release/)?omnivoice-tts(?:\.exe)? "\$BIN_DIR',
+                r'cp -v (?:build/omnivoice-tts|"\$exe") "\$BIN_DIR',
                 branch,
             )
         )
@@ -327,3 +342,25 @@ def test_ci_artifact_upload_includes_the_shared_libs():
     wf = (REPO / ".github/workflows/build-omnivoice-tts.yml").read_text()
     assert "bin/libggml*" in wf
     assert "bin/ggml*.dll" in wf
+
+
+def test_windows_build_finds_the_exe_for_either_generator():
+    # Visual Studio writes build/Release/omnivoice-tts.exe; Ninja and
+    # Makefiles write build/omnivoice-tts.exe. Copying only the first path
+    # failed every Ninja build at the copy step (#3042).
+    script = (REPO / "scripts" / "build-omnivoice-tts.sh").read_text(encoding="utf-8")
+    finder = script.split("built_windows_exe() {", 1)[1].split("\n}", 1)[0]
+    assert "build/Release/omnivoice-tts.exe" in finder
+    assert "build/omnivoice-tts.exe" in finder
+    assert 'exe="$(built_windows_exe)"' in script
+
+
+def test_manifest_covers_every_copied_library():
+    # The runtime loads the copied ggml libraries at spawn time, so each one
+    # gets a checksum next to the executable's (#3042).
+    script = (REPO / "scripts" / "build-omnivoice-tts.sh").read_text(encoding="utf-8")
+    copier = script.split("copy_shared_libs() {", 1)[1].split("\n}", 1)[0]
+    assert copier.count('>> "$COPIED_LIBS"') == 2
+    manifest_step = script.split('MANIFEST="$BIN_DIR/checksums.sha256"', 1)[1]
+    assert '"$COPIED_LIBS"' in manifest_step
+    assert 'sha256_of "$name"' in manifest_step

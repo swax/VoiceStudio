@@ -59,7 +59,7 @@ describe('RemoteBackendPanel', () => {
       expiresAt: Date.now() / 1000 + 60,
     });
     authMocks.clearAdminSession.mockImplementation(() =>
-      sessionStorage.removeItem('ov_admin_session'),
+      localStorage.removeItem('ov_admin_session'),
     );
     reload = vi.fn();
   });
@@ -112,7 +112,7 @@ describe('RemoteBackendPanel', () => {
     clickSave();
 
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/Save failed/i)),
+      expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/Could not save settings/i)),
     );
     expect(reload).toHaveBeenCalledOnce();
   });
@@ -215,17 +215,26 @@ describe('RemoteBackendPanel', () => {
   it('offers an explicit disable action that clears the remote URL and key', async () => {
     localStorage.setItem('ov_backend_url', 'http://old-box:3900');
     localStorage.setItem('ov_api_key', 'secret');
+    localStorage.setItem(
+      'ov_admin_session',
+      JSON.stringify({
+        token: `ovs_admin_session_${'S'.repeat(43)}`,
+        expiresAt: Date.now() / 1000 + 3600,
+        apiBase: 'http://old-box:3900',
+      }),
+    );
+    global.fetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
     render(<RemoteBackendPanel reload={reload} />);
     fireEvent.click(screen.getByTestId('remote-backend-disable'));
     await waitFor(() => expect(reload).toHaveBeenCalledOnce());
     expect(localStorage.getItem('ov_backend_url')).toBeNull();
     expect(localStorage.getItem('ov_api_key')).toBeNull();
-    expect(authMocks.clearAdminSession).toHaveBeenCalled();
+    expect(localStorage.getItem('ov_admin_session')).toBeNull();
   });
 
   it('clears a restored session before switching targets without a new key', async () => {
     localStorage.setItem('ov_backend_url', 'http://old-box:3900');
-    sessionStorage.setItem(
+    localStorage.setItem(
       'ov_admin_session',
       JSON.stringify({
         token: `ovs_admin_session_${'S'.repeat(43)}`,

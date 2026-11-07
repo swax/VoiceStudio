@@ -18,6 +18,8 @@ Optional JPEG, PNG and WebP uploads are limited to 5 MB and 16 megapixels,
 cropped to 256 × 256, and re-encoded without source metadata. Portraits live next
 to profile audio as `<id>.portrait.jpg`; deleting a profile removes its portrait.
 The reference pane and saved-profile editor allow replacing a portrait through either upload or the same explicit five-result image search used while creating a profile.
+While a replacement is saving, both upload and existing search-result buttons
+are disabled; the results remain available when the save finishes.
 
 After a new clone profile is saved, Electron releases the temporary upload and
 switches the composer to the returned profile as one atomic state change. The
@@ -73,7 +75,8 @@ The save-profile view uses the editor's full content width. New uploaded or
 recorded references use the selected local dictation pipeline (including its
 configured Parakeet/Whisper fallback). Installed-model readiness is checked before
 transcription; no model downloads are initiated. Missing models leave manual
-transcript entry available. ASR never overwrites text edited while it runs.
+transcript entry available, next to an install button for the recommended model
+(a download starts only when you click it, then transcription retries). ASR never overwrites text edited while it runs.
 Saving waits for transcription; using the reference without saving remains possible.
 
 Saved-voice pencil buttons, and **Edit voice** on the selected voice in the
@@ -120,3 +123,11 @@ Script import supports TXT, Markdown, DOC, DOCX, PDF and EPUB (text documents,
 not scanned-image OCR). Paste inserts at the caret; Replace script offers Undo.
 Clicking in the script shows the expression picker near the caret without taking
 typing focus. The voice chooser and save-profile form share the editor width.
+
+Deleting a saved voice commits the profile and history changes before removing its reference, locked take, consent recording and portrait. A failed database transaction leaves those assets available. Cleanup after a successful deletion is best effort; one unavailable asset does not prevent cleanup of the others.
+
+If cleanup fails after the profile record is deleted, the response reports incomplete cleanup and names the remaining confined paths relative to the voices folder, including nested locations. If a location can no longer be confined, the response directs the operator to the local backend log instead of exposing a host path. The backend log records their local locations for manual cleanup with home-directory prefixes redacted to `~`. Electron refreshes the saved-voice list after an error and clears selected clone/design references only when that list confirms the profile is gone; the existing error message still reports incomplete asset cleanup. Deleting the missing profile again does not retry its former audio files; no automatic cleanup retry is promised.
+
+If the backend becomes unavailable during a deletion error, the error settles immediately while confirmation waits in the managed saved-voice query. Backend readiness resumes that query. Only a successful list confirming absence clears the selected voice; rollback, failed confirmation and query cancellation preserve it. This refresh does not retry asset cleanup.
+
+Errors during batch deletion are each checked in order, so a later error cannot discard an earlier deletion check. A confirmation request stalled for 30 seconds is cancelled so later checks can continue; the timed-out check preserves its voice selection because absence remains unknown. Time paused offline does not count toward this request limit. Clearing the query-client cache cancels checks from that earlier cache lifecycle.

@@ -1,18 +1,24 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiJson } from '@/lib/api/client';
 import { useBackendStatus } from './use-backend-status';
-import { IDLE_STATUS_POLL_MS } from '@/lib/status-polling';
+import { isBackendReachable } from '@shared/utils/backendStage';
+import { IDLE_STATUS_POLL_MS, relaxWhenBackendBusy } from '@/lib/status-polling';
 
 export const performanceTiers = ['fast', 'balanced', 'quality', 'max'] as const;
+// All mounted controls share one draft mirror; a delayed import cannot apply an older preset.
+let cloneMirrorGeneration = 0;
 export type PerformanceTier = (typeof performanceTiers)[number];
+export type PerformanceChoice = PerformanceTier | 'auto';
 export type PerformanceFamily = 'tts' | 'asr' | 'dictation' | 'diarisation' | 'translation' | 'llm';
 export interface PerformanceProfileState {
-  global: PerformanceTier;
+  global: PerformanceChoice;
   overrides: Partial<Record<PerformanceFamily, PerformanceTier>>;
   effective: Record<PerformanceFamily, PerformanceTier>;
   families: PerformanceFamily[];
   implemented_families: PerformanceFamily[];
   applicable_families?: PerformanceFamily[];
+  /** TTS engines whose sampling the tiers tune (backend-owned list). */
+  tts_tiered_engines?: string[];
   targets: Record<
     PerformanceFamily,
     {
@@ -40,6 +46,25 @@ export interface PerformanceProfileState {
   >;
   capacity_activations?: Partial<Record<PerformanceFamily, { engine?: string; model?: string }>>;
   runtime_activations?: Partial<Record<PerformanceFamily, { engine?: string; model?: string }>>;
+  plan?: {
+    resolved: PerformanceTier;
+    status: 'fits' | 'adjusted' | 'unknown' | 'limited';
+    max_status: 'fits' | 'adjusted' | 'unknown' | 'limited';
+    hardware: {
+      device: string;
+      ram_gb: number | null;
+      vram_gb: number | null;
+      cpu_threads: number;
+    };
+    families: Record<
+      PerformanceFamily,
+      {
+        tier: PerformanceTier;
+        reason: 'fits' | 'memory' | 'installed' | 'kept' | 'unknown';
+        selection: { engine: string; model: string; label?: string | null } | null;
+      }
+    >;
+  };
 }
 
 /** Preference persistence only; runtime application must report its own result. */
@@ -49,9 +74,9 @@ export function usePerformanceProfile() {
   const saving = useIsMutating({ mutationKey: ['performance-profile'] }) > 0;
   const query = useQuery({
     queryKey: ['performance-profile'],
-    enabled: backend.stage === 'ready',
+    enabled: isBackendReachable(backend.stage),
     staleTime: 30_000,
-    refetchInterval: IDLE_STATUS_POLL_MS,
+    refetchInterval: () => relaxWhenBackendBusy(IDLE_STATUS_POLL_MS),
     queryFn: () => apiJson<PerformanceProfileState>('/api/settings/performance-profile'),
   });
   const mutation = useMutation({
@@ -61,7 +86,7 @@ export function usePerformanceProfile() {
       tier,
       family,
     }: {
-      tier: PerformanceTier;
+      tier: PerformanceChoice;
       family: PerformanceFamily | null;
     }) => {
       // Persist first. The old path waited for the relatively expensive engine
@@ -71,9 +96,13 @@ export function usePerformanceProfile() {
         method: 'PUT',
         body: JSON.stringify({ tier, family }),
       });
+      const mirrorGeneration = ++cloneMirrorGeneration;
       const target = state.targets.tts;
       if (
-        ['omnivoice', 'omnivoice-isolated'].includes(state.selections.tts.engine) &&
+        // Backends before 0.5.7 don't report the list; they tier only OmniVoice.
+        (state.tts_tiered_engines ?? ['omnivoice', 'omnivoice-subprocess']).includes(
+          state.selections.tts.engine,
+        ) &&
         typeof target.steps === 'number' &&
         typeof target.postprocess === 'boolean'
       ) {
@@ -81,10 +110,12 @@ export function usePerformanceProfile() {
         // draft only keeps its visible override controls in sync; a chunk-load
         // failure must not turn an already-applied backend change into a failed
         // mutation.
-        await import('@/lib/store/clone-settings')
-          .then(({ patchCloneSettings }) =>
-            patchCloneSettings({ steps: target.steps!, postprocess: target.postprocess! }),
-          )
+        void import('@/lib/store/clone-settings')
+          .then(({ patchCloneSettings }) => {
+            if (mirrorGeneration === cloneMirrorGeneration) {
+              return patchCloneSettings({ steps: target.steps!, postprocess: target.postprocess! });
+            }
+          })
           .catch(() => {});
       }
       // Dubbing omits unset steps so the backend applies this preset. Keep any
@@ -103,6 +134,7 @@ export function usePerformanceProfile() {
         client.invalidateQueries({ queryKey: ['translation-engines'] }),
         client.invalidateQueries({ queryKey: ['settings-dictation'] }),
         client.invalidateQueries({ queryKey: ['sidebar-dictation'] }),
+        client.invalidateQueries({ queryKey: ['diarisation-status'] }),
       ]);
     },
   });

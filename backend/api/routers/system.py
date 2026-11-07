@@ -1,3 +1,5 @@
+import importlib
+import importlib.util
 import os
 import sys
 import platform
@@ -7,7 +9,7 @@ import psutil
 import asyncio
 import logging
 from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Query, Request
-from core.prefs import set_ as prefs_set, delete as prefs_delete
+from core.prefs import delete as prefs_delete, set_ as prefs_set
 from services import network_share
 from services import tailscale as _tailscale
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse
@@ -19,8 +21,11 @@ import subprocess
 import shlex
 
 from core.config import OUTPUTS_DIR, DATA_DIR, CRASH_LOG_PATH, LOG_PATH, IDLE_TIMEOUT_SECONDS
-from core.version import APP_VERSION
+from core.version import APP_VERSION, build_commit
+from core.browser_guard import reject_cross_site_get
 from core.logging_utils import log_safe
+from core.poll_guard import PollGuard
+from core.nvidia_smi import find_nvidia_smi
 from core.public_errors import public_failure
 from services.model_manager import get_model_status, get_best_device, resolve_omnivoice_checkpoint
 from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
@@ -44,6 +49,14 @@ try:
     _is_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
 except Exception:
     _is_xpu = False
+try:
+    # torch.npu exists only once the Ascend extension registers it; torch_npu
+    # releases before 2.5.1 do not autoload, so import it where installed.
+    if not hasattr(torch, "npu") and importlib.util.find_spec("torch_npu"):
+        importlib.import_module("torch_npu")
+    _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
+except Exception:
+    _is_npu = False
 # Prime psutil's internal CPU counter so the first non-blocking call returns useful data
 psutil.cpu_percent(interval=None)
 
@@ -68,7 +81,7 @@ def _detect_cpu_model() -> str:
         if sys.platform == "darwin":
             import subprocess
             return subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=5
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, errors="replace", timeout=5
             ).strip()
         return platform.processor() or ""
     except Exception:
@@ -101,11 +114,12 @@ def _detect_os_gpu_name() -> str:
                 ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=3,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            names = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
             return max(names, key=_gpu_name_priority, default="")
         if sys.platform.startswith("linux"):
             executable = shutil.which("lspci")
@@ -115,11 +129,12 @@ def _detect_os_gpu_name() -> str:
                 [executable, "-mm"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=2,
                 check=False,
             )
             names = []
-            for line in result.stdout.splitlines():
+            for line in (result.stdout or "").splitlines():
                 parts = shlex.split(line)
                 if len(parts) >= 4 and parts[1] in {"VGA compatible controller", "3D controller"}:
                     names.append(" ".join(parts[2:4]))
@@ -132,18 +147,39 @@ def _detect_os_gpu_name() -> str:
                 [executable, "SPDisplaysDataType"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=3,
                 check=False,
             )
             names = [
                 line.split(":", 1)[1].strip()
-                for line in result.stdout.splitlines()
+                for line in (result.stdout or "").splitlines()
                 if "Chipset Model:" in line
             ]
             return max(names, key=_gpu_name_priority, default="")
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - best-effort label; it runs at import time
+        # A probe failure must never stop the backend from starting (#3612).
         return ""
     return ""
+
+
+def _active_accelerator():
+    """(module, name) of the accelerator this host runs on, or (None, "").
+
+    One resolution shared by device detection, ``/sysinfo`` and the post-flush
+    snapshot, so a host's backend is decided in a single place. CUDA, Intel XPU
+    and Ascend NPU all expose ``get_device_name`` / ``get_device_properties`` /
+    ``memory_allocated`` / ``memory_reserved`` through the same shape, so the
+    same code covers them. MPS is unified-memory and keeps its own branch (it
+    reports no device-side total).
+    """
+    if _is_cuda:
+        return torch.cuda, "cuda"
+    if _is_xpu:
+        return torch.xpu, "xpu"
+    if _is_npu:
+        return torch.npu, "npu"
+    return None, ""
 
 
 def _detect_gpu() -> tuple[str, float]:
@@ -152,14 +188,12 @@ def _detect_gpu() -> tuple[str, float]:
     MPS has unified memory, so there's no separate VRAM figure to report;
     the name alone tells a bug-report reader what hardware this is.
     """
+    backend, _ = _active_accelerator()
     try:
-        if _is_cuda:
-            props = torch.cuda.get_device_properties(0)
-            return torch.cuda.get_device_name(0), round(props.total_memory / (1024 ** 3), 1)
-        if _is_xpu:
-            props = torch.xpu.get_device_properties(0)
+        if backend is not None:
+            props = backend.get_device_properties(0)
             total_memory = float(getattr(props, "total_memory", 0.0))
-            return torch.xpu.get_device_name(0), round(total_memory / (1024 ** 3), 1)
+            return backend.get_device_name(0), round(total_memory / (1024 ** 3), 1)
         if _is_mac:
             return "Apple Silicon (MPS)", 0.0
     except Exception:
@@ -184,9 +218,10 @@ def _disk_free_gb() -> float:
 
 def _nvidia_live_stats() -> tuple[float, float, float] | None:
     """Return GPU%, used VRAM GiB, total VRAM GiB without an optional Python dependency."""
-    executable = shutil.which("nvidia-smi")
+    executable = find_nvidia_smi()
     if not executable:
         return None
+    selected = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",", 1)[0].strip() or "0"
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         result = subprocess.run(
@@ -194,17 +229,18 @@ def _nvidia_live_stats() -> tuple[float, float, float] | None:
                 executable,
                 "--query-gpu=utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
-                "--id=0",
+                f"--id={selected}",
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=1.5,
             check=False,
             creationflags=creationflags,
         )
         if result.returncode != 0:
             return None
-        values = [float(value.strip()) for value in result.stdout.splitlines()[0].split(",")]
+        values = [float(value.strip()) for value in (result.stdout or "").splitlines()[0].split(",")]
         if len(values) != 3:
             return None
         utilization, used_mib, total_mib = values
@@ -213,19 +249,21 @@ def _nvidia_live_stats() -> tuple[float, float, float] | None:
         return None
 
 
-def _ui_port() -> int:
-    """The Vite UI dev-server port, single-sourced from OMNIVOICE_UI_PORT.
+def _ui_port() -> int | None:
+    """The browser UI dev-server port, or None when there is no such server.
 
-    Mirrors the resolver in main.py (kept local to avoid importing the app
-    module). Falls back to 3901 on a missing or malformed value.
+    Shares core.csrf's resolver (OMNIVOICE_UI_PORT, alias VOICESTUDIO_UI_PORT)
+    so Settings → Sharing reports the port the CORS/CSRF allow-list trusts.
+    The packaged desktop app serves its UI from app://voicestudio, so with no
+    UI port configured a desktop-contained backend has none to report; the
+    Electron dev shell passes its renderer port explicitly.
     """
-    raw = os.environ.get("OMNIVOICE_UI_PORT")
-    if raw is None:
-        return 3901
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return 3901
+    from core.csrf import configured_ui_port, ui_port
+
+    configured = configured_ui_port()
+    if configured is None and os.environ.get("OMNIVOICE_DESKTOP_CONTAINED") == "1":
+        return None
+    return configured or ui_port()
 
 
 def _fast_download_status() -> dict:
@@ -287,19 +325,30 @@ def _has_hf_token() -> bool:
         # Resolver must never break /system/info — fall back to False.
         return False
 
+def _list_loaded_snapshot():
+    from services import model_lifecycle
+    return model_lifecycle.list_loaded()
+
+
+# Polled every second by several widgets while work runs: each gets a private
+# single-thread executor (see core.poll_guard) so a stalled driver/DB call can
+# never occupy the shared worker pool the rest of the API runs on.
+_model_status_poll = PollGuard("model-status", lambda: get_model_status())
+_loaded_models_poll = PollGuard("model-loaded", _list_loaded_snapshot)
+
+
 @router.get("/model/status", response_model=ModelStatusResponse)
-def model_status():
+async def model_status():
     """Report model loading state for frontend warm-up indicators."""
-    return get_model_status()
+    return await _model_status_poll.get()
 
 
 @router.get("/model/loaded")
-def loaded_models():
+async def loaded_models():
     """List all currently loaded models for the flush dropdown (MM2-04).
     Thin delegation to the model_lifecycle facade — shape unchanged:
     ``{models, count}``."""
-    from services import model_lifecycle
-    return model_lifecycle.list_loaded()
+    return await _loaded_models_poll.get()
 
 
 @router.post("/model/unload/{model_id}")
@@ -322,7 +371,7 @@ def system_info():
     and a 500 here blocks the entire UI from rendering system details.
     """
     try:
-        _ffmpeg = find_ffmpeg()
+        _ffmpeg_path = find_ffmpeg()
         from services import model_manager as _mm
         from services import asr_backend as _asr_backend
         from core import prefs as _prefs_mod
@@ -338,6 +387,7 @@ def system_info():
         )
         return {
             "app_version": APP_VERSION,
+            "build_commit": build_commit(),
             "generate_timeout_s": _mm.GPU_JOB_TIMEOUT_S,
             "cpu_generate_timeout_s": _mm.CPU_JOB_TIMEOUT_S,
             # #1787 review fix: a saved prefs.json value for either key can be
@@ -370,8 +420,8 @@ def system_info():
             "gpu_name": _GPU_NAME,
             "vram_total_gb": _VRAM_TOTAL_GB,
             "disk_free_gb": _disk_free_gb(),
-            "ffmpeg_ok": bool(_ffmpeg),
-            "ffmpeg_path": _ffmpeg or "",
+            "ffmpeg_ok": bool(_ffmpeg_path),
+            "ffmpeg_path": _ffmpeg_path or "",
             "proxy_url": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "",
             "share_enabled": network_share.get_state().enabled,
             "share_port": network_share.get_state().share_port,
@@ -385,6 +435,7 @@ def system_info():
         logger.exception("system_info failed — returning safe defaults")
         return {
             "app_version": APP_VERSION,
+            "build_commit": build_commit(),
             "generate_timeout_s": 300.0,
             "cpu_generate_timeout_s": 600.0,
             "generate_timeout_shadowed": False,
@@ -803,6 +854,7 @@ def get_sys_info():
     total_vram = 0.0
     gpu_active = False
 
+    backend, _ = _active_accelerator()
     try:
         if _is_mac:
             alloc = getattr(torch.mps, "current_allocated_memory", None)
@@ -811,13 +863,10 @@ def get_sys_info():
                 vram = driver() / (1024**3)
             elif alloc:
                 vram = alloc() / (1024**3)
-        elif _is_cuda:
-            vram = torch.cuda.memory_allocated() / (1024**3)
-            total_vram = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024**3)
-        elif _is_xpu:
-            vram = torch.xpu.memory_allocated() / (1024**3)
+        elif backend is not None:
+            vram = backend.memory_allocated() / (1024**3)
             total_vram = float(
-                getattr(torch.xpu.get_device_properties(0), "total_memory", 0.0)
+                getattr(backend.get_device_properties(backend.current_device()), "total_memory", 0.0)
             ) / (1024**3)
     except Exception:
         pass
@@ -889,6 +938,7 @@ async def flush_memory(unload_model: bool = False):
     # CUDA context plus kernel workspaces, which no in-process call can return.
     vram_after = 0.0
     vram_reserved = 0.0
+    backend, _ = _active_accelerator()
     try:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             driver = getattr(torch.mps, "driver_allocated_memory", None)
@@ -896,9 +946,9 @@ async def flush_memory(unload_model: bool = False):
                 vram_after = driver() / (1024**3)
             current = getattr(torch.mps, "current_allocated_memory", None)
             vram_reserved = (current() / (1024**3)) if current else vram_after
-        elif torch.cuda.is_available():
-            vram_after = torch.cuda.memory_allocated() / (1024**3)
-            vram_reserved = torch.cuda.memory_reserved() / (1024**3)
+        elif backend is not None:
+            vram_after = backend.memory_allocated() / (1024**3)
+            vram_reserved = backend.memory_reserved() / (1024**3)
     except Exception:
         pass
 
@@ -923,6 +973,11 @@ def _gpu_arch_warning_cached() -> "str | None":
     too heavy for the 30s notifications poll)."""
     if not _GPU_ARCH_WARNING:
         try:
+            from core.gpu_self_test import pending
+
+            # Not cached: an answer given now would hide a failure found later.
+            if pending():
+                return None
             from services.model_manager import check_device_compatibility
             compatible, warning = check_device_compatibility()
             _GPU_ARCH_WARNING.append(None if compatible else warning)
@@ -1012,7 +1067,7 @@ def system_notifications():
                 "level": "warn",
                 "title": f"Low disk space ({free_gb:.1f} GB free)",
                 "message": "VoiceStudio needs disk space for models, audio, and temp files.",
-                "action": None,
+                "action": {"type": "settings-tab", "target": "storage"},
             })
     except Exception:
         pass
@@ -1168,14 +1223,17 @@ PERSISTENT_KEYS = {
     "TRANSLATE_BASE_URL", "TRANSLATE_API_KEY", "TRANSLATE_MODEL",
     "DEEPL_API_KEY", "DEEPL_BASE_URL",
     "MICROSOFT_API_KEY", "MICROSOFT_BASE_URL",
-    # User-configurable network ports. Persisted so they survive restarts;
-    # the Rust sidecar reads OMNIVOICE_PORT at startup and the backend derives
-    # the LAN-share/UI ports from the others.
-    "OMNIVOICE_PORT", "OMNIVOICE_SHARE_PORT", "OMNIVOICE_UI_PORT",
+    "GOOGLE_TRANSLATE_API_KEY", "MICROSOFT_REGION", "AWS_PROFILE", "AWS_REGION",
+    # The LAN-share port is the only persisted port: the backend binds that
+    # listener itself. OMNIVOICE_PORT and OMNIVOICE_UI_PORT are deliberately
+    # NOT persisted — the process that binds them (the desktop shell, the dev
+    # script, Docker, Vite) reads its own environment, never prefs.json, so a
+    # saved value only made the backend misreport the ports it was given.
+    # core.prefs.restore_env ignores values saved by older versions.
+    "OMNIVOICE_SHARE_PORT",
     # Per-job compute-time budgets (#1787). Both are captured at import time
     # by services/model_manager.py (GPU_JOB_TIMEOUT_S / CPU_JOB_TIMEOUT_S), so
-    # a value saved here takes effect on the NEXT backend restart — same
-    # contract as OMNIVOICE_PORT above. Restored into os.environ during the
+    # a value saved here takes effect on the NEXT backend restart. Restored into os.environ during the
     # "env_prefs" startup step (main.py), which runs before model_manager is
     # first imported ("ml_imports"), so the restored value is what the module
     # captures. The Settings UI must say so (RestartBadge).
@@ -1187,15 +1245,22 @@ PERSISTENT_KEYS = {
 # main.py); merging them here lets users inspect/clear them from the same
 # Settings env panel as every other persisted var. Single-sourced from the
 # installer's SPECS so a future sidecar engine can't forget to register.
+#
+# The backend runs the interpreter inside these folders, so they are host
+# paths that must never arrive as raw HTTP text: a new value comes only from a
+# one-shot desktop authorization (kind "sidecar_dir"), like the models folder.
+# Clearing stays a plain request; values already persisted keep working.
+_SIDECAR_DIR_KEYS: set[str] = set()
 try:
     from services.sidecar_install import persistent_env_vars as _sidecar_env_vars
-    PERSISTENT_KEYS |= _sidecar_env_vars()
+    _SIDECAR_DIR_KEYS = set(_sidecar_env_vars())
+    PERSISTENT_KEYS |= _SIDECAR_DIR_KEYS
 except Exception:  # pragma: no cover — defensive: env panel > installer wiring
     pass
 
 # Keys whose value must be a valid TCP port (1024–65535). Validated before
 # being set so a bad value never reaches uvicorn / the share listener.
-_PORT_KEYS = {"OMNIVOICE_PORT", "OMNIVOICE_SHARE_PORT", "OMNIVOICE_UI_PORT"}
+_PORT_KEYS = {"OMNIVOICE_SHARE_PORT"}
 
 # Keys whose value is a wall-clock compute-time budget in seconds (#1787).
 # Validated the same way as _PORT_KEYS: reject anything that isn't a
@@ -1208,20 +1273,40 @@ _TIMEOUT_KEYS = {"OMNIVOICE_GENERATE_TIMEOUT_S", "OMNIVOICE_CPU_GENERATE_TIMEOUT
 _MAX_GENERATE_TIMEOUT_S = 21600.0  # 6 hours
 
 
+def _authorized_sidecar_dir(value, authorization) -> str:
+    """Resolve a sidecar install folder from a desktop authorization only."""
+    if value:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Engine folders cannot be set through the API. Set the variable in "
+                "the backend's environment (for example ~/.config/omnivoice/env) and "
+                "restart, or use the one-click engine installer in Settings → Models."
+            ),
+        )
+    if not authorization:
+        return ""  # clear
+    from core.path_authorization import PathAuthorizationError, consume
+
+    try:
+        raw = consume(str(authorization), "sidecar_dir").strip()
+    except PathAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise HTTPException(status_code=400, detail="Path contains invalid control characters")
+    return os.path.abspath(os.path.expanduser(raw)) if raw else ""
+
+
 @router.post("/system/set-env")
 async def set_env_var(body: dict):
-    """Set an environment variable at runtime, persisted across restarts.
+    """Set an environment variable for the running backend.
 
-    Persistent keys (proxy, FFMPEG_PATH, translation provider keys, …) are
-    saved to ``prefs.json`` so they survive backend restarts (restored at
-    startup in ``main.py``). HF_TOKEN is persisted via
-    ``huggingface_hub.login()`` (and cleared with the shared token-file helper). Other keys
-    are set on ``os.environ`` for the running process.
+    Keys in ``PERSISTENT_KEYS`` are saved in prefs.json and restored during
+    startup in main.py. HF_TOKEN is saved by
+    ``token_resolver.persist_hub_token()`` and cleared through the shared
+    token-file helper. Other accepted keys affect only this process.
 
-    The loopback-origin gate that previously lived inline here is now applied
-    at the router level via `dependencies=[Depends(require_admin)]` on
-    `router` — see the top of this file. Every route on this router is
-    gated, including this one. The 403 body and behavior are unchanged.
+    The loopback-origin gate that previously lived inline here is now applied at the router level via `dependencies=[Depends(require_admin)]` on `router` — see the top of this file. Every route on this router is gated, including this one. The 403 body and behavior are unchanged.
     """
     ALLOWED_KEYS = PERSISTENT_KEYS | {"HF_TOKEN", "TRANSLATE_API_KEY"}
     key = body.get("key", "")
@@ -1232,6 +1317,9 @@ async def set_env_var(body: dict):
             status_code=400,
             detail=f"Key '{key}' is not allowed. Allowed: {', '.join(sorted(ALLOWED_KEYS))}",
         )
+
+    if key in _SIDECAR_DIR_KEYS:
+        value = _authorized_sidecar_dir(value, body.get("authorization"))
 
     if value:
         # Port keys must be a numeric string in the unprivileged range so a
@@ -1269,15 +1357,15 @@ async def set_env_var(body: dict):
         os.environ[key] = value
         logger.info("Environment variable set (length=%d)", len(value))
 
-        # Capability 1 / issue #35: HF_TOKEN persists across restarts via
-        # huggingface_hub.login() — writes the token to $HF_HOME/token so
-        # the next process pickup doesn't need an env var. add_to_git_credential
-        # stays False; we don't want to spew tokens into the user's git config.
+        # Capability 1 / issue #35: HF_TOKEN persists across restarts in the
+        # Hub token file so the next process pickup doesn't need an env var.
+        # persist_hub_token validates on huggingface.co only (never a mirror)
+        # and never writes a git credential.
         if key == "HF_TOKEN":
             try:
-                from huggingface_hub import login as _hf_login
-                _hf_login(token=value, add_to_git_credential=False)
-                logger.info("HF token persisted to $HF_HOME/token via login()")
+                from services.token_resolver import persist_hub_token
+                persist_hub_token(value)
+                logger.info("HF token persisted to the local Hub token file")
             except Exception as e:
                 # Non-fatal — the runtime env var is still set, so the
                 # current process will still see the token. We just lose
@@ -1296,14 +1384,17 @@ async def set_env_var(body: dict):
             except Exception:
                 raise HTTPException(status_code=500, detail="Could not clear local Hugging Face token files") from None
 
-    # HF_TOKEN persistence is handled above via huggingface_hub.login()/
+    # HF_TOKEN persistence is handled above via persist_hub_token()/
     # clear_hf_cli_tokens() — it never touches prefs.json. Everything else in
-    # PERSISTENT_KEYS (proxy, FFMPEG_PATH, translation provider keys, …) is
-    # saved to prefs.json so it survives backend restarts (restored at
-    # startup in main.py). Non-persistent keys stay process-local.
+    # the persistent set is stored after the process environment is updated.
     if key != "HF_TOKEN" and key in PERSISTENT_KEYS:
-        prefs_key = f"env.{key}"
-        if value:
+        prefs_key = "env." + key
+        from services.translation_apis import SECRET_ENV_KEYS
+        if key in SECRET_ENV_KEYS:
+            from services import settings_store
+            settings_store.set_secret("translation_env." + key, value or None)
+            prefs_delete(prefs_key)
+        elif value:
             prefs_set(prefs_key, value)
         else:
             prefs_delete(prefs_key)
@@ -1523,6 +1614,12 @@ async def network_enable(request: Request):
     }
 
 
+@router.get("/system/network/check")
+async def network_check(request: Request):
+    """Self-check for LAN sharing: bind address, port and per-address listener probe."""
+    return await network_share.self_check(request.app)
+
+
 @router.post("/system/network/disable")
 async def network_disable(request: Request):
     st = await network_share.disable(request.app)
@@ -1531,7 +1628,7 @@ async def network_disable(request: Request):
 
 # ── Tailscale (loopback-only control surface) ────────────────────────────────
 
-@router.get("/system/tailscale/status")
+@router.get("/system/tailscale/status", dependencies=[Depends(reject_cross_site_get)])
 async def tailscale_status():
     return _tailscale.status()
 

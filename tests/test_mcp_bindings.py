@@ -16,28 +16,27 @@ os.environ.setdefault("OMNIVOICE_DISABLE_FILE_LOG", "1")
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
-    monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
+    """The bindings service on this test's tmp DB, via fresh module copies.
+
+    Reloading core.config/core.db in place swapped functions other modules
+    had imported by name (``services.dub_pipeline.db_conn``), so later tests
+    in a combined run saw two different ``db_conn`` objects. Import the
+    backend tree fresh under the tmp env and restore the untouched originals
+    afterwards instead (tests/backend_module_state.py).
+    """
     import importlib
-    import core.config as _cfg
-    importlib.reload(_cfg)
-    import core.db as _db
-    importlib.reload(_db)
-    _db.init_db()
-    import services.mcp_bindings as mb
-    importlib.reload(mb)
+
+    from backend_module_state import purge, restore, snapshot
+
+    before = snapshot()
+    monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
+    purge()
     try:
-        yield mb
+        importlib.import_module("core.db").init_db()
+        yield importlib.import_module("services.mcp_bindings")
     finally:
-        # Mirror the `client` fixture below: importlib.reload mutates the
-        # module objects IN PLACE, so without this teardown every later test
-        # in a combined run — even one holding a collection-time reference —
-        # keeps reading DB/voices paths bound to this test's dead tmp_path
-        # (it broke backend/tests personas/audiobook in full-suite runs).
-        # Restore the env first, then re-reload under the restored value.
         monkeypatch.undo()
-        importlib.reload(_cfg)
-        importlib.reload(_db)
-        importlib.reload(mb)
+        restore(before)
 
 
 def test_upsert_creates_then_updates(db):
@@ -50,6 +49,57 @@ def test_upsert_creates_then_updates(db):
     b2 = db.upsert_binding("claude-code", profile_id="scarlett")
     assert b2["profile_id"] == "scarlett"
     assert b2["label"] == "Claude Code"
+
+
+def _interleave(db, monkeypatch, other_edit):
+    """Run ``other_edit`` (another Settings client) at the moment this upsert
+    stamps its time: after any read it does, before its write lands."""
+    import time as _time
+    import types
+
+    fired = []
+
+    def _now():
+        if not fired:
+            fired.append(True)
+            other_edit()
+        return _time.time()
+
+    monkeypatch.setattr(db, "time", types.SimpleNamespace(time=_now))
+    return fired
+
+
+def test_concurrent_partial_edits_keep_each_others_fields(db, monkeypatch):
+    """#2568: an omitted field must keep the value the row holds when this
+    edit writes, not a snapshot read before another client's edit."""
+    db.upsert_binding("cursor", label="Cursor", profile_id="morgan", default_engine="kokoro")
+    fired = _interleave(db, monkeypatch, lambda: db.upsert_binding("cursor", label="Cursor IDE"))
+
+    b = db.upsert_binding("cursor", profile_id="scarlett")
+
+    assert fired
+    assert (b["label"], b["profile_id"], b["default_engine"]) == ("Cursor IDE", "scarlett", "kokoro")
+    assert db.get_binding("cursor") == b
+
+
+def test_concurrent_first_saves_merge_instead_of_failing(db, monkeypatch):
+    fired = _interleave(
+        db, monkeypatch, lambda: db.upsert_binding("agent", label="Agent", default_engine="kokoro"),
+    )
+
+    b = db.upsert_binding("agent", profile_id="morgan")
+
+    assert fired
+    assert (b["label"], b["profile_id"], b["default_engine"]) == ("Agent", "morgan", "kokoro")
+
+
+def test_partial_upsert_clears_only_the_fields_sent_empty(db):
+    db.upsert_binding("a", label="A", profile_id="p", default_engine="e")
+    b = db.upsert_binding("a", profile_id="", label="")
+    assert (b["label"], b["profile_id"], b["default_engine"]) == ("", None, "e")
+    created = db.upsert_binding("new")
+    assert (created["label"], created["profile_id"], created["default_engine"]) == ("", None, None)
+    assert created["last_seen_at"] is None and created["created_at"] is not None
 
 
 def test_empty_client_id_rejected(db):
@@ -77,16 +127,18 @@ def test_resolution_precedence(db):
     r = db.resolve_voice("cursor", None)
     assert r["profile_id"] == "bound-voice" and r["source"] == "binding"
 
-    # Unknown client, no global default → none.
+    # Unknown client → none.
     r = db.resolve_voice("unknown", None)
     assert r["source"] == "none" and r["profile_id"] is None
 
 
-def test_resolution_global_default(db, monkeypatch):
+def test_resolution_ignores_the_never_written_global_default_pref(db, monkeypatch):
+    """No Settings surface ever wrote mcp_default_profile_id, so honoring a
+    stale or hand-edited value would pick a voice no UI shows."""
     from core import prefs
     monkeypatch.setattr(prefs, "get", lambda k, default=None: "global-voice" if k == "mcp_default_profile_id" else default)
     r = db.resolve_voice("no-binding-client", None)
-    assert r == {"profile_id": "global-voice", "default_engine": None, "source": "global"}
+    assert r == {"profile_id": None, "default_engine": None, "source": "none"}
 
 
 def test_touch_last_seen_is_best_effort(db):
@@ -163,38 +215,35 @@ def test_migration_0004_downgrade_drops_table(tmp_path):
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
+    """A fresh app on this test's data dir, without touching shared modules.
+
+    Earlier versions reloaded core.config/core.db/main in place and purged
+    api.*/services.* afterwards. In-place reloads swap functions that other
+    modules imported by name (``services.dub_pipeline.db_conn``), and the
+    purge left fresh copies in sys.modules while earlier-collected test
+    modules kept the originals, so later tests patched one copy while the
+    code ran in the other (#3466 CI: test_network_share_self_check,
+    test_backend_module_state). Now the backend tree is imported fresh under
+    the tmp env and the untouched originals are restored afterwards
+    (tests/backend_module_state.py).
+    """
     import importlib
-    for m in ("core.config", "core.db", "services.mcp_bindings"):
-        if m in sys.modules:
-            importlib.reload(importlib.import_module(m))
-    import core.db as _db
-    _db.init_db()
-    import main as _main
-    importlib.reload(_main)
-    from fastapi.testclient import TestClient
-    # No `with` — running the lifespan rebinds module-level event-bus queues
-    # to this loop and contaminates later lifespan tests (Wave 0.2 footgun).
+
+    from backend_module_state import purge, restore, snapshot
+
+    before = snapshot()
+    monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
+    purge()
     try:
+        importlib.import_module("core.db").init_db()
+        _main = importlib.import_module("main")
+        from fastapi.testclient import TestClient
+        # No `with` — running the lifespan rebinds module-level event-bus queues
+        # to this loop and contaminates later lifespan tests (Wave 0.2 footgun).
         yield TestClient(_main.app, client=("127.0.0.1", 50000))
     finally:
-        # Reloading main above poisons the global module for any later test
-        # that does `from main import …`. Reload once more with the default
-        # (project) data dir restored so the shared module is clean again.
-        # The api.*/services.* trees must be PURGED first, not merely left
-        # cached: `import main` above (re)imported them under this test's
-        # tmp_path env, and modules like api.routers.profiles keep
-        # value-copies of core.config paths (`from core.config import
-        # VOICES_DIR`) that an in-place reload of core.config alone cannot
-        # heal — later personas/profiles requests then wrote voice files
-        # into this test's dead tmp_path in combined full-suite runs.
         monkeypatch.undo()
-        importlib.reload(importlib.import_module("core.config"))
-        importlib.reload(importlib.import_module("core.db"))
-        for m in list(sys.modules):
-            if m in ("api", "services") or m.startswith(("api.", "services.")):
-                sys.modules.pop(m, None)
-        importlib.reload(_main)
+        restore(before)
 
 
 def test_rest_crud_roundtrip(client):

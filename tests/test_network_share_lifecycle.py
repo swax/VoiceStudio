@@ -9,11 +9,57 @@ Wrapped in asyncio.run inside a sync test so it does not depend on a
 pytest-asyncio event-loop mode being configured.
 """
 import asyncio
+from types import SimpleNamespace
 import socket
 
 import pytest
 
 from services import network_share as ns
+
+
+@pytest.mark.parametrize('second_operation', ['enable', 'disable'])
+def test_overlapping_lifecycle_calls_leave_no_listener_or_mcp_hosts(monkeypatch, second_operation):
+    from services import network_share as ns
+
+    async def exercise():
+        servers = []
+        serving = []
+
+        class Server:
+            def __init__(self, _config):
+                self.started = False
+                self.should_exit = False
+                servers.append(self)
+
+            async def serve(self):
+                serving.append(asyncio.current_task())
+                self.started = True
+                while not self.should_exit:
+                    await asyncio.sleep(0)
+
+        monkeypatch.setattr(ns, '_runtime', ns._ShareRuntime())
+        monkeypatch.setattr(ns.uvicorn, 'Server', Server)
+        monkeypatch.setattr(ns, '_find_free_port', lambda *_: 3901)
+        monkeypatch.setattr(ns, 'lan_ipv4_addresses', lambda: ['192.168.1.42'])
+        security = SimpleNamespace(allowed_hosts=['localhost:*'], allowed_origins=['http://localhost:*'])
+        app = SimpleNamespace(state=SimpleNamespace(mcp_transport_security=security))
+        try:
+            states = await asyncio.gather(ns.enable(app), getattr(ns, second_operation)(app))
+            assert len(servers) == 1
+            if second_operation == 'enable':
+                assert states[0] is states[1]
+            else:
+                assert not ns.get_state().enabled
+            await ns.disable(app)
+            assert security.allowed_hosts == ['localhost:*']
+            assert security.allowed_origins == ['http://localhost:*']
+            assert all(task.done() for task in serving)
+        finally:
+            for server in servers:
+                server.should_exit = True
+            await asyncio.gather(*serving, return_exceptions=True)
+
+    asyncio.run(exercise())
 
 
 def _can_connect(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:

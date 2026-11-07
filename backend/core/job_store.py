@@ -62,6 +62,23 @@ def mark_cancelled(job_id: str) -> None:
     _update_status(job_id, "cancelled", finished=True)
 
 
+def retire_if_active(job_id: str, status: str, error: Optional[str] = None) -> bool:
+    """Move a still ``pending``/``running`` job to a terminal ``status``.
+
+    For exit paths that cannot know whether the job already settled (a
+    cancelled or closed response): a job that already finished, failed or was
+    cancelled keeps its terminal status. Returns True if a row was changed.
+    """
+    now = time.time()
+    with db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status=?, updated_at=?, finished_at=?, error=? "
+            "WHERE id=? AND status IN ('pending', 'running')",
+            (status, now, now, error, job_id),
+        )
+        return cur.rowcount > 0
+
+
 def _update_status(job_id: str, status: str, *, finished: bool = False, error: Optional[str] = None) -> None:
     now = time.time()
     with db_conn() as conn:
@@ -81,34 +98,22 @@ def _update_status(job_id: str, status: str, *, finished: bool = False, error: O
 
 
 def append_event(job_id: str, payload: str) -> int:
-    """Persist one SSE event. Returns the new `seq` number.
-
-    `payload` is the raw SSE line (e.g. `data: {...}\\n\\n`). The schema keeps
-    it opaque so future event shapes don't require migrations.
-    """
-    now = time.time()
+    """Persist an SSE payload and return its per-job sequence number."""
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS s FROM job_events WHERE job_id = ?",
-            (job_id,),
+            "INSERT INTO job_events (job_id, seq, created_at, payload) "
+            "SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ? "
+            "FROM job_events WHERE job_id = ? RETURNING seq",
+            (job_id, time.time(), payload, job_id),
         ).fetchone()
-        next_seq = int(row["s"]) + 1
+        seq = int(row["seq"])
         conn.execute(
-            "INSERT INTO job_events (job_id, seq, created_at, payload) VALUES (?, ?, ?, ?)",
-            (job_id, next_seq, now, payload),
+            "DELETE FROM job_events WHERE job_id = ? AND seq NOT IN "
+            "(SELECT seq FROM job_events WHERE job_id = ? "
+            "ORDER BY seq DESC LIMIT ?)",
+            (job_id, job_id, _EVENT_CAP_PER_JOB),
         )
-        # Trim oldest beyond the cap. Cheap: bounded by _EVENT_CAP_PER_JOB.
-        cnt = conn.execute(
-            "SELECT COUNT(*) AS n FROM job_events WHERE job_id = ?",
-            (job_id,),
-        ).fetchone()["n"]
-        if cnt > _EVENT_CAP_PER_JOB:
-            conn.execute(
-                "DELETE FROM job_events WHERE job_id = ? AND seq IN "
-                "(SELECT seq FROM job_events WHERE job_id = ? ORDER BY seq ASC LIMIT ?)",
-                (job_id, job_id, cnt - _EVENT_CAP_PER_JOB),
-            )
-    return next_seq
+    return seq
 
 
 def events_since(job_id: str, after_seq: int = 0, limit: int = 1000) -> list[dict]:
@@ -131,8 +136,9 @@ def get(job_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def list_jobs(*, status: Optional[str] = None, project_id: Optional[str] = None, limit: int = 100) -> list[dict]:
-    """List jobs, newest first. Filter by status (e.g. `active` = running+pending) or project."""
+def list_jobs(*, status: Optional[str] = None, project_id: Optional[str] = None,
+              types: Optional[tuple[str, ...]] = None, limit: int = 100) -> list[dict]:
+    """List jobs, newest first. Filter by status (e.g. `active` = running+pending) or project, with type filtering before the row limit."""
     where = []
     params = []
     if status == "active":
@@ -143,6 +149,11 @@ def list_jobs(*, status: Optional[str] = None, project_id: Optional[str] = None,
     if project_id:
         where.append("project_id = ?")
         params.append(project_id)
+    if types is not None:
+        if not types:
+            return []
+        where.append("type IN (" + ",".join("?" for _ in types) + ")")
+        params.extend(types)
     sql = "SELECT * FROM jobs"
     if where:
         sql += " WHERE " + " AND ".join(where)

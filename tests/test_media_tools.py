@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import time
 import zipfile
 from unittest.mock import patch
 
@@ -627,7 +628,7 @@ def test_failed_publication_restores_working_directory(mt, monkeypatch, tmp_path
         return original_replace(src, dst)
 
     monkeypatch.setattr(mt.os, 'replace', replace)
-    monkeypatch.setattr(mt.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
     with pytest.raises(PermissionError, match='publication locked'):
         mt._install_staged_directory(str(staged), str(target))
     assert (target / 'version').read_text() == 'working'
@@ -648,7 +649,7 @@ def test_failed_rollback_keeps_recoverable_backup(mt, monkeypatch, tmp_path):
         return original_replace(src, dst)
 
     monkeypatch.setattr(mt.os, 'replace', replace)
-    monkeypatch.setattr(mt.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
     with pytest.raises(OSError, match='Previous installation preserved at'):
         mt._install_staged_directory(str(staged), str(target))
     backups = list(tmp_path.glob('.media-backup-*/previous/version'))
@@ -670,7 +671,7 @@ def test_locked_backup_cleanup_does_not_fail_successful_update(mt, monkeypatch, 
         return original_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(mt.shutil, 'rmtree', rmtree)
-    monkeypatch.setattr(mt.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
     mt._install_staged_directory(str(staged), str(target))
     assert (target / 'version').read_text() == 'new'
 

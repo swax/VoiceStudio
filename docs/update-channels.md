@@ -1,32 +1,57 @@
-# Update channels (Stable / Preview)
+# Desktop updates
 
-VoiceStudio checks for updates shortly after launch and every six hours while
-it stays open. You choose **which builds** it offers you with the update
-channel in **Settings → Updates → Update channel**.
+VoiceStudio's desktop app follows **Stable** releases unless you opt in to
+**Beta**. It checks for an
+update about 10 seconds after launch and every six hours while it stays open;
+**Settings → Updates** also has a manual check. The app never downloads an
+update until you ask, and an available update is only offered, never forced.
 
-| Channel | What you get | Who it's for |
-|---------|--------------|--------------|
-| **Stable** (default) | The latest tagged `vX.Y.Z` release. | Everyone. This is the default on every install and every launch. |
-| **Preview** | The latest `main` build (a rolling `preview` prerelease). Newer features, less testing. Falls back to a stable release if one is ahead. | Users who want to try fixes/features before they're tagged, and report issues. |
+| Build | Where it comes from | Who it's for |
+|-------|--------------------|--------------|
+| **Stable** | The latest published `vX.Y.Z` GitHub Release. | Everyone. This is the default. |
+| **Beta** | The newest `vX.Y.Z-beta.N` prerelease, cut from `main` before the matching stable release. | Testers who want fixes early and can live with bugs. Opt in under **Settings → Updates → Update channel**. |
 
-Switching is instant — the next automatic or manual check uses your chosen
-channel. Downloads show transferred size, total size, speed, percentage and
-ETA, and can continue while synthesis, transcription or dubbing work runs.
-VoiceStudio only enables **Restart to update** after the package has downloaded
-and passed the updater's signature/checksum verification, and blocks that
-restart until active work has finished and current drafts are flushed.
+Switching channel takes effect immediately and is remembered across restarts.
+It is locked while an update is downloading or waiting to restart.
 
-There are **no accounts or updater telemetry**. Stable checks fetch only the
-Stable manifest. Preview checks compare the small Stable and Preview manifests,
-then use whichever has the newer version; package download begins when the user
-asks. Both channels use a different release location:
+- **Beta rolls forward onto Stable.** When a stable release passes your beta
+  (for example `0.5.9` after `0.5.9-beta.3`), Beta installs it, so you never
+  linger on an old beta.
+- **Switching back to Stable never downgrades.** If your beta is newer than the
+  latest stable, you stay on it until the next stable release.
+- Beta builds are GitHub *prereleases*: they never become the `latest` release
+  and Stable users never see them. Microsoft Store, Snap Store and Mac App
+  Store builds are Stable-only.
+- Beta Linux AppImages update through the in-app updater, not AppImageUpdate.
 
-- Stable → `releases/latest/download/`
-- Preview → `releases/download/preview/`
+There is no separate preview desktop feed. To try changes between betas:
 
-The Electron feed publishes a platform/architecture-specific manifest with a
-SHA-512 package checksum; the Tauri feed publishes its signed `latest.json`.
-Each desktop shell rejects a package that fails its integrity check.
+- **Run `main` from source** — see the platform install guides
+  ([macOS](install/macos.md#building-from-source) ·
+  [Windows](install/windows.md#building-from-source) ·
+  [Linux](install/linux.md#building-from-source)), or build and install a
+  package from `main` with the [install script's `--main` mode](install/script.md#building-main).
+- **Docker** — `ghcr.io/debpalash/voicestudio:latest` follows `main`; see
+  [image tags](install/docker.md#image-tags).
+
+Downloads show transferred size, total size, speed, percentage and ETA, and
+can continue while synthesis, transcription or dubbing work runs. VoiceStudio
+only enables **Restart to update** after the package has downloaded and passed
+the updater's checksum verification, and blocks that restart until active work
+has finished and current drafts are flushed.
+
+There are **no accounts or updater telemetry**. A check fetches one small
+platform/architecture-specific manifest from
+`github.com/debpalash/VoiceStudio/releases/latest/download/` (Stable), or, on
+Beta, from the newest beta or stable release found through the public GitHub
+releases list; it carries the
+package's SHA-512 checksum, and the app rejects a package that fails it. On
+Linux the in-app updater uses the AppImage; update a `.deb` installation by
+installing the newer `.deb`. Source checkouts do not self-update.
+
+The archived Tauri app keeps its frozen, signed `latest.json` feeds at
+immutable URLs; they never offer Electron installers. Move to Electron with the
+[migration guide](electron-migration.md).
 
 ## Your data during updates
 
@@ -38,6 +63,8 @@ database schema upgrade, VoiceStudio:
 1. **Backs up the database first** — a consistent snapshot is written next to
    it as `omnivoice.db.backup-<version>-<n>` before any migration runs. The
    newest **3** backups are kept; older ones are pruned automatically.
+   An interrupted copy leaves a `.part-<pid>` temporary file. Partial files are
+   never shown as backups, and the next snapshot removes abandoned ones.
    (Databases over 500 MB skip the snapshot, with a log line saying so.)
 2. **Stops instead of guessing** — if a migration fails midway, the app does
    *not* start on a half-migrated database and does *not* silently restore
@@ -54,27 +81,3 @@ drift after an app update is reconciled **in place** with `uv sync`, and a
 failed sync keeps the previous environment working. The venv is only ever
 rebuilt when its interpreter is *confirmed* broken (structural check + a
 direct probe) or when you explicitly use **Clean & Retry**.
-
-## For maintainers — how previews are built
-
-Preview builds come from **`main`**, two ways:
-
-- **Nightly (automatic).** A scheduled job (07:00 UTC) rebuilds the rolling
-  `preview` prerelease from `main` — but only when `main` actually moved in the
-  last day, so idle days cost nothing. Preview is never more than ~24h behind
-  `main`.
-- **On demand.** **Actions → Desktop Release → Run workflow** on `main`, set
-  **publish_preview = true**. Useful to refresh immediately without waiting
-  for the nightly. Previews build from `main` **only** (hard rule, owner-set
-  2026-07-16) — the preview-gate refuses any other branch; to preview a fix,
-  merge it to `main` first.
-
-Either way it builds the matrix and publishes/updates a single rolling
-`preview` **prerelease** — always flagged prerelease, and carrying the same
-platform set as stable (both verified in CI after each preview publish) — with
-its own signed `latest.json`. The tagged `latest` stable release is never
-affected. Preview users get the new build on their next check; stable users see
-nothing.
-
-To stop offering previews, delete the `preview` release/tag on GitHub — the
-Preview channel then falls back to stable.

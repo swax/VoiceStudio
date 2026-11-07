@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import logging
 import functools
 import re
@@ -29,19 +30,23 @@ logger = logging.getLogger("omnivoice.translation_engines")
 
 _NLLB_REPO_ID = "facebook/nllb-200-distilled-600M"
 _ARGOS_INSTALL_LOCK = threading.Lock()
-_ARGOS_LANG_ALIASES = {
-    "cmn": "zh",
-    "zho": "zh",
-    "in": "id",
-    "iw": "he",
-    "fil": "tl",
-}
-# Human names (and the UI's own labels) that are not ISO 639-1 tokens.
+# UI labels that name a language instead of coding it, mapped to Argos' token.
 _ARGOS_NAME_ALIASES = {
     "chinese": "zh",
     "chinese (simplified)": "zh",
     "mandarin": "zh",
 }
+# Other ISO 639 spellings (three-letter or retired two-letter) mapped to the
+# token Argos package metadata uses.
+_ARGOS_CODE_ALIASES = {
+    "cmn": "zh",
+    "zho": "zh",
+    "in": "id",   # retired Indonesian code
+    "iw": "he",   # retired Hebrew code
+    "fil": "tl",  # Filipino is packaged as Tagalog
+}
+_ARGOS_CHINESE_CODES = frozenset({"zh", "zho", "cmn"})
+_ARGOS_TRADITIONAL_SUBTAGS = frozenset({"hant", "tw", "hk", "mo"})
 
 
 # Engine ID → registry entry. Keyed by the `provider` string sent from the
@@ -51,11 +56,8 @@ REGISTRY: dict[str, dict] = {
         "id": "argos",
         "display_name": "Argos (Local, Fast)",
         "pip_package": "argostranslate",
-        # `argostranslate.translate`, not the bare package: the translator runs
-        # on CTranslate2, and the bare package imports fine on a host whose
-        # kernel rejects CTranslate2's native library (#692) — so a shallow
-        # probe advertised Argos as ready and every translate 500'd. Probe the
-        # module that actually pulls the native dep (same lesson as #1185).
+        # The bare package imports without the native library; the translate
+        # submodule is what loads CTranslate2 and can fail (#692, #1185).
         "probe_module": "argostranslate.translate",
         "category": "offline",
         "needs_key": False,
@@ -84,8 +86,9 @@ REGISTRY: dict[str, dict] = {
     "deepl": {
         "id": "deepl",
         "display_name": "DeepL (Online, Key)",
-        "pip_package": "deep_translator",
-        "probe_module": "deep_translator",
+        "pip_package": "httpx",
+        "probe_module": "httpx",
+        "builtin": True,
         "category": "online",
         "needs_key": True,
         "notes": "High-quality EU MT. Free tier: 500K chars/month. Set DEEPL_API_KEY.",
@@ -93,11 +96,20 @@ REGISTRY: dict[str, dict] = {
     "microsoft": {
         "id": "microsoft",
         "display_name": "Microsoft Translator (Online, Key)",
-        "pip_package": "deep_translator",
-        "probe_module": "deep_translator",
+        "pip_package": "httpx",
+        "probe_module": "httpx",
+        "builtin": True,
         "category": "online",
         "needs_key": True,
         "notes": "Azure Cognitive Services. Free tier: 2M chars/month. Set MICROSOFT_API_KEY.",
+    },
+    "google-cloud": {
+        "id": "google-cloud", "display_name": "Google Cloud Translation", "pip_package": "httpx",
+        "probe_module": "httpx", "category": "online", "needs_key": True, "builtin": True,
+    },
+    "amazon": {
+        "id": "amazon", "display_name": "Amazon Translate", "pip_package": "boto3",
+        "probe_module": "boto3", "category": "online", "needs_key": True, "builtin": True,
     },
     "mymemory": {
         "id": "mymemory",
@@ -137,43 +149,62 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False) or os.environ.get("OMNIVOICE_FROZEN"))
 
 
-def _probe(entry: dict) -> tuple[bool, str | None]:
+def _nllb_weights_probe() -> tuple[bool, str | None]:
+    # Transformers being importable only proves the runtime exists.
+    # The weights are a separate explicit model install; do not report
+    # NLLB ready and let from_pretrained download 2.4 GB silently.
+    from api.routers.setup.models import cache_is_complete, is_cached
+
+    model = {"repo_id": _NLLB_REPO_ID}
+    if not is_cached(_NLLB_REPO_ID) or not cache_is_complete(model):
+        return False, "NLLB model weights are not installed"
+    return True, None
+
+
+def _argos_native_blocker() -> str | None:
+    """Try to make CTranslate2 loadable before Argos is imported (#692).
+
+    Returns the failure text if it stays unloadable, else None. A crash in the
+    repair code itself is only logged.
+    """
+    try:
+        from core.execstack import ensure_ctranslate2_loadable
+
+        loadable, why = ensure_ctranslate2_loadable()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("CTranslate2 repair before Argos probe failed: %s", exc)
+        return None
+    return None if loadable else why
+
+
+def _probe(entry: dict, *, import_check: bool = True) -> tuple[bool, str | None]:
     mod = entry.get("probe_module")
     if not mod:
         return True, None
-    if mod.startswith("argostranslate"):
-        # Repair CTranslate2's exec-stack request before the import that would
-        # be rejected by it (#692) — otherwise Argos, the default offline
-        # engine, is unusable on kernels that refuse an executable stack.
-        try:
-            from core.execstack import ensure_ctranslate2_loadable
-
-            ok, detail = ensure_ctranslate2_loadable()
-            if not ok:
-                return False, detail
-        except Exception as e:  # noqa: BLE001 — a broken repair must not hide the engine
-            logger.debug("exec-stack repair unavailable (%s) — probing anyway", e)
+    if not import_check:
+        # Inventory-only answer: is the package installed? Importing it is the
+        # expensive part (argostranslate is 8-54 s cold), and the real
+        # translate path still imports - and fails loudly - on first use.
+        if importlib.util.find_spec(mod.split(".")[0]) is None:
+            return False, f"{mod!r} is not installed"
+        if entry.get("id") == "nllb":
+            return _nllb_weights_probe()
+        return True, None
+    if mod.split(".")[0] == "argostranslate":
+        blocked = _argos_native_blocker()
+        if blocked:
+            return False, blocked
     try:
         importlib.import_module(mod)
         if entry.get("id") == "nllb":
-            # Transformers being importable only proves the runtime exists.
-            # The weights are a separate explicit model install; do not report
-            # NLLB ready and let from_pretrained download 2.4 GB silently.
-            from api.routers.setup.models import cache_is_complete, is_cached
-
-            model = {"repo_id": _NLLB_REPO_ID}
-            if not is_cached(_NLLB_REPO_ID) or not cache_is_complete(model):
-                return False, "NLLB model weights are not installed"
+            return _nllb_weights_probe()
         # availability_reason is failure-only metadata. Returning a success
         # label here made every healthy provider look unavailable after the
         # public diagnostic scrubber intentionally replaced non-null details.
         return True, None
     except ImportError as e:
         return False, f"import {mod!r} failed: {e}"
-    except Exception as e:  # noqa: BLE001
-        # A native library that refuses to load raises OSError, not ImportError
-        # (#692). An availability probe must report "unusable here", never take
-        # the engine list down with it.
+    except Exception as e:  # noqa: BLE001 — native libraries raise OSError
         return False, f"import {mod!r} failed ({type(e).__name__}): {e}"
 
 
@@ -224,6 +255,11 @@ def _configured(entry: dict) -> tuple[bool, str | None]:
         return bool(os.environ.get("DEEPL_API_KEY") or os.environ.get("TRANSLATE_API_KEY")), None
     if engine_id == "microsoft":
         return bool(os.environ.get("MICROSOFT_API_KEY") or os.environ.get("TRANSLATE_API_KEY")), None
+    if engine_id == "google-cloud":
+        return bool(os.environ.get("GOOGLE_TRANSLATE_API_KEY")), None
+    if engine_id == "amazon":
+        # Resolve shared-file, SSO and role credentials only on an explicit request.
+        return True, None
     return True, None
 
 
@@ -290,7 +326,7 @@ def uninstall_blocker(engine_id: str) -> "tuple[int, str] | None":
     pkg = entry.get("pip_package") if entry else None
     if not pkg:
         return None
-    if _normalize(pkg) in _app_dependency_names():
+    if entry.get("builtin") or _normalize(pkg) in _app_dependency_names():
         return 400, (
             f"{entry['display_name']} uses {pkg}, which VoiceStudio itself "
             "depends on. Uninstalling it would break the app."
@@ -322,44 +358,42 @@ def is_installed(engine_id: str) -> bool:
     return ok
 
 
-def is_ready(engine_id: str) -> bool:
-    """True only when both runtime/model and required configuration exist."""
+def is_ready(engine_id: str, *, import_check: bool = True) -> bool:
+    """True only when both runtime/model and required configuration exist.
+
+    ``import_check=False`` answers from the installed packages alone, for
+    inventory scans that must not import every engine runtime.
+    """
     entry = REGISTRY.get(engine_id)
     if not entry:
         return False
-    installed, _ = _probe(entry)
+    installed, _ = _probe(entry, import_check=import_check)
     configured, _ = _configured(entry)
     return installed and configured
 
 
 def argos_lang_code(value: str) -> str:
-    """Return the base language token used by Argos package metadata.
+    """Reduce a UI label or locale tag to the base code Argos packages use.
 
-    Accepts ISO 639-1 codes (e.g. ``"zh"``), BCP-47 tags with a region or script
-    suffix (e.g. ``"zh-CN"``, ``"cmn-Hans"``), human names from the dub UI's own
-    label list (e.g. ``"Chinese"``, ``"Mandarin"``), legacy / deprecated ISO
-    639-1 codes still seen in older corpora (``"in"``→``"id"`` for Indonesian,
-    ``"iw"``→``"he"`` for Hebrew), and ISO 639-2/T (e.g. ``"zho"``→``"zh"``,
-    ``"fil"``→``"tl"`` for Tagalog). Empty or whitespace-only input raises
-    ``ValueError`` so the caller sees an actionable error instead of a
-    silently-empty language token.
+    ``zh-CN``, ``cmn_Hans``, ``Mandarin`` and ``zho`` all become ``zh``;
+    region and script suffixes are dropped. Raises ``ValueError`` for
+    Traditional Chinese (Argos has no such model) and for anything that does
+    not reduce to a two- or three-letter code.
     """
-    raw = str(value or "").strip()
-    key = raw.lower()
-    parts = key.replace("_", "-").split("-")
-    if key == "chinese (traditional)" or (
-        parts[0] in {"zh", "zho", "cmn"} and
-        any(part in {"hant", "tw", "hk", "mo"} for part in parts[1:])
+    text = str(value or "").strip().lower()
+    parts = text.replace("_", "-").split("-")
+    if text == "chinese (traditional)" or (
+        parts[0] in _ARGOS_CHINESE_CODES
+        and any(tag in _ARGOS_TRADITIONAL_SUBTAGS for tag in parts[1:])
     ):
-        raise ValueError("Argos does not provide Traditional Chinese; choose NLLB for this script")
-    named = _ARGOS_NAME_ALIASES.get(key)
-    if named:
-        return named
-    code = parts[0]
-    code = _ARGOS_LANG_ALIASES.get(code, code)
-    named = _ARGOS_NAME_ALIASES.get(code)
-    if named:
-        return named
+        raise ValueError(
+            "Argos has no Traditional Chinese model; pick NLLB for Traditional "
+            "Chinese, or choose Simplified Chinese for Argos."
+        )
+    if text in _ARGOS_NAME_ALIASES:
+        return _ARGOS_NAME_ALIASES[text]
+    code = _ARGOS_CODE_ALIASES.get(parts[0], parts[0])
+    code = _ARGOS_NAME_ALIASES.get(code, code)
     if not re.fullmatch(r"[a-z]{2,3}", code):
         raise ValueError("Choose a valid source and target language")
     return code
@@ -488,8 +522,8 @@ async def run_pip(args: list[str], timeout: float = 600.0) -> tuple[int, str]:
             stderr=asyncio.subprocess.STDOUT,
         )
     except NotImplementedError:
-        logger.debug("asyncio subprocess not supported, falling back to thread-based subprocess")
-        return await _run_pip_thread(cmd, timeout)
+        logger.debug("Async process launching is unavailable; running the installer in a worker thread")
+        return await _run_installer_in_thread(cmd, timeout)
     except FileNotFoundError as e:
         return 1, f"installer not found: {e}"
     try:
@@ -504,23 +538,23 @@ async def run_pip(args: list[str], timeout: float = 600.0) -> tuple[int, str]:
     return proc.returncode or 0, out
 
 
-async def _run_pip_thread(cmd: list[str], timeout: float) -> tuple[int, str]:
-    """Fallback: run pip in a thread via subprocess.Popen (Windows compat)."""
+async def _run_installer_in_thread(cmd: list[str], timeout: float) -> tuple[int, str]:
     loop = asyncio.get_running_loop()
-
-    def _run():
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+    factory = functools.partial(
+        subprocess.Popen,
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    proc = await loop.run_in_executor(None, factory)
+    try:
+        stdout, _ = await loop.run_in_executor(
+            None, functools.partial(proc.communicate, timeout=timeout)
         )
-        try:
-            stdout, _ = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, _ = proc.communicate()
-            return 1, f"pip timed out after {timeout:.0f}s"
-        out = stdout.decode(errors="replace") if stdout else ""
-        return proc.returncode or 0, out
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        await loop.run_in_executor(None, proc.communicate)
+        return 1, f"pip timed out after {timeout:.0f}s"
+    out = stdout.decode(errors="replace") if stdout else ""
+    return proc.returncode or 0, out
 
-    return await loop.run_in_executor(None, _run)

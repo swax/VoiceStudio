@@ -81,12 +81,22 @@ class Supertonic3Backend(SubprocessBackend):
     display_name = "Supertonic-3 (31 langs, CPU ONNX, 7 preset voices, OpenRAIL-M)"
     supports_voice_design = False  # preset voices only
     supports_cloning = False  # preset voices only; generate() never reads ref_audio
+    #: Selectable built-in voices; /generate's ``preset_voice`` and the voice
+    #: picker read these (#2938). Same list ``generate()`` validates against.
+    PRESET_VOICES = list(st3_constants.VOICE_PRESETS)
+    DEFAULT_VOICE = st3_constants.DEFAULT_VOICE
     # TTS-04: honest hardware reporting. Supertonic-3 has no CUDA / MPS
     # path in the SDK ‑‑ ONNX Runtime CPU EP only.
     gpu_compat: tuple[str, ...] = ("cpu",)
     _DEFAULT_SAMPLE_RATE = st3_constants.SAMPLE_RATE
 
     # ── SubprocessBackend contract ─────────────────────────────────────
+
+    @classmethod
+    def shares_parent_torch(cls) -> bool:
+        # The same check venv_python() makes: no venv of its own means the
+        # parent interpreter runs it.
+        return _own_venv_python() is None
 
     @classmethod
     def venv_python(cls) -> Path:
@@ -187,7 +197,7 @@ class Supertonic3Backend(SubprocessBackend):
           * ``voice``        ‑‑ one of :data:`VOICE_PRESETS` (str). Default
                                 ``DEFAULT_VOICE``. Unknown ids log a warning
                                 and fall back.
-          * ``language``     ‑‑ ISO 639-1 code or ``"auto"`` / ``None``.
+          * ``language``     ‑‑ full language name, ISO 639-1 code or ``"auto"`` / ``None``.
                                 ``"auto"`` and ``None`` map to ``"na"`` so
                                 the SDK's multilingual fallback engages.
           * ``speed``        ‑‑ float, clamped to [0.7, 2.0].

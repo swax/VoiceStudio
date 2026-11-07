@@ -29,7 +29,7 @@ def _make_test_audio(duration_s=1.0, sample_rate=24000) -> torch.Tensor:
 class TestListEffectPresets:
     def test_returns_all_presets(self):
         presets = list_effect_presets()
-        assert len(presets) == 6
+        assert len(presets) == 8
         ids = [p["id"] for p in presets]
         assert "broadcast" in ids
         assert "cinematic" in ids
@@ -37,6 +37,8 @@ class TestListEffectPresets:
         assert "raw" in ids
         assert "warm" in ids
         assert "bright" in ids
+        assert "echo" in ids
+        assert "pa" in ids
 
     def test_preset_has_required_fields(self):
         for preset in list_effect_presets():
@@ -52,7 +54,8 @@ class TestGetEffectChain:
         assert len(chain) > 0
         types = [fx["type"] for fx in chain]
         assert "highpass" in types
-        assert "compressor" in types
+        assert "leveler" in types  # #3412: levels, no fast compressor
+        assert "compressor" not in types
         assert "limiter" in types
 
     def test_cinematic_has_reverb(self):
@@ -70,6 +73,15 @@ class TestGetEffectChain:
 
 
 class TestApplyEffectsChain:
+    @pytest.mark.parametrize("preset,tail_ms", [("echo", 1000), ("pa", 500)])
+    def test_optional_reverb_tail_rings_out_and_fades(self, preset, tail_ms):
+        sample_rate = 24000
+        audio = _make_test_audio(duration_s=0.25, sample_rate=sample_rate)
+        result = apply_effects_chain(audio, sample_rate, get_effect_chain(preset))
+        assert result.shape[-1] == audio.shape[-1] + tail_ms * sample_rate // 1000
+        assert torch.any(result[..., audio.shape[-1] :].abs() > 1e-6)
+        assert result[..., -1].abs().max().item() < 1e-6
+
     def test_raw_preset_returns_unmodified(self):
         audio = _make_test_audio()
         result = apply_effects_chain(audio, sample_rate=24000, chain=[])

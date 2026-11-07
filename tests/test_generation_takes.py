@@ -396,3 +396,140 @@ def test_history_retention_get_put_roundtrip(settings_client):
 def test_history_retention_rejects_negative(settings_client):
     r = settings_client.put("/api/settings/history-retention", json={"cap": -1})
     assert r.status_code == 422
+
+
+def test_finalization_retains_current_take_when_stars_fill_cap(api, monkeypatch):
+    import asyncio
+    import time
+    import torch
+    import threading
+    _client, dbf, outdir, gen = api
+    monkeypatch.setattr(gen, "_history_cap", lambda: 1)
+    _insert_take(dbf, outdir, "favorite", 0, starred=1)
+    monkeypatch.setattr("core.analytics.capture", lambda *args: None)
+    writing_threads = []
+    writer = gen.save_generation_wav
+    def record_writer(*args, **kwargs):
+        writing_threads.append(threading.get_ident())
+        return writer(*args, **kwargs)
+    monkeypatch.setattr(gen, "save_generation_wav", record_writer)
+    _, meta = asyncio.run(gen._finalize_generation(
+        torch.zeros(1, 240), 24000, text="hello", history_mode="design",
+        ref_audio_path=None, language="English", instruct=None,
+        resolved_profile_id=None, used_seed=42, start_time=time.time(), already_marked=True, include_wav_bytes=True,
+    ))
+    assert writing_threads and threading.get_ident() not in writing_threads
+    assert (outdir / meta["filename"]).is_file()
+    with sqlite3.connect(str(dbf)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] == 2
+    # The next generation can retire this unstarred take; stars remain safe.
+    assert gen._prune_history_over_cap(keep_id="next") == 1
+    assert not (outdir / meta["filename"]).exists()
+    assert meta["_wav_bytes"].startswith(b"RIFF")
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_cancel_during_save_cleans_up_after_writer_stops(api, monkeypatch, write_fails):
+    import asyncio
+    import threading
+    import time
+    import torch
+    from pathlib import Path
+
+    _client, dbf, outdir, gen = api
+    started, release = threading.Event(), threading.Event()
+
+    def slow_writer(path, *args, **kwargs):
+        Path(path).write_bytes(b"partial")
+        started.set()
+        assert release.wait(5)
+        Path(path).write_bytes(b"completed")
+        if write_fails:
+            raise OSError("write failed")
+
+    monkeypatch.setattr(gen, "save_generation_wav", slow_writer)
+
+    async def run():
+        waiting = asyncio.Event()
+        original_shield = asyncio.shield
+        calls = 0
+        def observed_shield(future):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                waiting.set()
+            return original_shield(future)
+        monkeypatch.setattr(asyncio, "shield", observed_shield)
+        task = asyncio.create_task(gen._finalize_generation(
+            torch.zeros(1, 240), 24000, text="hello", history_mode="design",
+            ref_audio_path=None, language="English", instruct=None,
+            resolved_profile_id=None, used_seed=42, start_time=time.time(),
+            already_marked=True,
+        ))
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            task.cancel()
+            await asyncio.wait_for(waiting.wait(), timeout=3)
+            assert not task.done(), "cancellation must wait for the active writer"
+            task.cancel()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert not list(outdir.glob("*.wav"))
+    with sqlite3.connect(str(dbf)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("failure", ["write", "read"])
+def test_failed_finalization_removes_unpublished_wav(api, monkeypatch, failure):
+    import asyncio
+    import time
+    import torch
+    from pathlib import Path
+
+    _client, dbf, outdir, gen = api
+    def writer(path, *args, **kwargs):
+        Path(path).write_bytes(b"partial")
+        if failure == "write":
+            raise OSError("write failed")
+    def read_fails(path):
+        raise OSError("read failed")
+    monkeypatch.setattr(gen, "save_generation_wav", writer)
+    if failure == "read":
+        monkeypatch.setattr(Path, "read_bytes", read_fails)
+    with pytest.raises(OSError, match=failure + " failed"):
+        asyncio.run(gen._finalize_generation(
+            torch.zeros(1, 240), 24000, text="hello", history_mode="design",
+            ref_audio_path=None, language="English", instruct=None,
+            resolved_profile_id=None, used_seed=42, start_time=time.time(),
+            already_marked=True, include_wav_bytes=True,
+        ))
+    assert not list(outdir.glob("*.wav"))
+    with sqlite3.connect(str(dbf)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0] == 0
+
+
+def test_colliding_take_id_does_not_remove_saved_audio(api, monkeypatch):
+    import asyncio
+    import time
+    import torch
+    from pathlib import Path
+    _client, dbf, outdir, gen = api
+    existing = outdir / "aaaaaaaa.wav"
+    existing.write_bytes(b"saved take")
+    ids = iter(["aaaaaaaa", "bbbbbbbb"])
+    monkeypatch.setattr(gen.uuid, "uuid4", lambda: next(ids))
+    def fail_write(path, *args, **kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError("write failed")
+    monkeypatch.setattr(gen, "save_generation_wav", fail_write)
+    with pytest.raises(OSError, match="write failed"):
+        asyncio.run(gen._finalize_generation(
+            torch.zeros(1, 240), 24000, text="hello", history_mode="design",
+            ref_audio_path=None, language="English", instruct=None,
+            resolved_profile_id=None, used_seed=42, start_time=time.time(), already_marked=True))
+    assert existing.read_bytes() == b"saved take"
+    assert not (outdir / "bbbbbbbb.wav").exists()

@@ -160,9 +160,10 @@ def test_every_locale_discloses_hugging_face_model_access():
     import json
     from pathlib import Path
 
-    locales = Path(__file__).resolve().parents[1] / "electron/src/shared/i18n/locales"
-    paths = sorted(locales.glob("*.json"))
-    assert len(paths) == 21
+    root = Path(__file__).resolve().parents[1] / "electron/src"
+    paths = sorted((root / "shared/i18n/locales").glob("*.json"))
+    renderer = {p.name for p in (root / "renderer/src/i18n/locales").glob("*.json")}
+    assert {p.name for p in paths} == renderer and "en.json" in renderer
     for path in paths:
         strings = json.loads(path.read_text("utf-8"))
         footer = strings["license"]["pockettts_footer"]
@@ -187,10 +188,15 @@ def test_gated_weight_failures_are_typed_and_actionable(reason):
     assert "HF_TOKEN" in failure["hint"]
 
 
-def test_generic_gated_model_still_uses_existing_pyannote_class():
+def test_generic_gated_model_is_an_access_problem_not_pyannote():
     from core.failure import classify
 
-    assert classify("gated model license not accepted") == "PYANNOTE_LICENSE_REQUIRED"
+    assert classify("gated model license not accepted") == "HF_AUTH_FAILED"
+    assert classify(
+        "GatedRepoError: 401 Client Error. Cannot access gated repo for url "
+        "https://huggingface.co/sesame/csm-1b/resolve/main/prompts/conversational_a.wav."
+    ) == "HF_AUTH_FAILED"
+    assert classify("pyannote/segmentation-3.0 is gated: 403 forbidden") == "PYANNOTE_LICENSE_REQUIRED"
 
 
 def test_license_gate_fails_closed_when_settings_read_fails(monkeypatch):

@@ -9,11 +9,9 @@ inference staying on the powerful machine.
 > gate (share PIN, API key, dictation WebSocket, trusted networks) with the exact
 > headers, params, and `401`/`403`/`429` meanings.
 
-> Want to keep working *here* and only send individual jobs to another GPU? That
-> is a different feature — see [docs/remote-workers.md](remote-workers.md). This
-> page moves the whole backend (and your projects with it) to the other machine;
-> remote workers keep everything local and farm out single tasks. Both are
-> supported, and setting one up does not affect the other.
+This page covers the retained **remote backend** mode: the whole backend and its
+projects run on the other machine. It is distinct from Network sharing, which
+serves the current backend's UI to other devices on the LAN.
 
 This is opt-in and off by default: with no API key set, the backend stays
 loopback-only exactly as before.
@@ -148,7 +146,12 @@ remote key — is what's gating access.
   trusted LAN/Tailnet, set `OMNIVOICE_TRUSTED_NETWORKS` to a comma-separated list
   of CIDRs (e.g. `192.168.1.0/24,10.0.0.0/8`); clients from those networks are
   then treated as trusted by the **consumption** gates (share PIN, API key,
-  dictation WebSocket) and need no key/PIN. **Admin routes** (`/system/*`,
+  dictation WebSocket) and need no key/PIN. A proxy that forwards the original
+  `Host` (Caddy and Nginx Proxy Manager do) also needs its host name in
+  `OMNIVOICE_ALLOWED_HOSTS`, or requests without the API key are refused as an
+  unrecognized host name; IP addresses, `localhost` and `*.ts.net` names need
+  no entry (see [host names](api-auth.md#requests-from-other-websites-and-host-names)).
+  **Admin routes** (`/system/*`,
   `/api/settings/*`) stay true-loopback-only — use `OMNIVOICE_SERVER_MODE=1` for
   headless admin. It's the granular alternative to
   `OMNIVOICE_SERVER_MODE=1` (which trusts *all* non-loopback sources) and

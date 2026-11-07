@@ -168,7 +168,7 @@ def test_stringified_plain_pool_shutdown_still_not_matched():
 def _stub_load(monkeypatch, error):
     """Wire _load_model_sync's collaborators so `_load()` raises `error`
     without importing torch or touching the network."""
-    fake_torch = types.SimpleNamespace(float16="f16")
+    fake_torch = types.SimpleNamespace(float16="f16", float32="f32")
 
     class _FakeOV:
         @staticmethod
@@ -270,6 +270,9 @@ def test_load_sync_bails_before_torch_when_already_shutting_down(monkeypatch):
 
 
 def test_preload_interrupted_by_shutdown_logs_info_only(monkeypatch, caplog):
+    from core import device_caps
+    # Exercise native preload even on hosts that normally route TTS to a sidecar.
+    monkeypatch.setattr(device_caps, "detect_host_caps", lambda: types.SimpleNamespace(family="cpu"))
     async def _boom():
         raise ModelLoadInterruptedByShutdown("shutdown during load")
 
@@ -320,6 +323,8 @@ def test_lifespan_shutdown_mid_load_is_clean_and_clears_sentinel(
     with _reimported_backend_modules():
         import main as main_mod
         from core import run_sentinel
+        from core import device_caps
+        monkeypatch.setattr(device_caps, "detect_host_caps", lambda: types.SimpleNamespace(family="cpu"))
 
         # The module object main's lifespan actually loads through — NOT the
         # module-level `mm` alias, which a sibling suite's sys.modules purge can

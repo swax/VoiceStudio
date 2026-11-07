@@ -19,8 +19,11 @@ from services import translation_engines as te
 def test_list_engines_emits_install_command():
     engines = {e["id"]: e for e in te.list_engines()}
     # deep_translator-backed online engines all share the same command.
-    for eid in ("google", "deepl", "microsoft", "mymemory"):
+    for eid in ("google", "mymemory"):
         assert engines[eid]["install_command"] == "uv pip install deep_translator", eid
+    for eid in ("deepl", "microsoft", "google-cloud"):
+        assert engines[eid]["install_command"] == "uv pip install httpx"
+    assert engines["amazon"]["install_command"] == "uv pip install boto3"
     assert engines["argos"]["install_command"] == "uv pip install argostranslate"
     assert engines["openai"]["install_command"] == "uv pip install openai"
     # NLLB rides on the core `transformers` dep — no separate install line.

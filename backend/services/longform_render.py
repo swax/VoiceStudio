@@ -37,9 +37,13 @@ import json
 import math
 import os
 import re
+import threading
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
+
+from services.ffmpeg_utils import local_inputs_only
 
 _BITRATE_RE = re.compile(r"^\d{2,3}k$")
 #: Default ceiling for the content-addressed chapter cache. Above this, the
@@ -48,6 +52,54 @@ _BITRATE_RE = re.compile(r"^\d{2,3}k$")
 _CACHE_MAX_BYTES = int(float(os.environ.get("OMNIVOICE_LONGFORM_CACHE_MAX_GB", "2")) * 1024 ** 3)
 _COVER_EXTS = {".jpg", ".jpeg", ".png"}
 _COVER_MAX_BYTES = 8 * 1024 * 1024  # 8 MB — a book cover, not a payload
+
+_cache_lock = threading.Lock()
+_cache_pins: Counter[str] = Counter()
+
+
+class CacheLease:
+    """Keep a render's cache inputs until mux/cancellation cleanup finishes."""
+
+    def __init__(self) -> None:
+        self._paths: set[str] = set()
+        self._released = False
+
+    def hold(self, path: str) -> str:
+        key = os.path.normcase(os.path.realpath(path))
+        with _cache_lock:
+            self._hold_locked(key)
+        return path
+
+    def _hold_locked(self, key: str) -> None:
+        # A native worker may finish after its request was cancelled.
+        if not self._released and key not in self._paths:
+            self._paths.add(key)
+            _cache_pins[key] += 1
+
+    def hold_existing(self, cache_dir: str) -> None:
+        """Reserve existing audio while asynchronous engine setup resolves keys.
+
+        Use a temporary lease and release it after the plan's exact inputs have
+        their own pins. Snapshot and pruning share a lock, so eviction cannot
+        slip between discovering a later chapter/segment and reserving it.
+        """
+        with _cache_lock:
+            for root, _dirs, names in os.walk(cache_dir):
+                for name in names:
+                    if name.lower().endswith(".wav"):
+                        self._hold_locked(os.path.normcase(os.path.realpath(
+                            os.path.join(root, name))))
+
+    def release(self) -> None:
+        with _cache_lock:
+            if self._released:
+                return
+            self._released = True
+            for key in self._paths:
+                _cache_pins[key] -= 1
+                if not _cache_pins[key]:
+                    del _cache_pins[key]
+            self._paths.clear()
 
 #: Our metadata field → FFMETADATA tag key. Order is stable for deterministic
 #: output (tested). ``author`` maps to ``artist`` and ``narrator`` to
@@ -65,20 +117,30 @@ _GLOBAL_TAG_KEYS: list[tuple[str, str]] = [
 
 
 def _escape_meta(value: str) -> str:
-    """Escape an FFMETADATA value (``=``, ``;``, ``#``, ``\\``, newline)."""
-    return re.sub(r"([=;#\\\n])", r"\\\1", value or "")
+    """Escape an FFMETADATA value (``=``, ``;``, ``#``, ``\\``, newline).
+
+    CRLF and lone CR are folded to LF first: FFmpeg's parser ends a metadata
+    line at a bare CR, so only LF is escapable and an unescaped CR silently
+    truncated every description paragraph after the first (#2528).
+    """
+    value = re.sub(r"\r\n?", "\n", value or "")
+    return re.sub(r"([=;#\\\n])", r"\\\1", value)
 
 
 def prune_cache_dir(cache_dir: str, max_bytes: int = _CACHE_MAX_BYTES) -> tuple[int, int]:
-    """Evict the oldest files in ``cache_dir`` until the total size is within
+    """Evict the oldest audio/cache files in ``cache_dir`` until the total size is within
     ``max_bytes`` (LRU by mtime). The content-addressed render cache otherwise
     grows without bound — uncompressed WAVs accumulate across every render.
 
     Walks the whole tree, so chapter WAVs at the root and segment WAVs under
     ``segments/`` share ONE byte budget — the cap holds no matter which layer
-    grew. Best-effort: returns ``(remaining_bytes, removed_count)`` and never
-    raises (a missing dir / unstattable file is just skipped). Call it *before*
-    writing a job's files so the fresh ones are never the eviction target.
+    grew. Bookkeeping (including the voices-root index needed to find legacy
+    WAVs after a data-dir move) is counted but never evicted. Metadata alone may
+    exceed the budget. Files held by a :class:`CacheLease` are also counted but
+    never evicted. Prune at render exit, before releasing that render's lease:
+    a book larger than the budget keeps its completed work for a later resume.
+    Best-effort: returns ``(remaining_bytes, removed_count)`` and never raises
+    (a missing dir / unstattable file is just skipped).
     """
     entries: list[tuple[float, int, str]] = []
     total = 0
@@ -92,7 +154,8 @@ def prune_cache_dir(cache_dir: str, max_bytes: int = _CACHE_MAX_BYTES) -> tuple[
                 mtime = os.path.getmtime(p)
             except OSError:
                 continue
-            entries.append((mtime, size, p))
+            if not name.lower().endswith(".json"):
+                entries.append((mtime, size, p))
             total += size
     if total <= max_bytes:
         return (total, 0)
@@ -102,7 +165,18 @@ def prune_cache_dir(cache_dir: str, max_bytes: int = _CACHE_MAX_BYTES) -> tuple[
         if total <= max_bytes:
             break
         try:
-            os.remove(p)
+            with _cache_lock:
+                key = os.path.normcase(os.path.realpath(p))
+                if _cache_pins.get(key, 0):
+                    continue
+                # atomic_save_wav publishes from .<target>.<random>.wav.
+                # The target's lease also protects that unfinished write.
+                temporary = re.fullmatch(r"\.(.+)\.[^.]+\.wav", os.path.basename(key))
+                if temporary and _cache_pins.get(
+                    os.path.join(os.path.dirname(key), temporary[1]), 0,
+                ):
+                    continue
+                os.remove(p)
             total -= size
             removed += 1
         except OSError:
@@ -405,6 +479,9 @@ class SegmentCache:
         extra_sig: str = "",
         vary_repeats: bool = False,
         legacy_voice_sigs: Iterable[dict] = (),
+        lease: Optional[CacheLease] = None,
+        gap_sig: str = "",
+        gap_spans: Optional[Callable[[object], bool]] = None,
     ) -> None:
         self.dir = os.path.join(cache_dir, SEGMENT_SUBDIR)
         self.sample_rate = int(sample_rate)
@@ -417,12 +494,18 @@ class SegmentCache:
         # keep counting.
         self.legacy_voice_sigs = [dict(s) for s in legacy_voice_sigs if s]
         self.extra_sig = extra_sig or ""
+        # A render input that only changes segments with gaps inside them
+        # (room tone between paragraphs, #3611): keyed into those segments
+        # alone, so segments without such gaps stay reusable.
+        self.gap_sig = gap_sig or ""
+        self.gap_spans = gap_spans
         # Cache opt-out (#1208): when on, a per-occurrence nonce enters the key
         # so identical repeated lines no longer share one WAV. Off → the nonce
         # is dropped and keys are byte-identical to pre-#1208 (default render).
         self.vary_repeats = bool(vary_repeats)
         self.hits = 0
         self.misses = 0
+        self.lease = lease
 
     def _path(self, span, nonce: int = 0, *, sigs: Optional[dict] = None) -> str:
         sigs = self.voice_sig if sigs is None else sigs
@@ -433,10 +516,16 @@ class SegmentCache:
             voice_id=span.voice_id,
             voice_sig=sigs.get(span.voice_id or "", ""),
             speed=getattr(span, "speed", None),
-            extra_sig=self.extra_sig,
+            extra_sig=self._extra_sig_for(span),
             nonce=nonce if self.vary_repeats else 0,
         )
-        return os.path.join(self.dir, f"{key}.wav")
+        path = os.path.join(self.dir, f"{key}.wav")
+        return self.lease.hold(path) if self.lease is not None else path
+
+    def _extra_sig_for(self, span) -> str:
+        if self.gap_sig and self.gap_spans is not None and self.gap_spans(span):
+            return f"{self.extra_sig}\x00{self.gap_sig}"
+        return self.extra_sig
 
     def _existing_path(self, span, nonce: int = 0) -> Optional[str]:
         """The file holding ``span``'s audio under the current key, adopting a
@@ -450,6 +539,21 @@ class SegmentCache:
                 return adopt_cached_file(legacy, path)
         return None
 
+    def reserve(self, spans: Iterable) -> None:
+        """Hold all possible inputs before any span can suspend the render."""
+        if self.lease is None:
+            return
+        occurrences: Counter = Counter()
+        for span in spans:
+            if not span.text:
+                continue
+            key = (span.voice_id, span.text, getattr(span, "speed", None))
+            nonce = occurrences[key]
+            occurrences[key] += 1
+            self._path(span, nonce)
+            for sigs in self.legacy_voice_sigs:
+                self._path(span, nonce, sigs=sigs)
+
     def load(self, span, nonce: int = 0):
         """Cached audio tensor for ``span``, or ``None`` (miss). A hit bumps
         the file's mtime so LRU eviction sees the segment as recently used.
@@ -461,7 +565,8 @@ class SegmentCache:
             return None
         try:
             import torchaudio
-            audio, sr = torchaudio.load(path)
+            from services.audio_io import load_audio
+            audio, sr = load_audio(path)
         except Exception:
             self.misses += 1
             return None  # unreadable/corrupt entry — clean miss, re-render
@@ -615,11 +720,11 @@ def build_loudnorm_measure_cmd(ffmpeg: str, concat_list_path: str, filt: str) ->
     """Pure argv for the measure pass: decode the concat list, run the
     print_format=json loudnorm filter, discard audio to the portable null muxer.
     Input segment is byte-identical to build_render_cmd so measured == muxed."""
-    return [
+    return local_inputs_only([
         ffmpeg, "-y", "-hide_banner", "-loglevel", "info",
         "-f", "concat", "-safe", "0", "-i", str(concat_list_path),
         "-af", filt, "-f", "null", "-",
-    ]
+    ], tool="ffmpeg")
 
 
 # ── FFMETADATA ──────────────────────────────────────────────────────────────
@@ -649,6 +754,15 @@ def build_ffmetadata(
         ]
         start = end
     return "\n".join(lines) + "\n"
+
+
+def write_lf_text(path: str, text: str) -> None:
+    """Write an ffmpeg-parsed text file (FFMETADATA, concat list) as UTF-8 with
+    bare LF endings. Text mode would turn the LF in an escaped ``\\<LF>``
+    paragraph break into CRLF on Windows, where FFmpeg then ends the tag at that
+    line and drops the rest (#2528)."""
+    with open(path, "wb") as f:
+        f.write(text.encode("utf-8"))
 
 
 def build_concat_list(wav_paths: Iterable[str]) -> str:
@@ -740,12 +854,14 @@ def build_render_cmd(
         if embed_cover:
             cmd += ["-c:v", "copy"]
         cmd += ["-movflags", "+faststart", "-f", "mp4", str(out_path)]
-    return cmd
+    return local_inputs_only(cmd, tool="ffmpeg")
 
 
-# ── Render summary (what a finished render WAS) ─────────────────────────────
+# ── Render summary ───────────────────────────────────────────────────────────
+# A content-free note on how a finished render was made (settings and counts,
+# never script text), shown later in the Projects list.
 
-#: Cap on chapter titles kept in a summary — the library is a list, not a TOC.
+#: At most this many chapter titles are kept in a summary.
 _SUMMARY_MAX_TITLES = 60
 
 
@@ -760,42 +876,45 @@ def _summary_json_value(value):
     return value
 
 
-def render_summary(
-    chapters: list,
-    *,
-    voices: list[dict],
-    engine_id: str = "",
-    language: Optional[str] = None,
-    fmt: str = "",
-    options: Optional[dict] = None,
-) -> dict:
-    """How a render was made, small enough to ride on its ``done`` event.
+def render_summary(chapters, *, voices, engine_id="", language=None, fmt="",
+                   options=None) -> dict:
+    """Describe a finished render without including any of its text.
 
-    A finished file in a library is only useful if it says what it is: which
-    voice, how fast, which engine, how it was joined. ``chapters`` is the plan
-    (objects with ``title`` and ``spans`` carrying ``text``/``speed``);
-    ``voices`` is the already-resolved ``[{"id", "name"}]`` actually used;
-    ``options`` is the render's non-default expressive options, already filtered
-    by the caller (any new knob — join gaps included — shows up here without
-    touching this function).
-    Content-free by design: counts and settings, never the script text.
+    ``chapters`` are objects with ``title`` and ``spans`` (``text``, ``speed``).
+    Only non-blank spans count as lines. ``options`` keeps every entry that is
+    not ``None`` (a seed of 0 or an explicit False is a real choice).
     """
-    spans = [s for c in chapters for s in getattr(c, "spans", [])]
-    spoken = [s for s in spans if (getattr(s, "text", "") or "").strip()]
-    speeds = sorted({round(float(getattr(s, "speed", None) or 1.0), 2) for s in spoken
-                     if math.isfinite(float(getattr(s, "speed", None) or 1.0))})
-    titles = [str(getattr(c, "title", "") or "") for c in chapters][:_SUMMARY_MAX_TITLES]
+    lines = 0
+    words = 0
+    speeds: set = set()
+    for chapter in chapters:
+        for span in chapter.spans:
+            text = (span.text or "").strip()
+            if not text:
+                continue
+            lines += 1
+            words += len(text.split())
+            raw = getattr(span, "speed", None)
+            rate = 1.0 if not raw else raw
+            try:
+                rate = float(rate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(rate):
+                speeds.add(round(rate, 2))
+    voice_list = []
+    for v in voices or []:
+        if isinstance(v, dict):
+            voice_list.append({"id": str(v.get("id") or ""), "name": str(v.get("name") or "")})
     return {
         "engine": engine_id or "",
-        "voices": [{"id": str(v.get("id") or ""), "name": str(v.get("name") or "")} for v in voices],
+        "voices": voice_list,
         "language": language or "",
         "format": fmt or "",
-        "lines": len(spoken),
-        "words": sum(len(s.text.split()) for s in spoken),
-        "speeds": speeds,
-        # The caller passes only non-default options; keep explicit falsy values
-        # (seed 0, postprocess off) — they are settings, not absences.
-        "options": {str(k): _summary_json_value(v) for k, v in (options or {}).items()
-                    if v is not None},
-        "chapter_titles": titles,
+        "lines": lines,
+        "words": words,
+        "speeds": sorted(speeds),
+        "options": {str(k): _summary_json_value(v)
+                    for k, v in (options or {}).items() if v is not None},
+        "chapter_titles": [str(c.title) for c in list(chapters)[:_SUMMARY_MAX_TITLES]],
     }

@@ -1,13 +1,16 @@
 // @vitest-environment node
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import {
   isValidVoiceStudioRoot,
+  directorySize,
+  modelsAreShared,
   purgeResetScopes,
   scanResetScopes,
+  within,
   type ResetRoots,
 } from './reset-data';
 
@@ -22,9 +25,9 @@ afterEach(async () => {
 async function fixture(): Promise<ResetRoots & { root: string }> {
   const root = await mkdtemp(join(tmpdir(), 'VoiceStudio-reset-test-'));
   created.push(root);
-  const data = join(root, 'OmniVoice', 'data');
+  const data = join(root, 'Application Support', 'OmniVoice', 'data');
   const models = join(root, '.cache', 'huggingface');
-  const logs = join(root, 'OmniVoice', 'logs');
+  const logs = join(root, 'Application Support', 'OmniVoice', 'logs');
   const temp = join(root, 'temp');
   await Promise.all([data, models, logs, temp].map((path) => mkdir(path, { recursive: true })));
   await mkdir(join(data, 'voices'), { recursive: true });
@@ -82,4 +85,83 @@ it('refuses filesystem roots, home directories and unsigned custom roots', async
   expect(await isValidVoiceStudioRoot(parse(root).root, null)).toBe(false);
   expect(await isValidVoiceStudioRoot(root, root)).toBe(false);
   expect(await isValidVoiceStudioRoot(root, null)).toBe(false);
+});
+
+it('does not infer ownership from a lookalike ancestor or a model-cache signature', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'VoiceStudio-lookalike-'));
+  created.push(root);
+  const personal = join(root, 'Application Support', 'VoiceStudio', 'personal', 'documents');
+  const cache = join(root, 'external-cache');
+  await mkdir(join(cache, 'models--someone--model'), { recursive: true });
+  await mkdir(personal, { recursive: true });
+  expect(await isValidVoiceStudioRoot(personal, null)).toBe(false);
+  expect(await isValidVoiceStudioRoot(cache, null)).toBe(false);
+  expect(await isValidVoiceStudioRoot(cache, null, true)).toBe(true);
+});
+
+it('resolves aliases before deciding whether models are shared', async () => {
+  const roots = await fixture();
+  const externalAlias = join(roots.root, 'external-models-link');
+  await symlink(roots.models, externalAlias, process.platform === 'win32' ? 'junction' : 'dir');
+  expect(await modelsAreShared(externalAlias, roots.data)).toBe(true);
+
+  const nestedModels = join(roots.data, 'models');
+  const nestedAlias = join(roots.root, 'nested-models-link');
+  await mkdir(nestedModels);
+  await symlink(nestedModels, nestedAlias, process.platform === 'win32' ? 'junction' : 'dir');
+  expect(await modelsAreShared(nestedAlias, roots.data)).toBe(false);
+});
+
+it('authorizes reset roots per scope and rejects a logs alias to a shared cache', async () => {
+  const roots = await fixture();
+  const cacheLogs = join(roots.root, 'cache-logs');
+  await symlink(roots.models, cacheLogs, process.platform === 'win32' ? 'junction' : 'dir');
+  const report = await purgeResetScopes({ ...roots, logs: cacheLogs }, ['logs'], null);
+  expect(report.refused).toContain(cacheLogs);
+  expect(existsSync(join(roots.models, 'models--fixture', 'weights.bin'))).toBe(true);
+});
+
+it('measures a linked root but never follows links found inside it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'VoiceStudio-size-'));
+  created.push(root);
+  const data = join(root, 'Application Support', 'OmniVoice', 'data');
+  const external = join(root, 'external');
+  const alias = join(root, 'data-link');
+  await mkdir(data, { recursive: true });
+  await mkdir(external);
+  await writeFile(join(data, 'owned.bin'), '1234');
+  await writeFile(join(external, 'external.bin'), '12345678');
+  await symlink(
+    external,
+    join(data, 'external-link'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+  await symlink(data, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  expect(await directorySize(alias)).toBe(4);
+});
+
+it('treats dot-prefixed names as children rather than parent traversal', () => {
+  const root = join(parse(process.cwd()).root, 'tmp', 'VoiceStudio');
+  expect(within(join(root, '..cache'), root)).toBe(true);
+  expect(within(join(root, '..', 'cache'), root)).toBe(false);
+});
+
+it('treats a bare app-named folder as owned only under an app-data parent or with a signature', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'VoiceStudio-parent-test-'));
+  created.push(root);
+  const personal = join(root, 'Documents', 'VoiceStudio');
+  const installed = join(root, '.config', 'VoiceStudio');
+  const strayShare = join(root, 'share', 'OmniVoice');
+  const localShare = join(root, '.local', 'share', 'OmniVoice');
+  for (const path of [personal, installed, strayShare, localShare])
+    await mkdir(path, { recursive: true });
+  const home = join(root, 'home');
+  expect(await isValidVoiceStudioRoot(personal, home)).toBe(false);
+  expect(await isValidVoiceStudioRoot(strayShare, home)).toBe(false);
+  expect(await isValidVoiceStudioRoot(installed, home)).toBe(true);
+  expect(await isValidVoiceStudioRoot(localShare, home)).toBe(true);
+  // Directly under the home folder, as ~/.omnivoice is.
+  expect(await isValidVoiceStudioRoot(personal, join(root, 'Documents'))).toBe(true);
+  await writeFile(join(personal, 'omnivoice.db'), 'db');
+  expect(await isValidVoiceStudioRoot(personal, home)).toBe(true);
 });

@@ -174,7 +174,12 @@ def resolve_skill(skill_id: str) -> SkillResolution:
         provider = llm_providers.active_provider()
         source = "active" if provider is not None else "none"
 
-    if not enabled:
+    from core import prefs
+    backend_pin = os.environ.get("OMNIVOICE_LLM_BACKEND")
+    backend_off = backend_pin == "off" or (
+        not backend_pin and not override and prefs.get("llm_backend") == "off"
+    )
+    if not enabled or backend_off:
         ready, reason = False, "disabled"
     elif provider is None:
         ready, reason = False, "no_provider"
@@ -230,13 +235,6 @@ def resolve_skill_client(skill_id: str) -> Optional[SkillClient]:
         return None
     from services import llm_providers
 
-    api_key = llm_providers.resolve_api_key(res.provider)
-    if not api_key:
-        return None
-    kw: dict[str, Any] = {"api_key": api_key}
-    base_url = llm_providers.resolve_base_url(res.provider)
-    if base_url:
-        kw["base_url"] = base_url
     # max_retries=0: a rate-limited provider returning 429 + a long Retry-After
     # would otherwise let the SDK sleep+retry inside a single call, blowing the
     # skill's wall-clock budget (the cinematic pass budget, the glossary call
@@ -250,7 +248,8 @@ def resolve_skill_client(skill_id: str) -> Optional[SkillClient]:
     # The contract here is already "None == LLM unavailable, degrade" — a bad
     # proxy env must degrade the skill, never 500 the calling feature.
     try:
-        client = OpenAI(max_retries=0, **kw)
+        from services.llm_transport import create_client
+        client = create_client(res.provider)
     except Exception as exc:
         logger.warning(
             "LLM client construction failed for skill %s (provider %s): %s — "

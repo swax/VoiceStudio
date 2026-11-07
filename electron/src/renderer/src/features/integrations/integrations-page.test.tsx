@@ -8,16 +8,48 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 vi.mock('@/components/app-shell/workspace-header', () => ({
   WorkspaceHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
 }));
+vi.mock('@shared/config/integration-catalog', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@shared/config/integration-catalog')>();
+  return {
+    ...actual,
+    INTEGRATION_CATALOG: actual.INTEGRATION_CATALOG.map((entry) => ({
+      ...entry,
+      featured: entry.name === 'Twilio',
+    })),
+  };
+});
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-it('keeps integrations with a shared vendor URL distinct while filtering', async () => {
+it('only lists integrations with completed wiring pages', () => {
+  const { container } = render(<IntegrationsPage />);
+  const names = [...container.querySelectorAll('.integration-card h3')].map(
+    (heading) => heading.textContent,
+  );
+  expect(names.sort()).toEqual([
+    'Claude Code',
+    'Codex CLI',
+    'Cursor',
+    'Docker',
+    'GitHub Container Registry',
+    'Model Context Protocol',
+    'OpenAI Agents',
+    'Twilio',
+    'VoiceStudio API',
+    'n8n',
+  ]);
+  expect(container.textContent).not.toContain('Zapier');
+  expect(container.textContent).not.toContain('integrationCatalog.externalLink');
+  expect(container.querySelector('.integrations-featured')).toBeNull();
+});
+
+it('keeps wired integrations distinct while filtering', async () => {
   const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
   const { container } = render(<IntegrationsPage />);
   const originalCount = container.querySelectorAll('.integration-card').length;
   fireEvent.change(screen.getByRole('textbox', { name: 'common.search' }), {
-    target: { value: 'modelcontextprotocol/servers' },
+    target: { value: 'mcp' },
   });
   const cards = [...container.querySelectorAll<HTMLButtonElement>('.integration-card')];
   expect(cards.length).toBeGreaterThan(1);
@@ -34,7 +66,7 @@ it('keeps integrations with a shared vendor URL distinct while filtering', async
   expect(errors).not.toHaveBeenCalled();
 });
 
-it('badges only entries with a real setup block as working with VoiceStudio', () => {
+it('badges every listed integration as working with VoiceStudio', () => {
   const { container } = render(<IntegrationsPage />);
   const card = (name: string) =>
     [...container.querySelectorAll('.integration-card')].find(
@@ -42,7 +74,17 @@ it('badges only entries with a real setup block as working with VoiceStudio', ()
     )!;
   expect(card('Codex CLI')).toHaveTextContent('integrationCatalog.worksWith');
   expect(card('Codex CLI')).toHaveTextContent('integrationCatalog.capability.mcp');
-  expect(card('Zapier')).toHaveTextContent('integrationCatalog.externalLink');
-  expect(card('Zapier').querySelector('.integration-card-capabilities')).toBeNull();
+  expect(card('Twilio')).toHaveTextContent('integrationCatalog.worksWith');
+  expect(card('Twilio')).toHaveTextContent('integrationCatalog.capability.phoneCalls');
   expect(container.textContent).not.toContain('directoryExamples.example');
+});
+
+it('badges only featured (sponsored) integrations', () => {
+  const { container } = render(<IntegrationsPage />);
+  const card = (name: string) =>
+    [...container.querySelectorAll('.integration-card')].find(
+      (element) => element.querySelector('h3')?.textContent === name,
+    )!;
+  expect(card('Twilio').querySelector('.integration-badge--featured')).not.toBeNull();
+  expect(card('Codex CLI').querySelector('.integration-badge--featured')).toBeNull();
 });

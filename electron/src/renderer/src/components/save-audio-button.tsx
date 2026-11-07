@@ -10,10 +10,13 @@ export function SaveAudioButton({
   url,
   suggestedName,
   disabled = false,
+  iconOnly = false,
 }: {
   url?: string;
   suggestedName: string;
   disabled?: boolean;
+  /** A compact secondary action: the label becomes the tooltip. */
+  iconOnly?: boolean;
 }) {
   const { t } = useTranslation();
   const [saving, setSaving] = useState(false);
@@ -49,12 +52,14 @@ export function SaveAudioButton({
   return (
     <Button
       variant="ghost"
-      size="sm"
+      size={iconOnly ? 'icon-sm' : 'sm'}
+      aria-label={iconOnly ? t('clone.download') : undefined}
+      title={iconOnly ? t('clone.download') : undefined}
       onClick={() => void save()}
       disabled={disabled || saving || !url || !bridge}
     >
       <DownloadIcon />
-      {t('clone.download')}
+      {iconOnly ? null : t('clone.download')}
     </Button>
   );
 }

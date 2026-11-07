@@ -8,8 +8,8 @@ import {
   isUninspectableProcessError,
   parseSsListeners,
   parseWindowsListeners,
-  stopUnixProcess,
   stopWindowsProcess,
+  stopUnixProcess,
 } from "../../scripts/clear-dev-ports.mjs";
 
 test("parses only requested Windows TCP listeners", () => {
@@ -157,47 +157,31 @@ test("waits for the listener to disappear after force stop", async () => {
   assert.equal(sleeps, 12);
 });
 
-// Windows auto-stop is allowed again, but only bound to the process INSTANCE:
-// a pid recycled between inspect and kill must never be terminated.
-test("windows stop re-checks the process identity before terminating", () => {
-  const calls = [];
-  const run = (_exe, args) => {
-    calls.push(args.at(-1));
-    return { status: 0 };
-  };
-  stopWindowsProcess(4242, false, "windows:2026-09-08T21:25:58.5000000Z", run);
-  assert.equal(calls.length, 1);
-  assert.match(calls[0], /ProcessId = 4242/);
-  assert.match(calls[0], /2026-09-08T21:25:58\.5000000Z/);
-  assert.match(calls[0], /Invoke-CimMethod -InputObject \$p -MethodName Terminate/);
-  // The identity must be compared before the terminate, never after.
-  assert.ok(calls[0].indexOf("-ne '2026") < calls[0].indexOf("Invoke-CimMethod"));
+test("Windows termination rechecks identity before terminating", () => {
+  let script = "";
+  stopWindowsProcess(42, false, "windows:2026-01-02T03:04:05.0000000Z", (_cmd, args) => {
+    script = args.at(-1);
+    return { status: 0, stdout: "" };
+  });
+  assert.match(script, /ProcessId = 42/);
+  assert.match(script, /2026-01-02T03:04:05\.0000000Z/);
+  assert.ok(script.indexOf("$stamp -ne") < script.indexOf("Invoke-CimMethod"));
+  assert.match(script, /ReturnValue/);
 });
 
-test("windows stop leaves a recycled pid alone instead of failing the run", () => {
-  assert.doesNotThrow(() =>
-    stopWindowsProcess(4242, false, "windows:whatever", () => ({ status: 3 })),
+test("Windows termination ignores a recycled pid and surfaces failures", () => {
+  assert.doesNotThrow(() => stopWindowsProcess(42, false, "windows:x", () => ({ status: 3 })));
+  assert.throws(() => stopWindowsProcess(42, false, "windows:x", () => ({ status: 1 })), /42/);
+  assert.throws(
+    () => stopWindowsProcess(42, false, "windows:x", () => ({ status: 4, stdout: "2\n" })),
+    /return value 2/,
   );
 });
 
-test("windows stop surfaces a real termination failure", () => {
-  assert.throws(
-    () => stopWindowsProcess(4242, false, "windows:whatever", () => ({ status: 1 })),
-    /Could not stop process 4242/,
-  );
-});
-
-// Win32_Process.Terminate reports failure through ReturnValue, not by throwing:
-// discarding it would report success on an access-denied kill, and the port
-// would still be held.
-test("windows stop fails when Terminate reports a non-zero ReturnValue", () => {
-  const run = (_exe, args) => {
-    assert.match(args.at(-1), /ReturnValue -ne 0/);
-    return { status: 4, stdout: "2" };
-  };
-  assert.throws(
-    () => stopWindowsProcess(4242, false, "windows:whatever", run),
-    /Could not stop process 4242: Terminate returned 2/,
+test("POSIX ownership uses POSIX separators regardless of host", () => {
+  assert.equal(
+    belongsToCheckout("", "bun /repo/app/scripts/dev.mjs", "", false, "/repo/app"),
+    true,
   );
 });
 
@@ -216,6 +200,19 @@ test("an app-managed backend is recognised as ours", () => {
   const sep = String.fromCharCode(92);
   const winApp = ["C:", "Users", "x", "AppData", "Roaming", APP_BUNDLE_ID, "project", ".venv", "Scripts", "python.exe"].join(sep);
   assert.equal(belongsToCheckout("", "", winApp, true, ["C:", "repo"].join(sep)), true);
+});
+
+test("an Electron-managed runtime backend is recognised as ours", () => {
+  const root = "/work/VoiceStudio";
+  const linux = "/home/x/.config/VoiceStudio/runtime/project/.venv/bin/python";
+  assert.equal(belongsToCheckout("", `${linux} -m uvicorn main:app`, "", false, root), true);
+  const custom = "/mnt/fast/VoiceStudio/project/.venv/bin/python";
+  assert.equal(belongsToCheckout("", "", custom, false, root), true);
+  const sep = String.fromCharCode(92);
+  const win = ["C:", "Users", "x", "AppData", "Roaming", "VoiceStudio", "runtime", "project", ".venv", "Scripts", "python.exe"].join(sep);
+  assert.equal(belongsToCheckout("", "", win, true, ["C:", "repo"].join(sep)), true);
+  // Another project's venv in a folder that merely mentions the name is not ours.
+  assert.equal(belongsToCheckout("", "", "/srv/voicestudio-clone/.venv/bin/python", false, root), false);
 });
 
 test("the bundle id match is case-insensitive", () => {

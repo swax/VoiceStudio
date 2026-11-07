@@ -73,16 +73,27 @@ Notes on the PIN gate (`NetworkAccessMiddleware`, `backend/main.py`):
   always served un-PIN'd so the PIN-prompt UI can load.
 - It is a **consumption** credential: a valid PIN never unlocks the admin surface
   (it is 6 digits, brute-forceable). Admin needs loopback or the API key.
-- It is completely inert when no PIN is set (the default, and every Docker
-  deploy).
+- It is completely inert when no PIN is set (including Docker until in-app
+  network sharing is enabled). Docker's bridge can make the host's own browser
+  a non-loopback client; if the PIN is lost, follow the
+  [Docker recovery steps](install/docker.md#recovering-from-a-lost-share-pin).
 
 ---
 
 ## API key
 
+Export history (`GET /export/history`, `POST /export/record`) accepts local
+clients and authenticated remote consumers, including API-key sessions and
+share-PIN guests. Anonymous remote callers are rejected. Recording an export
+only stores metadata; `/export` and `/export/reveal` still require native local
+access, and deleting history retains its administrator boundary. Explicit server
+mode without a configured key or PIN keeps its existing open consumption policy
+for export metadata, with destination paths redacted from anonymous responses;
+the operator's port mapping controls access in that mode.
+
 The API key is the backend's durable root credential for a GPU box, Docker
 container, or reverse-proxied host. Direct API clients may send it on each
-request. The first-party browser/Tauri UI instead exchanges it once for a
+request. The first-party browser/Electron UI instead exchanges it once for a
 short-lived administrator session and never stores the master. Set it on the
 **backend** process:
 
@@ -158,11 +169,13 @@ The bundled UI uses a narrower protocol:
 
 1. `POST /api/auth/session` receives the master in an `Authorization` header
    exactly once and selects `{"transport":"cookie"}` for exact same-origin
-   browsers or `{"transport":"bearer"}` for Tauri/cross-origin clients.
+   browsers or `{"transport":"bearer"}` for cross-origin clients (including
+   the Electron app's remote-backend connections).
 2. Cookie transport returns `204` and sets `ov_session` as HttpOnly,
    SameSite=Strict, path `/`, with an eight-hour maximum lifetime. Bearer
    transport returns an opaque `ovs_admin_session_…` value which the UI keeps
-   in **sessionStorage only**, bound to the exact backend base URL. Bearer JSON
+   in **localStorage**, bound to the exact backend base URL, so authenticated
+   reloads and new tabs reuse it until its bounded expiry. Bearer JSON
    responses include both `expires_at` and a bounded `expires_in`; the UI uses
    the relative lifetime when available so clock skew between a remote GPU host
    and the browser cannot reject a valid session. `expires_at` remains for
@@ -170,6 +183,12 @@ The bundled UI uses a narrower protocol:
 3. `DELETE /api/auth/session` revokes the session. Removing or rotating
    `OMNIVOICE_API_KEY`, backend restart, explicit logout, and the eight-hour
    deadline also invalidate it.
+
+Choosing **Use local** discards the current stored bearer session, including
+one created by testing an unsaved backend URL. The stored session is revoked
+against its own backend, and the configured backend's cookie session is also
+revoked on a best-effort basis. Stored credentials are cleared immediately;
+the app reloads into local mode after both bounded revocation attempts finish.
 
 The master is never written to localStorage/sessionStorage, never returned by
 the backend, and never placed in a WebSocket URL. Legacy `ov_api_key` browser
@@ -225,7 +244,11 @@ is closed with code **1008** and reason `loopback origin required`.
 `OMNIVOICE_TRUSTED_NETWORKS` is a comma-separated list of **CIDR ranges** whose
 clients are treated as loopback-trusted by the **consumption** gates — so a
 reverse proxy or a trusted LAN/Tailnet can reach the API **without a PIN or key**
-(useful when a proxy strips the `Authorization` header).
+(useful when a proxy strips the `Authorization` header). Such requests are still
+host-checked: a proxy that forwards the original `Host` (Caddy and Nginx Proxy
+Manager do) needs its host name in `OMNIVOICE_ALLOWED_HOSTS`, as does any
+other name clients use besides an IP address, `localhost`, this machine's name
+or a `*.ts.net` name — see [host names](#requests-from-other-websites-and-host-names).
 
 ```bash
 export OMNIVOICE_TRUSTED_NETWORKS="192.168.1.0/24,10.0.0.0/8"
@@ -247,13 +270,23 @@ proxies are unwrapped so they match IPv4 CIDRs; the value is read at request
 time, so in production **restart the backend** to apply a change. Default empty
 — no change to the strict loopback default.
 
+### Docker host loopback
+
+`OMNIVOICE_TRUST_HOST_LOOPBACK=1` (server mode only) lets the Docker host's own
+browser skip the **share PIN**. Inside the container that browser arrives from
+the default gateway, so only that exact socket address qualifies, only on the
+main port (not the LAN-share listener), and forwarded headers are never read
+for it. It grants the PIN's consumption rights only: the API-key gate and admin
+routes are unaffected. Default off. Risks and setup:
+[Docker install](install/docker.md#trust-host-loopback).
+
 ---
 
 ## Admin routes and server mode
 
 Admin routes — `/system/*` (including `set-env`, **RCE-class**),
 `/api/settings/*`, engine selection/install/uninstall, media tools, MCP
-bindings, pronunciation settings, and remote-worker management — sit on a
+bindings and pronunciation settings — sit on a
 stricter gate (`require_admin`, `backend/api/dependencies.py`) than consumption.
 On the desktop build they are **true-loopback-only**: no PIN, key, or trusted
 network reaches them from another machine.
@@ -282,13 +315,15 @@ Managed sidecar installation remains true-loopback-only even with an API key.
 Its installer fetches mutable source and creates an editable environment, so it
 must be run directly on that machine until the source supply chain is pinned.
 
-Host paths are never selected through HTTP. The native Tauri process validates
-model-cache and export destinations plus custom FFmpeg/FFprobe binaries, writes
-a private one-shot capability, and only that opaque authorization reaches the
-backend. `/export` therefore accepts an `authorization` token, never a
+Host paths are never selected through HTTP. The Electron main process validates
+model-cache and export destinations (chosen in a native save/open dialog) plus
+custom FFmpeg/FFprobe binaries, writes a private one-shot capability, and only
+that opaque authorization reaches the backend. `/export` therefore accepts an `authorization` token, never a
 `destination_path`; revealing an arbitrary exported path runs in the native
 process, while the HTTP fallback is limited to the server-owned data root.
-`/system/set-env` does not accept executable-path keys at all. Server mode and
+`/system/set-env` does not accept executable-path keys at all, and sidecar
+engine folders (`OMNIVOICE_*_DIR`, whose interpreter the backend runs) are set
+in the env file (or left unset); the HTTP API can only clear them. Server mode and
 an API key do not weaken that native boundary.
 
 This is the fix for a real escalation (#1213): before it, server mode made the
@@ -303,9 +338,9 @@ credential at all**, because the API-key middleware waved it through as
 
 Everything above gates *authentication*. A **browser** frontend served from a
 different origin than the backend hits a separate wall first: CORS. The
-backend's allow-list defaults to loopback + Tauri origins only
+backend's allow-list defaults to loopback + the desktop origin only
 (`http://localhost:<ui-port>`, `http://127.0.0.1:<ui-port>`,
-`tauri://localhost`, `http://tauri.localhost`), so opening a dev/source UI via
+`app://voicestudio`), so opening a dev/source UI via
 a LAN IP (e.g. `http://192.168.1.159:3901` talking to `…:3900`) blocks every
 request with *"Missing Header: Access-Control-Allow-Origin"* — regardless of
 `OMNIVOICE_SERVER_MODE` or `OMNIVOICE_TRUSTED_NETWORKS`, neither of which
@@ -314,16 +349,18 @@ touches CORS (#1348).
 Add the exact origin the browser shows in its address bar:
 
 ```bash
-export OMNIVOICE_ALLOWED_ORIGINS="http://192.168.1.159:3901,http://localhost:3901,http://127.0.0.1:3901,tauri://localhost,http://tauri.localhost"
+export OMNIVOICE_ALLOWED_ORIGINS="http://192.168.1.159:3901,http://localhost:3901,http://127.0.0.1:3901,app://voicestudio"
 ```
 
 Each entry must be a bare origin — `scheme://host:port`, exactly what the
 browser sends in its `Origin` header — with no path and no trailing slash
 (`http://192.168.1.159:3901/` would never match). The variable **replaces**
-the default list, so restate the loopback/Tauri origins alongside your own. (The in-app LAN share and Tailscale flows in
+the default list, so restate the loopback and `app://voicestudio` origins
+alongside your own. (The in-app LAN share and Tailscale flows in
 [docs/sharing.md](sharing.md) don't need this — they serve UI and API from the
 same origin.) If you only moved the Vite dev server's port, set
-`OMNIVOICE_UI_PORT` instead and the default list follows it.
+`OMNIVOICE_UI_PORT` (the older `VOICESTUDIO_UI_PORT` name is still accepted)
+instead; both Vite and the default list follow it.
 
 CORS wraps both authentication gates: credentialless browser preflights are
 answered before PIN/API-key enforcement, and gate-generated `401` responses
@@ -343,12 +380,72 @@ validation removes only that trusted, configured prefix; it never accepts an
 arbitrary path merely because it ends in `/ws/events`, `/ws/transcribe` or
 `/ws/tts`.
 
+## Requests from other websites and host names
+
+Independently of every gate above, the backend refuses two kinds of browser
+traffic in **every** configuration, loopback included:
+
+- **Requests another website sends.** A state-changing request (`POST`, `PUT`,
+  `PATCH`, `DELETE`) or WebSocket handshake whose `Origin` is not allowed is
+  refused with `403` (WebSocket close `1008`), as is one whose
+  `Sec-Fetch-Site` is `cross-site` or `same-site` without an allowed `Origin`.
+  Browsers send no `Origin` on media and download `GET`s (`<video src>`,
+  download links); those pass when their `Referer` is an allowed origin, and a
+  missing or foreign `Referer` is refused.
+  `GET` routes that start work or reach outside the machine refuse cross-site
+  `Sec-Fetch-Site` too: dub downloads and exports (video, audio, MP3, stems,
+  segment clips), dub segment and video previews, transcription streams, voice
+  and archetype previews, Ogg/Opus encoding of generated audio, history,
+  profile-image search, community catalog reads, setup preflight, model access
+  checks, storage rescans, Hugging Face token checks, LLM provider model
+  lists, Tailscale status, engine health and disk-usage checks, and
+  diagnostics. Ordinary navigation to the UI is unaffected.
+  Allowed origins are this backend's own
+  origin, `app://voicestudio` and the `OMNIVOICE_ALLOWED_ORIGINS` list
+  (see [CORS](#browsers-from-another-origin-cors)). Clients that send no
+  `Origin` and no `Sec-Fetch-Site` — scripts, curl, SDKs, MCP clients, the
+  desktop app's own process — are not affected.
+- **Unrecognized host names.** A request that only network position
+  authorizes (loopback, a trusted network, or any client when no API key is
+  set) and carries no valid credential must address the backend by an IP
+  address, `localhost` / `*.localhost`, this machine's host name, a Tailscale
+  MagicDNS name (`*.ts.net`), a container host alias (`host.docker.internal`,
+  `gateway.docker.internal`, `host.containers.internal`), or a host named in
+  `OMNIVOICE_ALLOWED_HOSTS`, `OMNIVOICE_ALLOWED_ORIGINS`,
+  `OMNIVOICE_MCP_ALLOWED_HOSTS`, `OMNIVOICE_API_URL`,
+  `OMNIVOICE_PUBLIC_API_BASE` or `OMNIVOICE_BIND_HOST`. This stops a web page
+  from re-pointing its own domain at `127.0.0.1` (DNS rebinding). A request
+  that presents a valid API key or administrator session (including a WebSocket
+  ticket) is never host-checked, whatever its peer address — so
+  Caddy or cloudflared on the same machine can forward the original `Host`
+  with the client's key. A wrong or missing credential, or a share PIN alone, gets no such pass. The
+  UI shell, its assets and the session exchange are not host-checked either,
+  so a remote UI on any host name can still load and sign in. To reach the
+  backend by another name without a credential — a reverse proxy that keeps
+  the original `Host`, or a Docker host opened as `http://nas.lan:3900` — list
+  it:
+
+```bash
+export OMNIVOICE_ALLOWED_HOSTS="nas.lan,.home.example"   # ".suffix" allows subdomains
+```
+
+The packaged desktop app has no Settings field for this. Add the same line
+without `export` (`OMNIVOICE_ALLOWED_HOSTS=nas.lan`) to the user env file —
+`~/.config/omnivoice/env` on macOS and Linux,
+`%USERPROFILE%\.config\omnivoice\env` on Windows, or the file named by
+`OMNIVOICE_ENV_FILE` — and restart VoiceStudio. Docker takes it as
+`-e OMNIVOICE_ALLOWED_HOSTS=...`.
+
+`OMNIVOICE_ALLOWED_HOSTS=*` turns the host check off; use it only behind a
+proxy that validates `Host` itself. Browser extensions or other web apps that
+call the API directly need their origin in `OMNIVOICE_ALLOWED_ORIGINS`.
+
 ## Status codes
 
 | Code | Meaning | What to do |
 |---|---|---|
 | **401** | Consumption auth failed — `{"detail": "PIN required"}` or `{"detail": "API key required"}`. | Supply the PIN / key (header, cookie, or query param above). A WebSocket surfaces this as close code **1008**. |
-| **403** | Authorization failed: loopback/native access was required, cookie Origin/CSRF validation failed, a server-mode mutation lacked an admin credential, or a native path capability was invalid/expired. | A PIN cannot grant admin or filesystem access. Re-authenticate the UI; scripts should use the API-key header; run native operations from the desktop app. The admin gate names the key only when one can satisfy it: server mode with `OMNIVOICE_API_KEY` configured answers `{"detail": "loopback origin or admin API key required"}` (the bundled UI routes it to the API-key login form); PIN-only/no-key server mode and the desktop build answer `{"detail": "loopback origin required"}` (only loopback can satisfy the gate). |
+| **403** | Authorization failed: the request came from another website or used an unrecognized host name ([details](#requests-from-other-websites-and-host-names)), loopback/native access was required, cookie Origin/CSRF validation failed, a server-mode mutation lacked an admin credential, or a native path capability was invalid/expired. | A PIN cannot grant admin or filesystem access. Re-authenticate the UI; scripts should use the API-key header; run native operations from the desktop app. The admin gate names the key only when one can satisfy it: server mode with `OMNIVOICE_API_KEY` configured answers `{"detail": "loopback origin or admin API key required"}` (the bundled UI routes it to the API-key login form); PIN-only/no-key server mode and the desktop build answer `{"detail": "loopback origin required"}` (only loopback can satisfy the gate). |
 | **429** | A failed administrator-session exchange exceeded its per-client limit, the GPU pool is saturated, or a model download is rate-limited. Ships with `Retry-After`; workload throttles also carry `X-VoiceStudio-Retryable: true`. | Back off for `Retry-After` seconds. For authentication, verify the master before retrying; a correct master is never locked out. |
 
 ---

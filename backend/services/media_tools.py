@@ -54,7 +54,6 @@ underneath was never touched.
 """
 from __future__ import annotations
 
-import errno
 import hashlib
 import logging
 import os
@@ -64,12 +63,12 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 from collections.abc import Callable
 import zipfile
 
 from core.config import DATA_DIR
 from core import prefs
+from core.fs_retry import retry_on_lock
 from services.ffmpeg_utils import _binary_runs, _BINARY_OK, windows_tool_candidates as _windows_tool_candidates
 
 logger = logging.getLogger("omnivoice.media_tools")
@@ -275,19 +274,7 @@ def acquire_bundled(wait: bool = False) -> dict:
 
 def _retry_tool_filesystem(operation: Callable[[], None]) -> None:
     """Allow bounded time for probe images / virus scanners to release files."""
-    delays = (0.1, 0.25, 0.5, 1.0, 2.0)
-    for attempt in range(len(delays) + 1):
-        try:
-            operation()
-            return
-        except OSError as exc:
-            transient = (
-                exc.errno in (errno.EACCES, errno.EPERM, errno.EBUSY, errno.ENOTEMPTY)
-                or getattr(exc, "winerror", None) in (5, 32, 33)
-            )
-            if not transient or attempt == len(delays):
-                raise
-            time.sleep(delays[attempt])
+    retry_on_lock(operation)
 
 
 def _tool_path_exists(path: str) -> bool:
@@ -394,7 +381,7 @@ def _tool_version(path: str) -> str | None:
         return cached
     try:
         out = subprocess.run(
-            [path, "-version"], capture_output=True, text=True, timeout=10, check=False,
+            [path, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False,
         ).stdout
         m = re.match(r"^(?:ffmpeg|ffprobe) version (\S+)", out or "")
         if m:
@@ -683,6 +670,29 @@ def _do_update_ytdlp() -> str:
             raise RuntimeError("downloaded wheel has no readable yt_dlp version")
         _install_staged_directory(staged, overlay)
     return version
+
+
+_GUARDED_YTDLP_BOOTSTRAP = (
+    "import sys; sys.path.insert(0, sys.argv[1]); "
+    "from core.url_safety import run_guarded_ytdlp; "
+    "sys.exit(run_guarded_ytdlp(sys.argv[2:]))"
+)
+
+
+def guarded_ytdlp_invocation() -> "tuple[list[str], dict[str, str] | None]":
+    """Like :func:`ytdlp_invocation`, with the URL-import policy enforced.
+
+    The subprocess refuses connections to private-network addresses (unless
+    the user opted in), downloads only through yt-dlp's native downloaders and
+    refuses live streams — see ``core.url_safety``. Use it for every yt-dlp run whose input
+    comes from a caller. A build that cannot re-invoke the interpreter falls
+    back to the plain CLI; callers still validate the URL up front.
+    """
+    argv, env = ytdlp_invocation()
+    if argv[:3] != [sys.executable, "-m", "yt_dlp"]:
+        return argv, env
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [sys.executable, "-c", _GUARDED_YTDLP_BOOTSTRAP, backend_dir], env
 
 
 def ytdlp_invocation() -> "tuple[list[str], dict[str, str] | None]":

@@ -1,36 +1,56 @@
-import { Slider } from '@base-ui/react/slider';
 import { Link } from '@tanstack/react-router';
-import { CrownIcon, GaugeIcon, SparkleIcon, SparklesIcon } from 'lucide-react';
+import {
+  CrownIcon,
+  GaugeIcon,
+  SparkleIcon,
+  SparklesIcon,
+  WandSparklesIcon,
+  CircleCheckIcon,
+  CircleGaugeIcon,
+  CircleHelpIcon,
+  ChevronRightIcon,
+} from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useId, useState } from 'react';
-import type { RefObject } from 'react';
+import { useId, useRef, useState, type ReactNode } from 'react';
+import { Slider } from '@base-ui/react/slider';
+import { DirectionProvider } from '@base-ui/react/direction-provider';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { apiJson, describeError } from '@/lib/api/client';
 import { useBackendStatus } from '@/hooks/use-backend-status';
+import { isBackendReachable } from '@shared/utils/backendStage';
 import { useDictationSelection } from '@/hooks/use-dictation-selection';
 import { engineFamilyState, useEngines } from '@/hooks/use-engines';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { useAppActivities } from '@/lib/app-activity';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/popover';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { LiveDeviceUsage } from '@/components/live-device-usage';
 import { cn } from '@/lib/utils';
 import {
   performanceTiers,
   usePerformanceProfile,
   type PerformanceFamily,
-  type PerformanceTier,
+  type PerformanceChoice,
+  type PerformanceProfileState,
 } from '@/hooks/use-performance-profile';
 
 export function PerformanceProfile({
   family = null,
-  tooltipAnchor,
   variant = 'compact',
+  showHardware = true,
+  extra,
+  onApplied,
 }: {
   family?: PerformanceFamily | null;
-  tooltipAnchor?: RefObject<HTMLElement | null>;
   variant?: 'compact' | 'settings';
+  /** The hardware-fit row under the compact slider; the simplest sidebar view leaves it out. */
+  showHardware?: boolean;
+  /** Compact sidebar: show only the slider, and keep this (engines) plus the hardware fit in a popover. */
+  extra?: ReactNode;
+  onApplied?: (state: PerformanceProfileState) => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const profile = usePerformanceProfile();
   const activities = useAppActivities();
   const backend = useBackendStatus();
@@ -38,64 +58,50 @@ export function PerformanceProfile({
   const dictation = useDictationSelection();
   const batch = useQuery({
     queryKey: ['batch-jobs', 'active'],
-    enabled: backend.stage === 'ready',
+    enabled: isBackendReachable(backend.stage),
     queryFn: ({ signal }) => apiJson<unknown[]>('/batch/jobs?status=active&limit=100', { signal }),
     staleTime: 1_000,
     refetchInterval: (query) => (query.state.data?.length ? 1_000 : 15_000),
   });
-  const [failed, setFailed] = useState<PerformanceTier | null>(null);
+  const [failed, setFailed] = useState<PerformanceChoice | null>(null);
   const groupId = useId();
   const [draft, setDraft] = useState<number | null>(null);
+  const [hardwareOpen, setHardwareOpen] = useState(false);
+  const compactControl = useRef<HTMLDivElement>(null);
   const busy =
     profile.isSaving ||
-    backend.stage !== 'ready' ||
+    !isBackendReachable(backend.stage) ||
     batch.isPending ||
     batch.isError ||
     Boolean(batch.data?.length) ||
     Object.values(activities).some((count) => count > 0);
+  const choices: readonly PerformanceChoice[] = family
+    ? performanceTiers
+    : [...performanceTiers, 'auto'];
+  const popoverMode = extra != null && !family && variant !== 'settings';
   const selected = family ? profile.data?.effective[family] : profile.data?.global;
   const applicable = profile.data?.applicable_families ?? profile.data?.implemented_families ?? [];
-  const supported = family === null ? applicable.length > 0 : applicable.includes(family);
+  const supported = family === null ? true : applicable.includes(family);
   const disabled = busy || !profile.data || !supported;
-  const selectedIndex = selected ? performanceTiers.indexOf(selected) : -1;
+  const selectedIndex = selected ? choices.indexOf(selected) : -1;
   const position = draft ?? Math.max(0, selectedIndex);
-  const TierIcon = [GaugeIcon, SparkleIcon, SparklesIcon, CrownIcon][position];
-  const tipState = !supported
-    ? 'modelSettings.unavailable'
-    : busy
-      ? 'engineRuntime.working'
-      : 'engineRuntime.ready';
   const accent = [
     'var(--muted-foreground)',
     'color-mix(in oklab, var(--primary) 72%, var(--foreground))',
     'var(--primary)',
     'color-mix(in oklab, var(--primary) 82%, white)',
-  ][position];
-  const glow = disabled
-    ? 'none'
-    : [
-        'inset 0 1px 0 rgb(255 255 255 / 10%)',
-        'inset 0 1px 0 rgb(255 255 255 / 18%), 0 0 8px color-mix(in oklab, var(--primary) 16%, transparent)',
-        'inset 0 1px 0 rgb(255 255 255 / 30%), 0 0 16px color-mix(in oklab, var(--primary) 34%, transparent)',
-        'inset 0 1px 0 rgb(255 255 255 / 36%), 0 0 20px color-mix(in oklab, var(--primary) 46%, transparent)',
-      ][position];
-  const thumbGlow = disabled
-    ? 'none'
-    : [
-        '0 1px 3px rgb(0 0 0 / 20%)',
-        '0 2px 6px rgb(0 0 0 / 22%), 0 0 7px color-mix(in oklab, var(--primary) 16%, transparent)',
-        '0 3px 9px rgb(0 0 0 / 24%), 0 0 13px color-mix(in oklab, var(--primary) 34%, transparent)',
-        '0 4px 11px rgb(0 0 0 / 26%), 0 0 17px color-mix(in oklab, var(--primary) 48%, transparent)',
-      ][position];
-  const choose = async (tier: PerformanceTier) => {
+  ][Math.min(position, 3)];
+  const choose = async (tier: PerformanceChoice) => {
     if (disabled) {
       setDraft(null);
       return;
     }
-    setDraft(performanceTiers.indexOf(tier));
+    setDraft(choices.indexOf(tier));
     setFailed(null);
+    if (popoverMode) setHardwareOpen(true);
     try {
-      await profile.setTier({ tier, family });
+      const applied = await profile.setTier({ tier, family });
+      onApplied?.(applied);
       toast.success(
         t('performanceProfile.applied', {
           tier: t('performanceProfile.' + tier),
@@ -108,6 +114,12 @@ export function PerformanceProfile({
       setDraft(null);
     }
   };
+  const plan = profile.data?.plan;
+  const hardwareSummary = profile.isSaving
+    ? t('common.saving')
+    : plan
+      ? t('performanceHardware.' + (plan.status === 'limited' ? 'adjusted' : plan.status))
+      : '';
   const selection = family ? profile.data?.selections?.[family] : null;
   const target = family ? profile.data?.targets?.[family] : null;
   const legacyFamily =
@@ -147,15 +159,15 @@ export function PerformanceProfile({
           aria-labelledby={groupId}
           aria-busy={profile.isSaving}
           className={cn(
-            'grid min-w-0 grid-cols-2 gap-1 rounded-xl border border-border/60 bg-muted/45 p-1 sm:grid-cols-4',
+            'grid min-w-0 grid-cols-2 gap-1 rounded-xl border border-border/60 bg-muted/45 p-1 sm:grid-flow-col sm:auto-cols-fr',
             disabled && 'opacity-50',
           )}
         >
           <span id={groupId} className="sr-only">
             {t(supported ? 'performanceProfile.title' : 'modelSettings.unavailable')}
           </span>
-          {performanceTiers.map((tier, index) => {
-            const Icon = [GaugeIcon, SparkleIcon, SparklesIcon, CrownIcon][index];
+          {choices.map((tier, index) => {
+            const Icon = [GaugeIcon, SparkleIcon, SparklesIcon, CrownIcon, WandSparklesIcon][index];
             const active = supported && position === index;
             return (
               <button
@@ -229,68 +241,252 @@ export function PerformanceProfile({
       </div>
     );
   }
-  const control = (
-    <div className="min-w-0">
-      <span id={groupId} className="sr-only">
-        {t(supported ? 'performanceProfile.title' : 'modelSettings.unavailable')}
-      </span>
-      <Slider.Root
-        min={0}
-        max={performanceTiers.length - 1}
-        step={1}
-        largeStep={1}
-        value={position}
-        disabled={disabled}
-        aria-busy={profile.isSaving}
-        onValueChange={(value) => setDraft(value)}
-        onValueCommitted={(value) => void choose(performanceTiers[value])}
-        className={`w-full min-w-0 ${disabled ? 'opacity-50' : ''}`}
-      >
-        <Slider.Control className="relative flex h-9 w-full min-w-0 touch-none select-none items-center px-4">
-          <span
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 inset-y-1 rounded-full border border-border/60 transition-[background-color] duration-200 motion-reduce:transition-none"
-            style={{
-              backgroundColor: disabled
-                ? 'var(--muted)'
-                : `color-mix(in oklab, ${accent} ${[5, 9, 14, 20][position]}%, var(--muted))`,
-            }}
-          />
-          <span
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-y-1 left-0 rounded-full transition-[background,box-shadow,opacity] duration-200 motion-reduce:transition-none"
-            style={{
-              width: `calc(1rem + (100% - 2rem) * ${position / (performanceTiers.length - 1)})`,
-              background: `linear-gradient(110deg, color-mix(in oklab, ${accent} 65%, var(--muted)), ${accent} 75%, color-mix(in oklab, ${accent} ${position >= 2 ? 82 : 95}%, white))`,
-              boxShadow: glow,
-            }}
-          />
-          <Slider.Track className="relative h-7 w-full min-w-0">
-            <div
-              aria-hidden="true"
-              className="pointer-events-none absolute inset-0 flex items-center justify-between"
-            >
-              {performanceTiers.map((tier, index) => (
-                <span
-                  key={tier}
-                  title={t('performanceProfile.' + tier)}
-                  className={`size-1 shrink-0 rounded-full ${index <= position ? 'bg-primary-foreground/50' : 'bg-muted-foreground/60'}`}
-                />
-              ))}
+  const autoOn = selected === 'auto';
+  const tiers = performanceTiers;
+  // Auto is a mode, not a fifth notch: show the tier it resolved to as a hint.
+  const shownTier = draft != null ? choices[draft] : autoOn ? plan?.resolved : selected;
+  const HardwareIcon =
+    plan?.status === 'fits'
+      ? CircleCheckIcon
+      : plan?.status === 'unknown'
+        ? CircleHelpIcon
+        : CircleGaugeIcon;
+  const sliderTier = (shownTier === 'auto' ? plan?.resolved : shownTier) ?? 'balanced';
+  const sliderPosition = Math.max(0, tiers.indexOf(sliderTier as (typeof tiers)[number]));
+  const TierIcon = [GaugeIcon, SparkleIcon, SparklesIcon, CrownIcon][Math.min(3, sliderPosition)];
+  const panel = (
+    <PopoverContent
+      side="inline-end"
+      anchor={popoverMode ? compactControl : undefined}
+      className="max-h-[min(42rem,80dvh)] w-80 max-w-[calc(100vw-1rem)] space-y-3 overflow-y-auto p-4 text-xs"
+    >
+      {extra}
+      {plan && !family && (
+        <>
+          <div>
+            <p className="font-medium">
+              {t('performanceProfile.max') +
+                ' · ' +
+                t(
+                  'performanceHardware.' +
+                    (plan.max_status === 'limited' ? 'reason.memory' : plan.max_status),
+                )}
+            </p>
+            <p className="mt-1 text-muted-foreground">{t('performanceHardware.voiceFirst')}</p>
+          </div>
+          <LiveDeviceUsage open={hardwareOpen} />
+          <div className="-mx-1">
+            {(['tts', 'asr', 'translation', 'dictation', 'diarisation'] as const).map((name) => {
+              const entry = plan.families[name];
+              return (
+                <Link
+                  key={name}
+                  to="/settings/models/$family"
+                  params={{ family: name }}
+                  className="group flex min-h-7 items-center justify-between gap-3 rounded-md px-1 py-1 outline-none hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <span>{t('sidebarTools.' + name)}</span>
+                  <span className="flex items-center gap-1.5 text-end text-[11px] text-muted-foreground">
+                    {t('performanceHardware.reason.' + entry.reason)}
+                    <ChevronRightIcon
+                      className="size-3 shrink-0 opacity-50 group-hover:opacity-100 rtl:rotate-180"
+                      aria-hidden="true"
+                    />
+                  </span>
+                </Link>
+              );
+            })}
+          </div>
+          <details className="group/details border-t pt-1 text-muted-foreground">
+            <summary className="flex min-h-8 cursor-pointer list-none items-center justify-between gap-2 rounded outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+              {t('sidebarTools.details')}
+              <ChevronRightIcon
+                className="size-3.5 shrink-0 group-open/details:rotate-90 rtl:rotate-180"
+                aria-hidden="true"
+              />
+            </summary>
+            <div className="space-y-2 pt-1 leading-relaxed">
+              <p className="text-foreground/80 tabular-nums">
+                {t('performanceHardware.specs', {
+                  ram:
+                    plan.hardware.ram_gb?.toLocaleString(i18n.language, {
+                      maximumFractionDigits: 0,
+                    }) ?? '—',
+                  cores: plan.hardware.cpu_threads,
+                })}
+                {plan.hardware.vram_gb != null &&
+                  ' · ' +
+                    t('performanceHardware.vram', {
+                      memory: plan.hardware.vram_gb.toLocaleString(i18n.language, {
+                        maximumFractionDigits: 0,
+                      }),
+                    })}
+              </p>
+              <p>{t('performanceHardware.priority')}</p>
+              <p>{t('performanceHardware.estimate')}</p>
             </div>
-            <Slider.Thumb
-              aria-labelledby={groupId}
-              getAriaValueText={(_formatted, value) =>
-                t('performanceProfile.' + performanceTiers[value])
-              }
-              className="absolute top-1/2 z-10 grid size-7 place-items-center rounded-full border border-background/40 bg-foreground text-background outline-none ring-ring/40 transition-[box-shadow,transform] hover:scale-105 focus-within:ring-4 data-dragging:scale-105 motion-reduce:transition-none"
-              style={{ boxShadow: thumbGlow }}
-            >
-              <TierIcon className="size-3.5" aria-hidden="true" />
-            </Slider.Thumb>
-          </Slider.Track>
-        </Slider.Control>
-      </Slider.Root>
+          </details>
+        </>
+      )}
+    </PopoverContent>
+  );
+  const tierName = shownTier && shownTier !== 'auto' ? t('performanceProfile.' + shownTier) : null;
+  // The current level, beside the slider it reads from. In the sidebar it also opens the details.
+  const tierLabel = (
+    <>
+      <TierIcon className="size-3.5 shrink-0 text-primary" aria-hidden="true" />
+      <span className="min-w-0 truncate">{tierName ?? t('performanceProfile.auto')}</span>
+    </>
+  );
+  const body = (
+    <div ref={compactControl} data-slot="performance-control" className="min-w-0 space-y-1 py-1.5">
+      {/* One labelled row: the control's name, then the Auto mode it can hand over to. */}
+      <div className="flex min-h-6 items-center justify-between gap-2 ps-1">
+        <span
+          id={groupId}
+          className="min-w-0 truncate text-[11px] font-medium whitespace-nowrap text-muted-foreground"
+        >
+          {t(supported ? 'performanceProfile.title' : 'modelSettings.unavailable')}
+        </span>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                data-slot="performance-auto"
+                aria-pressed={autoOn}
+                aria-describedby={groupId + '-auto'}
+                disabled={disabled}
+                onClick={() => void choose(autoOn ? (plan?.resolved ?? 'balanced') : 'auto')}
+                className={cn(
+                  'inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded-md px-1.5 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
+                  autoOn
+                    ? 'bg-primary/12 text-primary'
+                    : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+                )}
+              />
+            }
+          >
+            <WandSparklesIcon className="size-3" aria-hidden="true" />
+            {t('performanceProfile.auto')}
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-56">
+            {t('performanceProfile.autoHint')}
+          </TooltipContent>
+        </Tooltip>
+        <span id={groupId + '-auto'} className="sr-only">
+          {t('performanceProfile.autoHint')}
+        </span>
+      </div>
+      <div className="flex min-w-0 items-center gap-2 ps-1">
+        <DirectionProvider direction={i18n.dir(i18n.language)}>
+          <Slider.Root
+            min={0}
+            max={tiers.length - 1}
+            step={1}
+            largeStep={1}
+            value={sliderPosition}
+            disabled={disabled}
+            aria-busy={profile.isSaving}
+            onValueChange={(value) => setDraft(value)}
+            onValueCommitted={(value) => void choose(tiers[value])}
+            className={cn('min-w-14 flex-1', disabled && 'opacity-50', autoOn && 'opacity-60')}
+          >
+            <Slider.Control className="relative flex h-6 w-full min-w-0 touch-none items-center select-none">
+              <Slider.Track className="relative h-1 w-full min-w-0 rounded-full bg-sidebar-accent">
+                <Slider.Indicator className="rounded-full bg-primary" />
+                {/* One tick per tier, so the steps read without labels. */}
+                {tiers.map((tier, index) => (
+                  <span
+                    key={tier}
+                    aria-hidden="true"
+                    className="pointer-events-none absolute top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sidebar-foreground/30 rtl:translate-x-1/2"
+                    style={{
+                      insetInlineStart: `${(index / Math.max(tiers.length - 1, 1)) * 100}%`,
+                    }}
+                  />
+                ))}
+                <Slider.Thumb
+                  aria-labelledby={groupId}
+                  aria-describedby={groupId + '-help'}
+                  getAriaValueText={(_formatted, value) => t('performanceProfile.' + tiers[value])}
+                  className="size-3.5 rounded-full bg-primary shadow-[0_1px_4px_rgb(0_0_0/30%)] ring-2 ring-sidebar outline-none focus-within:ring-4 focus-within:ring-ring/40"
+                />
+              </Slider.Track>
+            </Slider.Control>
+          </Slider.Root>
+        </DirectionProvider>
+        {popoverMode ? (
+          <PopoverTrigger
+            openOnHover
+            delay={200}
+            render={
+              <button
+                type="button"
+                data-slot="performance-trigger"
+                aria-label={
+                  hardwareSummary
+                    ? `${tierName ?? t('performanceProfile.auto')} · ${hardwareSummary}`
+                    : undefined
+                }
+                className="group/hw flex h-6 max-w-[60%] min-w-0 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs font-medium whitespace-nowrap text-foreground/85 outline-none hover:bg-sidebar-accent/60 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            }
+          >
+            {tierLabel}
+            <ChevronRightIcon
+              className="size-3 shrink-0 opacity-50 transition-transform group-hover/hw:translate-x-0.5 rtl:rotate-180 motion-reduce:transition-none"
+              aria-hidden="true"
+            />
+          </PopoverTrigger>
+        ) : (
+          supported && (
+            <span className="flex h-6 max-w-[60%] min-w-0 shrink-0 items-center gap-1 px-1.5 text-xs font-medium whitespace-nowrap text-foreground/85">
+              {tierLabel}
+            </span>
+          )
+        )}
+      </div>
+      {plan && !family && showHardware && (
+        <Popover open={hardwareOpen} onOpenChange={setHardwareOpen}>
+          <PopoverTrigger
+            render={
+              <button
+                type="button"
+                aria-label={hardwareSummary}
+                className="group/hw flex min-h-6 w-full items-center gap-1.5 rounded px-1 text-start text-[11px] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            }
+          >
+            <HardwareIcon
+              className={cn(
+                'size-3 shrink-0',
+                plan.status === 'fits'
+                  ? 'text-success'
+                  : plan.status !== 'unknown' && 'text-warning',
+              )}
+              aria-hidden="true"
+            />
+            <span className="min-w-0 flex-1 truncate" role="status">
+              {hardwareSummary}
+            </span>
+            <ChevronRightIcon
+              className="size-3 shrink-0 opacity-60 transition-transform group-hover/hw:translate-x-0.5 rtl:rotate-180 motion-reduce:transition-none"
+              aria-hidden="true"
+            />
+          </PopoverTrigger>
+          {panel}
+        </Popover>
+      )}
+      <p id={groupId + '-help'} className="sr-only">
+        {t(
+          !supported
+            ? 'performanceProfile.noTarget'
+            : busy
+              ? 'sidebarTools.wait'
+              : 'sidebarTools.speedHelp',
+        )}
+      </p>
       {(failed || profile.isError || batch.isError) && (
         <div role="alert" className="text-xs text-destructive">
           {t('common.error')}
@@ -310,60 +506,19 @@ export function PerformanceProfile({
       )}
     </div>
   );
-  return (
-    <Tooltip>
-      <TooltipTrigger render={<div className="min-w-0" />}>{control}</TooltipTrigger>
-      <TooltipContent
-        surface="theme"
-        anchor={tooltipAnchor}
-        showArrow={!tooltipAnchor}
-        side="top"
-        align="start"
-        sideOffset={8}
-        className={cn(
-          'flex-col items-start',
-          tooltipAnchor ? 'w-[var(--anchor-width)] max-w-none' : 'w-64',
-        )}
-      >
-        <div className="flex w-full min-w-0 max-w-[calc(100vw-2rem)] flex-col gap-2 py-1">
-          <div className="flex items-center justify-between gap-3">
-            <span className="inline-flex min-w-0 items-center gap-2 font-semibold">
-              <TierIcon className="size-4 shrink-0" style={{ color: accent }} aria-hidden="true" />
-              <span className="truncate">{t('performanceProfile.title')}</span>
-            </span>
-            <span className="inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-              <span
-                aria-hidden="true"
-                className={cn(
-                  'size-1.5 rounded-full',
-                  !supported
-                    ? 'bg-destructive'
-                    : busy
-                      ? 'animate-pulse bg-amber-400 motion-reduce:animate-none'
-                      : 'bg-emerald-400',
-                )}
-              />
-              {t(tipState)}
-            </span>
-          </div>
-          <div className="space-y-1 border-t border-border/60 pt-2">
-            <p className="text-[10px] font-medium text-muted-foreground">
-              {t('modelSettings.selected')}
-            </p>
-            <p className="text-sm font-medium" style={{ color: accent }}>
-              {t('performanceProfile.' + performanceTiers[position])}
-            </p>
-          </div>
-          <p className="border-t border-border/60 pt-2 text-xs leading-relaxed text-muted-foreground">
-            {t('performanceProfile.hint')}
-          </p>
-          {position === performanceTiers.length - 1 && (
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              {t('performanceProfile.maxHint')}
-            </p>
-          )}
-        </div>
-      </TooltipContent>
-    </Tooltip>
+  return popoverMode ? (
+    <Popover
+      open={hardwareOpen}
+      onOpenChange={(open) => {
+        // A save in flight keeps its feedback visible until it settles.
+        if (!open && profile.isSaving) return;
+        setHardwareOpen(open);
+      }}
+    >
+      {body}
+      {panel}
+    </Popover>
+  ) : (
+    body
   );
 }

@@ -47,6 +47,7 @@ const MIME: Record<string, string> = {
  */
 const DROPPED_REQUEST_HEADERS = new Set([
   'origin',
+  'x-voicestudio-desktop-origin',
   'host',
   'referer',
   'accept-charset',

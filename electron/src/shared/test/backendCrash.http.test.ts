@@ -91,7 +91,7 @@ describe('browser fallback — getLastBackendCrash / ack over HTTP', () => {
   it('uses only the short-lived session and deletes a legacy master', async () => {
     const { API } = await import('../api/client');
     const session = `ovs_admin_session_${'S'.repeat(43)}`;
-    sessionStorage.setItem(
+    localStorage.setItem(
       ADMIN_SESSION_STORAGE_KEY,
       JSON.stringify({ token: session, expiresAt: Date.now() / 1000 + 3600, apiBase: API }),
     );

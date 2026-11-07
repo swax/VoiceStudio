@@ -17,6 +17,7 @@ const FALLBACK_COPY: Record<string, FallbackCopy> = {
   en: { title: 'Something went wrong', retry: 'Try again' },
   es: { title: 'algo salió mal', retry: 'Inténtalo de nuevo' },
   fr: { title: "Quelque chose s'est mal passé", retry: 'Réessayez' },
+  gl: { title: 'Erro', retry: 'Téntao de novo' },
   hi: { title: 'कुछ ग़लत हो गया', retry: 'पुनः प्रयास करें' },
   id: { title: 'Ada yang tidak beres', retry: 'Coba lagi' },
   it: { title: 'Qualcosa è andato storto', retry: 'Riprova' },
@@ -31,7 +32,7 @@ const FALLBACK_COPY: Record<string, FallbackCopy> = {
   tr: { title: 'Bir şeyler ters gitti', retry: 'Tekrar dene' },
   uk: { title: 'Щось пішло не так', retry: 'Спробуйте знову' },
   vi: { title: 'Đã xảy ra lỗi', retry: 'Thử lại' },
-  'zh-CN': { title: '出了点问题', retry: '再试一次' },
+  'zh-CN': { title: '出现了问题', retry: '再试一次' },
   'zh-TW': { title: '出了點問題', retry: '再試一次' },
 };
 
@@ -99,15 +100,30 @@ export function installBlankWindowGuard(
   let stopped = false;
   let showingFallback = false;
   let repairRunning = false;
+  // Bumped whenever a main-frame navigation starts or commits, so a DOM probe
+  // that began on an older page can never trigger recovery for a newer one.
+  let generation = 0;
 
   const schedule = (delay: number) => {
     if (stopped || win.isDestroyed()) return;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => void inspect(), delay);
+    timer = setTimeout(() => {
+      timer = undefined;
+      void inspect();
+    }, delay);
   };
   const inspect = async () => {
     if (stopped || showingFallback || win.isDestroyed()) return;
-    if (await hasRenderedRoot(win)) {
+    const probed = generation;
+    const rendered = await hasRenderedRoot(win);
+    if (stopped || win.isDestroyed() || contents.isDestroyed()) return;
+    if (probed !== generation) {
+      // Stale result from a superseded page. A committed navigation reschedules
+      // itself; re-arm only if nothing is pending (e.g. the navigation failed).
+      if (!timer && !showingFallback) schedule(RETRY_BASE_MS);
+      return;
+    }
+    if (rendered) {
       reloads = 0;
       schedule(HEARTBEAT_MS);
       return;
@@ -123,7 +139,13 @@ export function installBlankWindowGuard(
     console.error('[window] renderer remained empty; showing built-in recovery');
     void win.loadURL(blankFallbackUrl(locale)).catch(() => {});
   };
+  const navigationStarted = (
+    details: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
+  ) => {
+    if (details.isMainFrame && !details.isSameDocument) generation += 1;
+  };
   const loaded = (_event: Electron.Event, url: string) => {
+    generation += 1;
     if (!isTrustedRenderer(url, devOrigin)) return;
     const manualRecovery = showingFallback;
     showingFallback = false;
@@ -146,12 +168,14 @@ export function installBlankWindowGuard(
     stopped = true;
     if (timer) clearTimeout(timer);
     if (!contents.isDestroyed()) {
+      contents.off('did-start-navigation', navigationStarted);
       contents.off('did-navigate', loaded);
       contents.off('will-navigate', repairRequested);
     }
     win.off('closed', closed);
   };
 
+  contents.on('did-start-navigation', navigationStarted);
   contents.on('did-navigate', loaded);
   contents.on('will-navigate', repairRequested);
   win.on('closed', closed);

@@ -477,3 +477,44 @@ def test_legacy_seg_cache_gate():
     # Any OTHER language on the job → ambiguous, never reuse.
     assert not _legacy_seg_cache_ok({"dubbed_tracks": {"bn": {}}}, "es")
     assert not _legacy_seg_cache_ok({"dubbed_tracks": {"es": {}, "bn": {}}}, "es")
+
+
+@pytest.mark.parametrize("cache_state", ["missing", "corrupt", "old_format"])
+def test_promoted_regeneration_validates_languages_before_any_tts(patched_generate, monkeypatch, cache_state):
+    run, model, job, job_dir = patched_generate
+    def check_language(self, language):
+        if language == "Japanese":
+            raise ValueError("Test engine does not support Japanese")
+    monkeypatch.setattr(_FakeBackend, "_check_language", check_language, raising=False)
+    segments = [
+        {"start": 0, "end": 1, "text": "First", "target_lang": "English"},
+        {"start": 1, "end": 2, "text": "Second"},
+    ]
+    run(_body(segments, language="English"))
+    model.calls.clear()
+    # Cached, unselected audio needs no language validation.
+    run(_body(segments, language="Japanese", regen_only=["0"]))
+    assert model.calls == ["First"]
+    model.calls.clear()
+    if cache_state == "missing":
+        (job_dir / "seg_es_1.wav").unlink()
+    elif cache_state == "corrupt":
+        (job_dir / "seg_es_1.wav").write_bytes(b"invalid WAV")
+    else:
+        job["seg_wav_kind_by_lang"] = {"es": "slotted"}
+    with pytest.raises(ValueError, match="does not support Japanese"):
+        run(_body(segments, language="Japanese", regen_only=["0"]))
+    assert model.calls == [], "validate the promoted set before replacing any cached audio"
+
+
+def test_silent_short_segment_skips_language_validation(patched_generate, monkeypatch):
+    run, model, job, job_dir = patched_generate
+    def check_language(self, language):
+        if language == "Japanese":
+            raise ValueError("Unsupported language")
+    monkeypatch.setattr(_FakeBackend, "_check_language", check_language, raising=False)
+    run(_body([
+        {"start": 0, "end": 0.05, "text": "Silent", "target_lang": "Japanese"},
+        {"start": 1, "end": 2, "text": "Spoken", "target_lang": "English"},
+    ], language="English"))
+    assert model.calls == ["Spoken"]

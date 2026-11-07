@@ -220,7 +220,7 @@ def test_demucs_separates_the_hq_stereo_extraction(tmp_path, monkeypatch):
     monkeypatch.setattr(dp, "get_best_device", lambda: "cpu")
 
     video = tmp_path / "clip.mp4"
-    video.write_bytes(b"\x00" * 64)
+    video.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 52)
 
     async def _drain():
         async for _ in dp.ingest_pipeline(

@@ -24,12 +24,17 @@ export interface Profile {
   seed: number | null;
   personality: string | null;
   vd_states: string | null;
+  /** Complete native Voice Design prompt, explicit picks and authoring engine. */
+  design_recipe?: string | null;
   /** Epoch seconds (SQLite REAL) on the wire; tolerate ISO strings too. */
   created_at: number | string;
   is_locked: boolean | number | null;
   verified_own_voice?: boolean | number | null;
   consent_text?: string | null;
   consent_recorded_at?: string | null;
+  /** Sync consent attestation (S2): required before a voice can sync. */
+  consent_basis?: 'own_voice' | 'speaker_permission' | '' | null;
+  consent_attested_at?: string | null;
 }
 
 // ── History (`GET /history`) ───────────────────────────────────────────────
@@ -46,14 +51,22 @@ export interface HistoryItem {
   generation_time: number | null;
   seed: number | null;
   starred: boolean | number | null;
+  /** JSON copy of the Voice Design draft behind a design take; null for any other take or a row saved earlier. */
+  design_recipe?: string | null;
+  /** The take's text as a reference transcript: no script markup, '' when it may be cut short (#3062). */
+  transcript?: string;
   /** Epoch seconds (SQLite REAL) on the wire; tolerate ISO strings too. */
   created_at: number | string;
 }
 
 // ── Engines (`GET /engines`) ───────────────────────────────────────────────
 export interface EngineBackend {
+  output_sample_rate?: number | null;
+  output_channels?: number | null;
   /** Lowercase picker names; null/absent means model-specific or unrestricted. */
   supported_language_names?: string[] | null;
+  /** Regional accents the engine renders itself, e.g. ['pt-BR'] (#3143). */
+  rendered_dialects?: string[] | null;
   execution_evidence?: {
     evidence_state: string;
     actual_execution_provider?: string | null;
@@ -66,6 +79,19 @@ export interface EngineBackend {
   reason: string | null;
   hint?: string | null;
   supports_cloning?: boolean | null;
+  /** Speech-to-speech conversion: Convert's "Keep my delivery" (#3421). */
+  supports_voice_conversion?: boolean;
+  /** Graded emotion conditioning (IndexTTS2): text, strength and vector. */
+  supports_emotion?: boolean;
+  /** Built-in voices a request may pick (`preset_voice`); empty or absent when the engine has none (#2938). */
+  preset_voices?: string[];
+  default_voice?: string | null;
+  /** False: needs a reference clip, so Voice Design is unavailable. Null/absent: undeclared. */
+  supports_voice_design?: boolean | null;
+  /** Whether `instruct` must be one of a fixed tag list (OmniVoice) or may be any wording. */
+  instruct_vocabulary?: InstructVocabulary;
+  /** Emotion mechanism and inline reaction tags the engine renders (#3422). */
+  expression_caps?: ExpressionCaps;
   /** Seconds of a clone reference the engine uses; null when not verified (#2281). */
   max_ref_seconds?: number | null;
   /** How that stretch is chosen from a longer clip. */
@@ -120,10 +146,33 @@ export interface SystemInfo {
   ffmpeg_path?: string;
 }
 
+/** `tags` = the fixed OmniVoice attribute list; `freeform` = any wording is passed through. */
+export type InstructVocabulary = 'tags' | 'freeform';
+
+/** "graded" = IndexTTS2 sliders/description; "direction" = written `instruct`; "none". */
+export type EmotionControl = 'graded' | 'direction' | 'none';
+
+export interface ExpressionCaps {
+  emotion: EmotionControl;
+  /** Inline tags the engine's tokenizer renders, e.g. `[laughter]`. */
+  tags: string[];
+}
+
+/** What the client reports about its Voice Design draft. The server adds a
+ *  `mapped` section of its own before storing it. */
+export interface DesignRecipe {
+  description: string;
+  picks: Record<string, string>;
+}
+
 // ── Generation (`POST /generate`, classic whole-file path) ─────────────────
 /** Everything the clone form sends. Names are the UI names; `toGenerateForm`
  *  in generate.ts maps them to the multipart field names. */
 export interface CloneGenerateInput {
+  /** Built-in voice id for engines that ship presets. */
+  presetVoice?: string;
+  wavBits?: 16 | 24 | 32;
+  effectPreset?: 'broadcast' | 'raw';
   seed?: number;
   text: string;
   /** Display-name language ("English"). "Auto" is omitted on the wire. */
@@ -133,8 +182,17 @@ export interface CloneGenerateInput {
   refAudio?: File | Blob | null;
   refAudioName?: string;
   refText?: string;
-  /** Free-text style; sanitised through the instruct whitelist before sending. */
+  /** Style or design wording. It is filtered through the instruct whitelist
+   *  unless `instructVocabulary` says the engine is free-form. */
   instruct?: string;
+  /** The target engine's reading of `instruct`. Leave unset for the OmniVoice tag list. */
+  instructVocabulary?: InstructVocabulary;
+  /** Draft recorded next to a design take for later reopening; has no effect on the audio. */
+  designRecipe?: DesignRecipe;
+  /** IndexTTS2 independent emotion conditioning (text or eight weights). */
+  emoText?: string;
+  emoAlpha?: number;
+  emoVector?: number[];
   steps: number;
   cfg: number;
   speed: number;

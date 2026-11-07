@@ -13,6 +13,7 @@ try {
     id: 'custom',
     display_name: 'Fixture provider',
     local: false,
+    configured: true,
     base_url: 'https://example.com/v1',
     model: 'fixture-model',
     has_key: true,
@@ -20,7 +21,7 @@ try {
     base_url_from_env: true,
   };
   await page.route('**/api/api/settings/llm-providers', (route) =>
-    route.fulfill({ json: { active, providers: [provider] } }),
+    route.fulfill({ json: { active, engine_active: active === 'custom' ? 'openai-compat' : 'off', providers: [provider] } }),
   );
   await page.route('**/api/api/settings/llm-providers/custom', (route) => {
     const body = route.request().postDataJSON();
@@ -31,6 +32,11 @@ try {
   });
   await page.route('**/api/api/settings/llm-providers/custom/test', (route) => {
     calls.push({ kind: 'test' });
+    return route.fulfill({ json: { ok: true, model: 'fixture-model', latency_ms: 5 } });
+  });
+  await page.route('**/api/api/settings/llm-providers/custom/connect', (route) => {
+    calls.push({ kind: 'connect' });
+    active = 'custom';
     return route.fulfill({ json: { ok: true, model: 'fixture-model', latency_ms: 5 } });
   });
   await page.route('**/api/api/settings/llm-providers/custom/models', (route) => {
@@ -57,14 +63,16 @@ try {
   assert(!('base_url' in calls[0].body));
   reject = true;
   await page.getByRole('button', { name: 'Test', exact: true }).click();
-  await page.getByRole('alert').filter({ hasText: 'Failed to save' }).waitFor();
+  await page.getByRole('alert').filter({ hasText: 'Save failed.' }).waitFor();
   assert.equal(calls.filter((call) => call.kind === 'test').length, 1);
   reject = false;
   await page.getByRole('button', { name: 'Fetch models', exact: true }).click();
   await page.getByRole('button', { name: 'model-two', exact: true }).click();
   assert.equal(await model.inputValue(), 'model-two');
-  await page.getByRole('button', { name: 'Save & use for translation', exact: true }).click();
-  await page.getByRole('button', { name: 'Save & keep active', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Connect & enable', exact: true }).click();
+  await page.getByRole('button', { name: 'Turn off LLM', exact: true }).waitFor();
+  assert.equal(calls.filter((call) => call.kind === 'connect').length, 1);
+  assert.equal(await page.getByText('Off (no LLM)', { exact: true }).count(), 0);
   console.log(
     'PASS: LLM pinned fields, preserved secret, save-before-test, failed-save guard, model catalogue and explicit activation',
   );

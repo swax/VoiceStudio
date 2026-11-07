@@ -1,15 +1,11 @@
 import { runRendererTask } from '@/lib/global-error-recovery';
-import { BlocksIcon, ChevronRightIcon, SearchIcon, SparklesIcon } from 'lucide-react';
+import { ChevronRightIcon, SearchIcon } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from '@tanstack/react-router';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { Input } from '@/components/ui/input';
-import {
-  INTEGRATION_CATALOG,
-  integrationSlug,
-} from '@shared/config/integration-catalog';
-import { SPONSORS } from '@shared/config/sponsors';
+import { INTEGRATION_CATALOG, integrationSlug } from '@shared/config/integration-catalog';
 import { integrationSetup } from './setup-registry';
 import { INTEGRATION_CATEGORIES, integrationCategoryKey } from './integration-categories';
 import './integrations-page.css';
@@ -25,30 +21,24 @@ export function IntegrationsPage() {
       navigate({ to: '/integrations/$slug', params: { slug: integrationSlug(name) } }),
     );
   const entries = useMemo(
-    () => [
-      ...SPONSORS.map((entry) => ({
-        ...entry,
-        featured: true,
-        capabilities: [] as readonly string[],
-        worksWith: false,
-        category: null as string | null,
-      })),
-      ...INTEGRATION_CATALOG.map((entry) => {
+    () =>
+      INTEGRATION_CATALOG.flatMap((entry) => {
         const setup = integrationSetup(integrationSlug(entry.name));
-        return {
-          ...entry,
-          tier: '',
-          featured: false,
-          // Only entries with a real setup block claim capabilities; the rest
-          // are external links to the provider.
-          capabilities: (setup?.capabilities ?? []).map(
-            (capability) => `integrationCatalog.capability.${capability}`,
-          ),
-          worksWith: Boolean(setup),
-        };
+        if (!setup) return [];
+        return [
+          {
+            ...entry,
+            capabilities: setup.capabilities.map(
+              (capability) => `integrationCatalog.capability.${capability}`,
+            ),
+          },
+        ];
       }),
-    ],
     [],
+  );
+  const categories = useMemo(
+    () => INTEGRATION_CATEGORIES.filter((id) => entries.some((entry) => entry.category === id)),
+    [entries],
   );
   const filtered = entries.filter((entry) => {
     const haystack =
@@ -65,46 +55,6 @@ export function IntegrationsPage() {
       </WorkspaceHeader>
       <main className="integrations-content">
         <div className="integrations-container">
-          <header className="integrations-hero">
-            <span className="integrations-hero-icon">
-              <BlocksIcon aria-hidden="true" />
-            </span>
-            <div className="integrations-hero-copy">
-              <div className="integrations-hero-title-row">
-                <h2>{t('integrationCatalog.title')}</h2>
-                <p>{t('integrationCatalog.description')}</p>
-              </div>
-              <p className="integrations-hero-notice">{t('directoryExamples.notice')}</p>
-            </div>
-          </header>
-
-          {SPONSORS.length > 0 && (
-            <section aria-labelledby="featured-integrations" className="integrations-featured">
-              <div className="integrations-section-heading">
-                <h3 id="featured-integrations">
-                  <SparklesIcon aria-hidden="true" />
-                  {t('integrationCatalog.featured')}
-                </h3>
-                <span>{SPONSORS.length}</span>
-              </div>
-              <div className="integrations-featured-grid">
-                {SPONSORS.map((sponsor) => (
-                  <button
-                    type="button"
-                    key={integrationSlug(sponsor.name)}
-                    onClick={() => openIntegration(sponsor.name)}
-                    className="integration-featured-card"
-                  >
-                    <img src={sponsor.logoUrl} alt="" loading="lazy" />
-                    <strong>{sponsor.name}</strong>
-                    <span>{t('integrationCatalog.featured')}</span>
-                    <ChevronRightIcon aria-hidden="true" />
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-
           <div className="integrations-toolbar">
             <label className="integrations-search">
               <SearchIcon aria-hidden="true" />
@@ -127,7 +77,7 @@ export function IntegrationsPage() {
               >
                 {t('integrationCatalog.category.all')}
               </button>
-              {INTEGRATION_CATEGORIES.map((id) => (
+              {categories.map((id) => (
                 <button
                   type="button"
                   key={id}
@@ -144,7 +94,7 @@ export function IntegrationsPage() {
             {filtered.map((entry) => (
               <button
                 type="button"
-                key={`${entry.featured ? 'sponsor' : 'catalog'}:${integrationSlug(entry.name)}`}
+                key={integrationSlug(entry.name)}
                 onClick={() => openIntegration(entry.name)}
                 className="integration-card"
               >
@@ -154,23 +104,14 @@ export function IntegrationsPage() {
                 </div>
                 <div className="integration-card-title">
                   <h3>{entry.name}</h3>
-                  <span
-                    className={
-                      entry.featured
-                        ? 'integration-badge integration-badge--featured'
-                        : entry.worksWith
-                          ? 'integration-badge integration-badge--works'
-                          : 'integration-badge'
-                    }
-                  >
-                    {t(
-                      entry.featured
-                        ? 'integrationCatalog.featured'
-                        : entry.worksWith
-                          ? 'integrationCatalog.worksWith'
-                          : 'integrationCatalog.externalLink',
-                    )}
+                  <span className="integration-badge integration-badge--works">
+                    {t('integrationCatalog.worksWith')}
                   </span>
+                  {entry.featured && (
+                    <span className="integration-badge integration-badge--featured">
+                      {t('integrationCatalog.featured')}
+                    </span>
+                  )}
                 </div>
                 {entry.capabilities.length > 0 && (
                   <p className="integration-card-capabilities">

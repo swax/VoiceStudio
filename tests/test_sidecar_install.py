@@ -624,62 +624,104 @@ def test_weights_step_downloads_via_endpoint_autoselect(monkeypatch):
     assert si._weights_present(spec)
 
 
-def test_weights_download_sends_the_bearer_string_not_the_token_record(monkeypatch):
-    """#2163: `token_resolver.resolve()` returns a ResolvedToken record, but
-    snapshot_download takes `token: str | None` and silently ignores a non-str
-    — falling back to huggingface_hub's own ambient token discovery. So gated
-    engine weights 401 for a user whose token lives in VoiceStudio's Settings
-    rather than HF's cache. Every other weights test here stubs resolve() to
-    None, which is exactly why this went unnoticed."""
+@pytest.mark.parametrize("first,second", [
+    ("https://hf-mirror.com", None),
+    (None, "https://hf-mirror.com"),
+])
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_weights_download_retries_once_on_changed_endpoint(monkeypatch, first, second, retry_fails):
+    import huggingface_hub
+    from services import endpoint_race
     from services.token_resolver import ResolvedToken
 
-    spec = _mk_spec(weights_repo_id="Example/Gated")
-    seen = {}
+    spec = _mk_spec(weights_repo_id="Example/Weights", weights_revision="fixed-revision",
+                    weights_allow_patterns=("config.yaml", "model.safetensors"))
+    endpoints = iter([first, second])
+    calls, failures = [], []
+    monkeypatch.setattr(endpoint_race, "effective_endpoint", lambda: next(endpoints))
+    monkeypatch.setattr(endpoint_race, "reselect_after_failure", lambda repo, reason: failures.append((repo, reason)) or True)
+    monkeypatch.setattr("services.token_resolver.resolve", lambda: ResolvedToken(token="hf_test_secret", source="app", username="test"))
+    def download(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 or retry_fails:
+            raise RuntimeError("Connection reset by peer")
+        _write_weights(Path(kwargs["local_dir"]), complete=False)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    if retry_fails:
+        with pytest.raises(si._StepError, match="Model weight download failed"):
+            si._step_fetch_weights(spec, si._new_job(spec.engine_id))
+    else:
+        si._step_fetch_weights(spec, si._new_job(spec.engine_id))
+    assert len(calls) == 2
+    assert failures == [(spec.weights_repo_id, "Connection reset by peer")]
+    assert calls[0].get("endpoint") == first
+    assert calls[1].get("endpoint") == second
+    for call, endpoint in zip(calls, [first, second]):
+        assert call["token"] == (False if endpoint else "hf_test_secret")
+        assert call["revision"] == "fixed-revision"
+        assert call["allow_patterns"] == ["config.yaml", "model.safetensors"]
+    assert si._weights_present(spec) is not retry_fails
 
-    def fake_snapshot_download(**kwargs):
-        seen.update(kwargs)
-        Path(kwargs["local_dir"]).mkdir(parents=True, exist_ok=True)
-        (Path(kwargs["local_dir"]) / "config.yaml").write_text("ok\n")
-        (Path(kwargs["local_dir"]) / "w.safetensors").write_bytes(b"\0" * (6 * 1024 * 1024))
 
+def test_weights_download_stops_when_endpoint_does_not_change(monkeypatch):
     import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
-    monkeypatch.setattr("services.endpoint_race.effective_endpoint", lambda: None)
-    monkeypatch.setattr(
-        "services.token_resolver.resolve",
-        lambda: ResolvedToken(token="hf_gatedsecret", source="app", username="tester"),
-    )
-
-    job = si._new_job(spec.engine_id)
-    si._job_step(job, "fetch_weights")["state"] = "running"
-    si._step_fetch_weights(spec, job)
-
-    assert seen["token"] == "hf_gatedsecret"
-    assert isinstance(seen["token"], str)
-
-
-def test_weights_download_sends_no_token_when_none_resolves(monkeypatch):
-    # The other half of the contract: no token anywhere must reach
-    # snapshot_download as a real None, never the string "None".
-    spec = _mk_spec(weights_repo_id="Example/Open")
-    seen = {}
-
-    def fake_snapshot_download(**kwargs):
-        seen.update(kwargs)
-        Path(kwargs["local_dir"]).mkdir(parents=True, exist_ok=True)
-        (Path(kwargs["local_dir"]) / "config.yaml").write_text("ok\n")
-        (Path(kwargs["local_dir"]) / "w.safetensors").write_bytes(b"\0" * (6 * 1024 * 1024))
-
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
-    monkeypatch.setattr("services.endpoint_race.effective_endpoint", lambda: None)
+    from services import endpoint_race
+    spec = _mk_spec(weights_repo_id="Example/Weights")
+    calls = []
+    def download(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("Connection reset by peer")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(endpoint_race, "reselect_after_failure", lambda *a: False)
     monkeypatch.setattr("services.token_resolver.resolve", lambda: None)
+    with pytest.raises(si._StepError, match="Model weight download failed"):
+        si._step_fetch_weights(spec, si._new_job(spec.engine_id))
+    assert len(calls) == 1
+    assert not si._weights_present(spec)
 
+
+class _DownloadRecorder:
+    """Stand-in for snapshot_download that remembers the kwargs it was given."""
+
+    def __init__(self):
+        self.received = None
+
+    def __call__(self, **kwargs):
+        self.received = kwargs
+        target = Path(kwargs["local_dir"])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "config.yaml").write_text("ok\n")
+        (target / "model.safetensors").write_bytes(bytes(6 * 1024 * 1024))
+
+
+def _fetch_weights_with_resolver(monkeypatch, resolver_result):
+    import huggingface_hub
+    from services import endpoint_race
+
+    recorder = _DownloadRecorder()
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", recorder)
+    monkeypatch.setattr(endpoint_race, "effective_endpoint", lambda: None)
+    monkeypatch.setattr("services.token_resolver.resolve", lambda: resolver_result)
+    spec = _mk_spec(weights_repo_id="Example/Weights")
     job = si._new_job(spec.engine_id)
     si._job_step(job, "fetch_weights")["state"] = "running"
     si._step_fetch_weights(spec, job)
+    return recorder.received
 
-    assert seen["token"] is None
+
+def test_fetch_weights_unwraps_resolved_token_record(monkeypatch):
+    from services.token_resolver import ResolvedToken
+
+    secret = "hf_zq81-sidecar-test-value"
+    got = _fetch_weights_with_resolver(
+        monkeypatch, ResolvedToken(token=secret, source="app", username="sam"))
+    assert type(got["token"]) is str
+    assert got["token"] == secret
+
+
+def test_fetch_weights_forwards_none_when_nothing_resolves(monkeypatch):
+    got = _fetch_weights_with_resolver(monkeypatch, None)
+    assert got.get("token", "missing") is None
 
 
 def test_weights_revision_is_pinned_and_old_marker_forces_upgrade(monkeypatch):
@@ -1078,7 +1120,8 @@ def test_uninstalling_one_engine_leaves_every_other_engine_intact(monkeypatch):
 @pytest.mark.parametrize(
     ("engine_id", "venv_args", "install_args", "env_var"),
     [
-        ("moss-tts-v15", ["--python", "3.11"], ["-e", "{c}[torch-runtime]"],
+        ("moss-tts-v15", ["--python", "3.11"],
+         ["-e", "{c}[torch-runtime]", "torchcodec===0.8.1"],
          "OMNIVOICE_MOSS_TTS_V15_DIR"),
         ("confucius4-tts", ["--python", "3.10"], ["-r", "{c}/requirements.txt"],
          "OMNIVOICE_CONFUCIUS4_TTS_DIR"),
@@ -1095,6 +1138,7 @@ def test_uninstalling_one_engine_leaves_every_other_engine_intact(monkeypatch):
     ],
 )
 def test_new_specs_install_recipe(monkeypatch, engine_id, venv_args, install_args, env_var):
+    """Engine recipes install into their own venv and expose the correct env var."""
     spec = si.get_spec(engine_id)
     # The env var must be the one the engine's own bootstrap reads, or the
     # install lands in a directory the engine never looks at.
@@ -1413,6 +1457,7 @@ def test_torch_pins_follow_the_host(monkeypatch, family, platform, suffix, index
     assert spec.torch_pins
     argvs = _capture_install_argvs(monkeypatch, family=family)
     monkeypatch.setattr(si.sys, "platform", platform)
+    monkeypatch.setattr(si, "_host_machine", lambda: "x86_64")
 
     si._step_install_deps(spec, si._new_job("voxcpm2"))
 
@@ -1424,6 +1469,223 @@ def test_torch_pins_follow_the_host(monkeypatch, family, platform, suffix, index
         assert pip[pip.index("--extra-index-url") + 1] == index
     else:
         assert "--extra-index-url" not in pip
+
+
+_TORCH_PINNED_SPECS = sorted(s for s in si.SPECS if si.SPECS[s].torch_pins)
+
+
+@pytest.mark.parametrize("engine_id", _TORCH_PINNED_SPECS)
+@pytest.mark.parametrize(
+    ("family", "suffix", "index"),
+    [
+        ("cuda", "+cu128", "https://download.pytorch.org/whl/cu128"),
+        ("cpu", "+cpu", "https://download.pytorch.org/whl/cpu"),
+    ],
+)
+@pytest.mark.parametrize("machine", ["aarch64", "arm64"])
+def test_linux_arm64_forces_only_torch_to_a_local_build(
+    monkeypatch, engine_id, family, suffix, index, machine
+):
+    """PyTorch's cu128 and CPU indexes ship aarch64 torchaudio 2.7.0 without a
+    local label, so the forced ``torchaudio==2.7.0+cu128`` / ``+cpu`` pin made
+    CosyVoice's install unresolvable on Linux ARM64 (NVIDIA or CPU-only). Only
+    torch takes the local build there; companions take the labelled build
+    where it exists, else the plain wheel."""
+    spec = si.get_spec(engine_id)
+    argvs = _capture_install_argvs(monkeypatch, family=family)
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    monkeypatch.setattr(si, "_host_machine", lambda: machine)
+
+    si._step_install_deps(spec, si._new_job(engine_id))
+
+    pip = next(a for a in argvs if a[1:3] == ["pip", "install"])
+    for pin in spec.torch_pins:
+        if pin.startswith("torch=="):
+            assert f"{pin}{suffix}" in pip
+        else:
+            assert pin in pip
+            assert f"{pin}{suffix}" not in pip
+    assert pip.count("--extra-index-url") == 1
+    assert pip[pip.index("--extra-index-url") + 1] == index
+
+
+# ── ROCm hosts take a ROCm torch, not the upstream's CUDA build (#2371) ────
+
+
+def _capture_rocm_install(monkeypatch, family, variant=None):
+    """Run indextts2's dependency step and return its `uv pip install` argv."""
+    from core.torch_indexes import PYTORCH_ROCM_INDEX_URL
+
+    if variant is None:
+        monkeypatch.delenv("OMNIVOICE_TORCH_VARIANT", raising=False)
+    else:
+        monkeypatch.setenv("OMNIVOICE_TORCH_VARIANT", variant)
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    argvs = _capture_install_argvs(monkeypatch, family=family)
+    spec = si.get_spec("indextts2")
+    si._step_install_deps(spec, si._new_job("indextts2"))
+    pip = next(a for a in argvs if a[1:3] == ["pip", "install"])
+    return pip, PYTORCH_ROCM_INDEX_URL
+
+
+def test_rocm_host_installs_rocm_torch_for_indextts2(monkeypatch):
+    """Fail-before/pass-after for #2371: the step used to run a bare
+    `uv pip install -e <checkout>`, so upstream's `[tool.uv.sources]` routed
+    torch to the cu128 index — a wheel that cannot see an AMD GPU, leaving
+    the whole sidecar on CPU (~17x slower on the reporter's RX 6800 XT)."""
+    from core.torch_indexes import PYTORCH_CU128_INDEX_URL
+
+    pip, rocm_index = _capture_rocm_install(monkeypatch, family="rocm")
+    # Upstream's cu128 tool.uv.sources must be ignored for torch to resolve.
+    assert "--no-sources" in pip
+    assert "torch==2.8.0+rocm6.4" in pip
+    assert "torchaudio==2.8.0+rocm6.4" in pip
+    i = pip.index("--extra-index-url")
+    assert pip[i + 1] == rocm_index
+    assert PYTORCH_CU128_INDEX_URL not in pip
+
+
+def test_rocm_variant_env_opts_in_before_the_family_probe_reports_rocm(monkeypatch):
+    """`OMNIVOICE_TORCH_VARIANT=rocm` is the documented opt-in; it can be set
+    while the main venv swap has not landed yet (family still cpu)."""
+    pip, _ = _capture_rocm_install(monkeypatch, family="cpu", variant=" ROCm ")
+    assert "--no-sources" in pip
+    assert "torch==2.8.0+rocm6.4" in pip
+
+
+def test_rocm_torch_never_leaks_to_other_hosts(monkeypatch):
+    """A CUDA host still resolves torch through upstream's own cu128 sources,
+    and a CPU host keeps its existing install — ROCm args are ROCm-only."""
+    from core.torch_indexes import PYTORCH_ROCM_INDEX_URL
+
+    for family in ("cuda", "cpu"):
+        pip, _ = _capture_rocm_install(monkeypatch, family=family)
+        assert "--no-sources" not in pip
+        assert PYTORCH_ROCM_INDEX_URL not in pip
+        assert not any(a.startswith("torch==2.8.0+") for a in pip)
+
+
+def test_rocm_args_never_reach_engines_that_did_not_opt_in(monkeypatch):
+    """voxcpm2 pins its own torch pair and follows the host (+cpu on ROCm,
+    per test_torch_pins_follow_the_host); opting indextts2 in must not
+    change any other spec's install."""
+    from core.torch_indexes import PYTORCH_ROCM_INDEX_URL
+
+    monkeypatch.delenv("OMNIVOICE_TORCH_VARIANT", raising=False)
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    argvs = _capture_install_argvs(monkeypatch, family="rocm")
+    for engine_id in _ALL_SPEC_IDS:
+        if engine_id == "indextts2":
+            continue
+        spec = si.get_spec(engine_id)
+        if spec.uses_rocm_index:
+            continue
+        argvs.clear()
+        si._step_install_deps(spec, si._new_job(engine_id))
+        pip = next(a for a in argvs if a[1:3] == ["pip", "install"])
+        assert "--no-sources" not in pip, engine_id
+        assert PYTORCH_ROCM_INDEX_URL not in pip, engine_id
+
+
+def test_rocm_index_env_is_the_index_uv_resolves_against(monkeypatch):
+    """Fail-before/pass-after: `OMNIVOICE_TORCH_INDEX` derived the pin tag
+    but the index appended to uv stayed the hard-coded public one — a
+    mirror's pins looked up on someone else's server, bypassing the mirror
+    a restricted network depends on."""
+    mirror = "https://mirror.example.com/pytorch/rocm6.4"
+    monkeypatch.setenv("OMNIVOICE_TORCH_INDEX", mirror)
+    pip, public = _capture_rocm_install(monkeypatch, family="rocm")
+    assert "--no-sources" in pip
+    assert "torch==2.8.0+rocm6.4" in pip  # tag still from the mirror's tail
+    assert mirror in pip
+    assert public not in pip
+
+
+# ── A pre-#2371 managed install is offered the repair on a ROCm host ───────
+
+_CUDA_TORCH_VERSION_PY = (
+    "from typing import Optional\n"
+    "__version__ = '2.8.0+cu128'\n"
+    "cuda: Optional[str] = '12.8'\n"
+    "hip: Optional[str] = None\n"
+)
+_ROCM_TORCH_VERSION_PY = (
+    "from typing import Optional\n"
+    "__version__ = '2.8.0+rocm6.4'\n"
+    "cuda: Optional[str] = None\n"
+    "hip: Optional[str] = '6.4.43482'\n"
+)
+
+
+def _mk_complete_indextts2_install(monkeypatch, torch_version_py: str):
+    """A COMPLETE managed indextts2 install whose venv's torch `version.py`
+    says which build it carries."""
+    monkeypatch.delenv("OMNIVOICE_INDEXTTS_DIR", raising=False)
+    monkeypatch.delenv("OMNIVOICE_TORCH_VARIANT", raising=False)
+    spec = si.get_spec("indextts2")
+    checkout = si.managed_checkout(spec)
+    (checkout / "indextts").mkdir(parents=True, exist_ok=True)
+    (checkout / "pyproject.toml").write_text("[project]\nname='index-tts'\n")
+    (checkout / spec.source_required_path).write_text("# fake infer\n")
+    si._write_source_marker(spec, checkout)
+    py = si._venv_python(checkout / ".venv")
+    py.parent.mkdir(parents=True)
+    py.write_text("#!fake\n")
+    _write_weights(
+        checkout / spec.weights_subdir,
+        complete=True,
+        repo_id=spec.weights_repo_id,
+        revision=spec.weights_revision,
+        config_name=spec.weights_config_names[0],
+    )
+    torch_dir = checkout / ".venv" / "lib" / "python3.11" / "site-packages" / "torch"
+    torch_dir.mkdir(parents=True)
+    (torch_dir / "version.py").write_text(torch_version_py)
+    return spec
+
+
+def test_rocm_host_offers_the_repair_when_the_venv_still_has_cuda_torch(monkeypatch):
+    """Fail-before/pass-after for the existing-install half of #2371: by the
+    marker rules this install is COMPLETE, so inventory reported installed
+    and start_install short-circuited with already_installed — the user
+    updates the app and the sidecar still runs on CPU while routing reports
+    acceleration."""
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    spec = _mk_complete_indextts2_install(monkeypatch, _CUDA_TORCH_VERSION_PY)
+    monkeypatch.setattr(si, "_host_family", lambda: "rocm")
+    assert si._rocm_index_url() is not None  # the gate's condition is live
+    assert si._healthy(spec) is False        # fail-before: True (marker-less)
+
+
+def test_rocm_host_keeps_a_rocm_torch_install_healthy(monkeypatch):
+    """The repair offer must not loop: once the deps step has swapped in the
+    ROCm build, the same install reads healthy again."""
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    spec = _mk_complete_indextts2_install(monkeypatch, _ROCM_TORCH_VERSION_PY)
+    monkeypatch.setattr(si, "_host_family", lambda: "rocm")
+    assert si._healthy(spec) is True
+
+
+def test_non_rocm_hosts_keep_installed_means_installed(monkeypatch):
+    """The gate changes nothing where the recipe did not change: CUDA and
+    CPU hosts (and the rocm opt-in turned off) keep the old verdict."""
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    spec = _mk_complete_indextts2_install(monkeypatch, _CUDA_TORCH_VERSION_PY)
+    for family in ("cuda", "cpu"):
+        monkeypatch.setattr(si, "_host_family", lambda f=family: f)
+        assert si._healthy(spec) is True
+    # A rocm-family host with the opt-in machinery unable to select rocm
+    # (probe failure degrades _host_family to "cpu" upstream) is covered by
+    # the "cpu" case above; non-Linux never takes the rocm index at all.
+    monkeypatch.setattr(si.sys, "platform", "win32")
+    # Windows-layout interpreter now that _venv_python asks for one:
+    checkout = si.managed_checkout(spec)
+    win_py = si._venv_python(checkout / ".venv")
+    win_py.parent.mkdir(parents=True, exist_ok=True)
+    win_py.write_text("#!fake\n")
+    monkeypatch.setattr(si, "_host_family", lambda: "rocm")
+    assert si._rocm_index_url() is None
+    assert si._healthy(spec) is True
 
 
 # ── Submodule trees, partial weights, and optional post-install data ──────
@@ -1707,8 +1969,9 @@ def test_unspecified_compatibility_does_not_rebuild_working_venv(monkeypatch, ve
     assert si._existing_venv_compatible(spec, Path("existing-python"))
 
 
-@pytest.mark.parametrize('engine', ['cosyvoice', 'moss-tts-nano'])
+@pytest.mark.parametrize('engine', ['cosyvoice', 'moss-tts-nano', 'moss-tts-v15'])
 def test_runtime_rejects_old_managed_recipe_but_preserves_external_installs(monkeypatch, tmp_path, engine):
+    """Recipe upgrades invalidate managed markers while preserving external venvs."""
     spec = si.SPECS[engine]
     checkout = si.managed_checkout(spec)
     py = si._venv_python(checkout / '.venv')
@@ -1728,3 +1991,117 @@ def test_runtime_rejects_old_managed_recipe_but_preserves_external_installs(monk
     (external / si._INSTALL_COMPLETE_MARKER).write_text('external-version\n')
     monkeypatch.setenv(spec.env_var, str(external))
     assert si.engine_venv_python(spec.env_var) == external_py
+
+
+def test_moss_decoder_recipe_upgrade_preserves_venv_and_cached_weights(monkeypatch, tmp_path):
+    """An old managed MOSS install resumes dependencies instead of skipping repair."""
+    spec = si.SPECS['moss-tts-v15']
+    checkout = si.managed_checkout(spec)
+    py = si._venv_python(checkout / '.venv')
+    py.parent.mkdir(parents=True)
+    py.write_text('#!existing-python\n')
+    marker = checkout / si._INSTALL_COMPLETE_MARKER
+    marker.write_text(spec.probe_module + '\n')
+    weights = tmp_path / 'hf-cache' / 'model.safetensors'
+    weights.parent.mkdir()
+    weights.write_bytes(b'existing weights')
+    monkeypatch.setattr(si, '_source_present', lambda *args: True)
+    monkeypatch.setattr(si, '_existing_venv_compatible', lambda *args: True)
+    monkeypatch.setattr(si, '_locate_uv', lambda: '/fake/uv')
+    monkeypatch.setattr(si, '_host_family', lambda: 'cuda')
+    commands = []
+    monkeypatch.setattr(si, '_run_logged', lambda job, argv, **kw: commands.append(argv) or 0)
+    monkeypatch.setattr(si.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
+
+    assert not si._healthy(spec)
+    job = si._new_job(spec.engine_id)
+    si._step_create_venv(spec, job)
+    si._step_install_deps(spec, job)
+    assert not marker.exists()
+    si._step_verify(spec, job)
+
+    assert len(commands) == 1
+    assert commands[0][1:3] == ['pip', 'install']
+    assert commands[0][3:5] == ['--python', str(py)]
+    assert 'torchcodec===0.8.1' in commands[0]
+    assert py.read_text() == '#!existing-python\n'
+    assert weights.read_bytes() == b'existing weights'
+    assert si._healthy(spec)
+    assert si._install_marker_valid(spec, checkout)
+
+
+def test_corrupt_non_utf8_markers_read_as_absent_not_crash(monkeypatch):
+    """#2634: a marker with undecodable bytes must mean 'not installed', not raise."""
+    spec = _mk_spec(source_revision="rev", weights_repo_id="Example/Weights")
+    checkout = si.managed_checkout(spec)
+    checkout.mkdir(parents=True, exist_ok=True)
+    (checkout / "pyproject.toml").write_text("[project]\nname='fake'\n")
+    (checkout / si._SOURCE_REVISION_MARKER).write_bytes(b"\xff\xfe\x80rev")
+    assert si._source_present(spec, checkout) is False
+
+    wdir = checkout / spec.weights_subdir
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / si._WEIGHTS_COMPLETE_MARKER).write_bytes(b"\xff\xfe\x80")
+    assert si._weights_present(spec) is False
+
+    extra_dir = checkout / "extra"
+    extra_dir.mkdir()
+    (extra_dir / "needed.txt").write_text("x")
+    (extra_dir / si._SOURCE_REVISION_MARKER).write_bytes(b"\xff\xfe\x80")
+    extra = si.ExtraSource("extra", "rev", "https://example.invalid/x.tar.gz", "needed.txt")
+    assert si._extra_source_present(extra, extra_dir) is False
+
+
+def test_engines_dir_env_relocates_managed_roots(monkeypatch, tmp_path):
+    """#2683: OMNIVOICE_ENGINES_DIR moves engine venvs off the data drive."""
+    spec = next(iter(si.SPECS.values()))
+    default_root = si.managed_root(spec)
+    assert default_root == Path(si.DATA_DIR) / "engines" / spec.engine_id
+    elsewhere = tmp_path / "bigdrive"
+    monkeypatch.setenv("OMNIVOICE_ENGINES_DIR", str(elsewhere))
+    assert si.managed_root(spec) == elsewhere / spec.engine_id
+
+
+# ── missing C++ compiler (#3423) ───────────────────────────────────────────
+# CosyVoice builds PyWORLD from source; without build tools the install used
+# to fail with only "a network hiccup, re-run", which never helps.
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "error: Microsoft Visual C++ 14.0 or greater is required. Get it with "
+        "\"Microsoft C++ Build Tools\"",
+        "xcrun: error: invalid active developer path (/Library/Developer/CommandLineTools)",
+        "error: command 'c++' failed: No such file or directory",
+    ],
+)
+def test_missing_compiler_names_the_build_tools(monkeypatch, line):
+    from collections import deque
+
+    spec = si.get_spec("cosyvoice")
+    monkeypatch.setattr(si, "_locate_uv", lambda: "/fake/uv")
+    monkeypatch.setattr(si, "_host_family", lambda: "cpu")
+
+    def failing_run(job, argv, timeout=None, env=None):
+        job["_last_run_output"] = deque(["Building pyworld", line])
+        return 1
+
+    monkeypatch.setattr(si, "_run_logged", failing_run)
+    with pytest.raises(si._StepError) as err:
+        si._step_install_deps(spec, si._new_job("cosyvoice"))
+    assert "no C++ compiler" in str(err.value)
+    assert "compiler was found" in err.value.remediation
+    assert "network hiccup" not in err.value.remediation
+
+
+def test_missing_compiler_remediation_per_platform():
+    assert "Build Tools" in si._missing_compiler_remediation("win32")
+    assert "xcode-select --install" in si._missing_compiler_remediation("darwin")
+    assert "build-essential" in si._missing_compiler_remediation("linux")
+    assert not si._output_shows_missing_compiler(["connection reset by peer"])
+    # An installed compiler that fails to build is a build error, not a
+    # missing toolchain.
+    assert not si._output_shows_missing_compiler([
+        "pyworld.cpp(12): error C2065: 'foo': undeclared identifier",
+        "error: command 'C:\\BuildTools\\VC\\bin\\cl.exe' failed with exit code 2",
+    ])

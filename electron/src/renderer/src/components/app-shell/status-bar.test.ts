@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import type { EnginesResponse } from '@/lib/api/types';
 import { engineFamilyState } from '@/hooks/use-engines';
-import { resolveRemoteRuntime, resolveRuntimeHealth } from './status-runtime';
+import { isResidentAsrModel, resolveRuntimeHealth, sidebarToolState } from './status-runtime';
+
+describe('plain-language tool status', () => {
+  it('never reports cached readiness when the backend is offline', () => {
+    for (const state of ['engineRuntime.ready', 'engineRuntime.idle', 'engineRuntime.working']) {
+      expect(sidebarToolState(state, false)).toBe('modelMaintenance.offline');
+    }
+  });
+
+  it('distinguishes loading on use from setup problems without relying on color', () => {
+    expect(sidebarToolState('engineRuntime.idle', true)).toBe('modelSettings.available');
+    expect(sidebarToolState('modelSettings.unavailable', true)).toBe('sidebarTools.checkSetup');
+    expect(sidebarToolState('engineRuntime.working', true)).toBe('engineRuntime.working');
+    expect(sidebarToolState('engineSidebar.inactive', true)).toBe('engineSidebar.inactive');
+  });
+});
 
 const engines = (available = true): EnginesResponse => ({
   tts: {
@@ -61,58 +76,13 @@ describe('sidebar runtime health', () => {
       ),
     ).toBe('unavailable');
   });
+});
 
-  it("uses the selected remote worker's actual model readiness", () => {
-    const runtime = {
-      target: 'worker-1',
-      remote: true,
-      label: 'Studio GPU',
-      reason: 'chosen',
-      models: [
-        {
-          engine: 'omnivoice',
-          model_id: 'omnivoice:default',
-          supported: true,
-          installed: true,
-          downloaded: true,
-          resident: false,
-        },
-      ],
-    };
-
-    expect(resolveRemoteRuntime(runtime, false, false, false).state).toBe('idle');
-    expect(
-      resolveRemoteRuntime(
-        { ...runtime, models: [{ ...runtime.models[0], resident: true }] },
-        false,
-        false,
-        false,
-      ).state,
-    ).toBe('ready');
-    expect(resolveRemoteRuntime(runtime, false, false, true).state).toBe('working');
-  });
-
-  it('never calls an absent or undownloaded remote model ready', () => {
-    const runtime = {
-      target: 'worker-1',
-      remote: true,
-      label: 'Studio GPU',
-      reason: 'chosen',
-      models: [
-        {
-          engine: 'omnivoice',
-          model_id: 'omnivoice:default',
-          supported: true,
-          installed: true,
-          downloaded: false,
-          resident: true,
-        },
-      ],
-    };
-
-    expect(resolveRemoteRuntime(runtime, false, false, false).state).toBe('unavailable');
-    expect(resolveRemoteRuntime({ ...runtime, models: [] }, false, false, false).state).toBe(
-      'unavailable',
-    );
+describe('resident speech-to-text rows', () => {
+  it('counts the warm transcription model alongside dictation', () => {
+    expect(isResidentAsrModel('transcription-asr')).toBe(true);
+    expect(isResidentAsrModel('capture-asr')).toBe(true);
+    expect(isResidentAsrModel('asr')).toBe(true);
+    expect(isResidentAsrModel('diarization')).toBe(false);
   });
 });

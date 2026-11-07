@@ -20,19 +20,9 @@ import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { getBridge } from '@/components/bridge';
 import {
   getIntegrationBySlug,
-  integrationSlug,
   type IntegrationCatalogEntry,
 } from '@shared/config/integration-catalog';
-import { SPONSORS } from '@shared/config/sponsors';
 import './integrations-page.css';
-
-/** Catalog entries and featured sponsors both have an in-app page. */
-function findIntegration(slug: string): IntegrationCatalogEntry | undefined {
-  const entry = getIntegrationBySlug(slug);
-  const sponsor = SPONSORS.find((item) => integrationSlug(item.name) === slug);
-  if (sponsor) return { ...entry, ...sponsor, category: entry?.category ?? '', featured: true };
-  return entry;
-}
 
 function openExternal(url: string) {
   const bridge = getBridge();
@@ -157,8 +147,8 @@ export function IntegrationDetailPage() {
   const backend = useBackendStatus();
   const setup = integrationSetup(slug ?? '');
   const blocks = useMemo(() => setup?.blocks(backend.baseUrl) ?? null, [setup, backend.baseUrl]);
-  const entry = findIntegration(slug ?? '');
-  if (!entry) {
+  const entry = getIntegrationBySlug(slug ?? '');
+  if (!entry || !setup) {
     return (
       <div className="integrations-page">
         <WorkspaceHeader>
@@ -179,23 +169,15 @@ export function IntegrationDetailPage() {
   const capabilities = (
     <section className="integration-detail-panel" aria-labelledby="integration-capabilities">
       <h3 id="integration-capabilities">{t('integrationCatalog.capabilitiesTitle')}</h3>
-      {setup ? (
-        <>
-          <p className="integration-works-with">
-            <CircleCheckIcon aria-hidden="true" />
-            {t('integrationCatalog.worksWith')}
-          </p>
-          <div className="integration-capabilities">
-            {setup.capabilities.map((capability) => (
-              <span key={capability}>{t(`integrationCatalog.capability.${capability}`)}</span>
-            ))}
-          </div>
-        </>
-      ) : (
-        <p className="integration-detail-note">
-          {t(entry.featured ? 'integrationCatalog.featured' : 'directoryExamples.notice')}
-        </p>
-      )}
+      <p className="integration-works-with">
+        <CircleCheckIcon aria-hidden="true" />
+        {t('integrationCatalog.worksWith')}
+      </p>
+      <div className="integration-capabilities">
+        {setup.capabilities.map((capability) => (
+          <span key={capability}>{t(`integrationCatalog.capability.${capability}`)}</span>
+        ))}
+      </div>
     </section>
   );
   const website = (
@@ -228,7 +210,7 @@ export function IntegrationDetailPage() {
   let body: ReactNode;
   if (setup?.panel) {
     body = <setup.panel hero={hero} rail={rail} />;
-  } else if (setup) {
+  } else {
     body = (
       <>
         {hero({})}
@@ -255,13 +237,6 @@ export function IntegrationDetailPage() {
           }
           railBottom={rail}
         />
-      </>
-    );
-  } else {
-    body = (
-      <>
-        {hero({})}
-        <div className="integration-detail-grid">{rail}</div>
       </>
     );
   }

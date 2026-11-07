@@ -64,7 +64,7 @@ def test_get_prefs_defaults(client):
     assert r.status_code == 200
     body = r.json()
     assert body == {"enabled": True, "mode": "toggle",
-                    "model_id": "sherpa-whisper-tiny"}
+                    "model_id": "sherpa-whisper-tiny", "prompt": ""}
 
 
 def test_set_prefs_persists_and_validates(client):
@@ -73,17 +73,55 @@ def test_set_prefs_persists_and_validates(client):
     assert r.status_code == 200
     body = r.json()
     assert body == {"enabled": False, "mode": "hold",
-                    "model_id": "sherpa-whisper-tiny"}
+                    "model_id": "sherpa-whisper-tiny", "prompt": ""}
     # Persistence: a follow-up GET sees the written values (round-trips through
     # the store the handler actually used — robust to prefs-reference swaps).
     got = client.get("/dictation/prefs").json()
     assert got == {"enabled": False, "mode": "hold",
-                   "model_id": "sherpa-whisper-tiny"}
+                   "model_id": "sherpa-whisper-tiny", "prompt": ""}
 
     # Bad mode rejected.
     assert client.post("/dictation/prefs", json={"mode": "nope"}).status_code == 400
     # Bad model rejected.
     assert client.post("/dictation/prefs", json={"model_id": "nope"}).status_code == 400
+
+
+def _hint(client):
+    return client.get("/dictation/prefs").json()["prompt"]
+
+
+def test_hint_is_trimmed_kept_through_other_updates_and_blankable(client):
+    posted = client.post("/dictation/prefs", json={"prompt": "\tNakamura, PostgreSQL  "})
+    assert posted.json()["prompt"] == "Nakamura, PostgreSQL"
+    client.post("/dictation/prefs", json={"enabled": False})
+    assert _hint(client) == "Nakamura, PostgreSQL"
+    client.post("/dictation/prefs", json={"prompt": " \n "})
+    assert _hint(client) == ""
+
+
+@pytest.mark.parametrize(("extra", "status"), [(0, 200), (1, 400)])
+def test_hint_length_boundary(client, extra, status):
+    from api.routers import dictation as dr
+
+    client.post("/dictation/prefs", json={"prompt": "keep me"})
+    res = client.post("/dictation/prefs", json={"prompt": "x" * (dr.MAX_PROMPT_CHARS + extra)})
+    assert res.status_code == status
+    if status == 400:
+        assert str(dr.MAX_PROMPT_CHARS) in res.json()["detail"]
+        assert _hint(client) == "keep me"
+    else:
+        assert len(_hint(client)) == dr.MAX_PROMPT_CHARS
+
+
+def test_only_non_hint_updates_unload_the_capture_engine(client):
+    from services import asr_backend
+
+    marker = object()
+    for body, unloaded in (({"prompt": "terms"}, False), ({"mode": "hold"}, True)):
+        asr_backend._capture_backend = marker
+        assert client.post("/dictation/prefs", json=body).status_code == 200
+        assert (asr_backend._capture_backend is None) is unloaded
+    asr_backend._capture_backend = None
 
 
 def test_set_prefs_accepts_repo_id_and_normalizes(client):

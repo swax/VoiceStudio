@@ -16,7 +16,6 @@ const {
   streamGenerateSpeech,
   createStreamingChunkPlayer,
   supportsStreamingPreview,
-  resolveRemoteTtsTarget,
   decodePcm16Base64,
   pcm16BytesToFloat32,
   peaksFromChunkList,
@@ -29,8 +28,15 @@ const { getPlaybackTrack, stopActivePlayback, seekActivePlayback } =
 // ── Web Audio fakes ─────────────────────────────────────────────────────────
 
 class FakeGainParam {
-  setValueAtTime() {}
-  linearRampToValueAtTime() {}
+  constructor() {
+    this.automation = [];
+  }
+  setValueAtTime(value, time) {
+    this.automation.push(['hold', value, time]);
+  }
+  linearRampToValueAtTime(value, time) {
+    this.automation.push(['linear', value, time]);
+  }
 }
 class FakeGain {
   constructor() {
@@ -55,11 +61,18 @@ class FakeSource {
 }
 class FakeAudioContext {
   static instances = [];
-  constructor() {
+  static openedWith = [];
+  static unsupportedRate = null;
+  constructor(options) {
+    FakeAudioContext.openedWith.push(options ?? null);
+    if (options?.sampleRate === FakeAudioContext.unsupportedRate)
+      throw new Error('unsupported clock');
     this.currentTime = 0;
     this.state = 'running';
+    this.sampleRate = options?.sampleRate ?? 48000;
     this.destination = {};
     this.started = []; // every source that called start()
+    this.gainNodes = [];
     FakeAudioContext.instances.push(this);
   }
   resume() {
@@ -88,7 +101,9 @@ class FakeAudioContext {
     return new FakeSource(this);
   }
   createGain() {
-    return new FakeGain();
+    const gain = new FakeGain();
+    this.gainNodes.push(gain);
+    return gain;
   }
 }
 
@@ -142,6 +157,8 @@ const ndjsonResponse = (events, headers = {}) => {
 
 beforeEach(() => {
   FakeAudioContext.instances = [];
+  FakeAudioContext.openedWith = [];
+  FakeAudioContext.unsupportedRate = null;
   window.AudioContext = FakeAudioContext;
   apiFetch.mockReset();
 });
@@ -189,20 +206,15 @@ describe('pcm16BytesToFloat32', () => {
   });
 });
 
-describe('createStreamingChunkPlayer.appendPcm16Bytes', () => {
-  it('schedules raw /ws/tts frames on the same gapless timeline as base64 chunks', () => {
-    const player = createStreamingChunkPlayer({ label: 'live', sampleRate: 24000 });
-    const ctx = FakeAudioContext.instances.at(-1);
+it('places websocket bytes immediately after an encoded chunk', () => {
+  const transport = createStreamingChunkPlayer({ sampleRate: 24000 });
+  transport.appendPcm16Base64(chunkEvent(3).pcm);
+  transport.appendPcm16Bytes(new Int16Array(CHUNK_SAMPLES).buffer);
+  const starts = FakeAudioContext.instances[0].started.map((source) => source.startedAt.when);
 
-    const frame = new Int16Array(Array.from({ length: 2400 }, (_, i) => (i % 100) * 50));
-    player.appendPcm16Bytes(frame.buffer);
-    player.appendPcm16Bytes(frame.buffer);
-
-    expect(ctx.started.length).toBe(2);
-    // Second chunk starts exactly one chunk-duration later — gapless.
-    expect(ctx.started[1].startedAt.when).toBeCloseTo(2400 / 24000, 5);
-    player.fail();
-  });
+  expect(starts).toHaveLength(2);
+  expect(starts[1] - starts[0]).toBeCloseTo(CHUNK_SAMPLES / 24000, 5);
+  transport.fail();
 });
 
 describe('peaksFromChunkList', () => {
@@ -227,48 +239,6 @@ describe('supportsStreamingPreview', () => {
     delete window.webkitAudioContext;
     expect(supportsStreamingPreview()).toBe(false);
     window.AudioContext = saved;
-  });
-});
-
-// ── resolveRemoteTtsTarget ──────────────────────────────────────────────────
-//
-// The stream is rendered by THIS process, so a progressive preview on a
-// remote target would quietly run the job on this machine after the user
-// picked their 4090. This is the check that stops that, and it must fail
-// open: a picker that cannot be reached must never block a local render.
-
-describe('resolveRemoteTtsTarget', () => {
-  const json = (body, ok = true) => ({ ok, json: async () => body });
-
-  it('asks routing for the tts operation specifically', async () => {
-    apiFetch.mockResolvedValue(json({ active: { remote: false } }));
-    await resolveRemoteTtsTarget();
-    expect(apiFetch.mock.calls[0][0]).toBe('/workers/target?op=tts');
-    // A dead backend must fail this probe in one round trip, not stall the
-    // click behind the transport retry ladder.
-    expect(apiFetch.mock.calls[0][1]).toMatchObject({ retryTransport: false });
-  });
-
-  it('reports the worker when the resolved target is remote', async () => {
-    apiFetch.mockResolvedValue(
-      json({ active: { remote: true, worker_id: 'w1', label: 'desktop-4090' } }),
-    );
-    expect(await resolveRemoteTtsTarget()).toEqual({ workerId: 'w1', label: 'desktop-4090' });
-  });
-
-  it('answers local for a fallback decision, so streaming stays available', async () => {
-    apiFetch.mockResolvedValue(
-      json({ active: { remote: false, reason: 'desktop-4090 is offline — running locally' } }),
-    );
-    expect(await resolveRemoteTtsTarget()).toBeNull();
-  });
-
-  it('answers local when the endpoint errors or the backend is unreachable', async () => {
-    apiFetch.mockResolvedValue(json({ detail: 'nope' }, false));
-    expect(await resolveRemoteTtsTarget()).toBeNull();
-
-    apiFetch.mockRejectedValue(new Error('connection refused'));
-    expect(await resolveRemoteTtsTarget()).toBeNull();
   });
 });
 
@@ -523,6 +493,67 @@ describe('streamGenerateSpeech', () => {
 // ── createStreamingChunkPlayer transport ────────────────────────────────────
 
 describe('createStreamingChunkPlayer', () => {
+  it('falls back to the device clock after a requested rate is refused', () => {
+    FakeAudioContext.unsupportedRate = 24000;
+    const transport = createStreamingChunkPlayer({ sampleRate: 24000 });
+
+    expect(FakeAudioContext.instances).toHaveLength(1);
+    expect(FakeAudioContext.instances[0].sampleRate).toBe(48000);
+    expect(FakeAudioContext.openedWith).toEqual([{ sampleRate: 24000 }, null]);
+    transport.fail();
+  });
+
+  it('counts the lead-in from first data and waits for output drainage', () => {
+    vi.useFakeTimers();
+    try {
+      const completed = vi.fn();
+      const transport = createStreamingChunkPlayer({ sampleRate: 24000, onDone: completed });
+      const clock = FakeAudioContext.instances[0];
+      clock.currentTime = 4;
+      transport.appendPcm16Base64(chunkEvent(0).pcm);
+      transport.finalize();
+
+      expect(getPlaybackTrack().currentTime).toBe(0);
+      expect(clock.started[0].startedAt.when - clock.currentTime).toBeCloseTo(0.08, 5);
+      clock.currentTime = 4.22;
+      vi.advanceTimersByTime(250);
+      expect(completed).not.toHaveBeenCalled();
+      clock.currentTime = 4.24;
+      vi.advanceTimersByTime(250);
+      expect(completed).toHaveBeenLastCalledWith('ended');
+      expect(clock.started.some((source) => source.stopped)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses the surviving tail for a shortened blend after re-anchoring', () => {
+    const transport = createStreamingChunkPlayer({ sampleRate: 24000, crossfadeMs: 50 });
+    transport.appendPcm16Base64(chunkEvent(0).pcm);
+    const clock = FakeAudioContext.instances[0];
+    clock.currentTime = 0.15;
+    transport.appendPcm16Base64(chunkEvent(1).pcm);
+    const ramps = clock.gainNodes
+      .flatMap((node) => node.gain.automation)
+      .filter(([method]) => method === 'linear');
+
+    expect(ramps.map(([, target]) => target).sort()).toEqual([0, 1]);
+    expect(ramps[0][2] - 0.17).toBeCloseTo(0.01, 5);
+    transport.fail();
+  });
+
+  it('starts cleanly when late data arrives after the prior source', () => {
+    const transport = createStreamingChunkPlayer({ sampleRate: 24000, crossfadeMs: 50 });
+    transport.appendPcm16Base64(chunkEvent(0).pcm);
+    const clock = FakeAudioContext.instances[0];
+    clock.currentTime = 3;
+    transport.appendPcm16Base64(chunkEvent(1).pcm);
+
+    expect(clock.started).toHaveLength(2);
+    expect(clock.gainNodes.every((node) => node.gain.automation.length === 0)).toBe(true);
+    transport.fail();
+  });
+
   it('supports seek within the buffered region (reschedules from the target)', () => {
     const player = createStreamingChunkPlayer({
       label: 'x',

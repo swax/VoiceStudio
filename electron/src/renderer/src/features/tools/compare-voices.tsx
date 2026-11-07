@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { EngineNotice } from '@/components/engine-notice';
+import { DisabledReason, firstReason } from '@/components/disabled-reason';
 import { Input } from '@/components/ui/input';
 import { PipelineFailure } from '@/components/pipeline-failure';
 import { WaveformPlayer } from '@/components/waveform-player';
@@ -15,6 +16,7 @@ import { queryKeys } from '@/lib/query';
 import { describeError } from '@/lib/api/client';
 import { PRESETS } from '@shared/utils/constants';
 import { beginAppActivity } from '@/lib/app-activity';
+import { announceDroppedSpeech } from '@/lib/dropped-speech';
 import { useTtsReadiness } from '@/hooks/use-tts-readiness';
 
 export function CompareVoices() {
@@ -90,6 +92,10 @@ export function CompareVoices() {
           { signal: controller.signal },
         );
         if (controller.signal.aborted) break;
+        announceDroppedSpeech(
+          result.dropped,
+          t(side === 0 ? 'compare.voice_a' : 'compare.voice_b') + ' · ' + voice.name,
+        );
         const url = URL.createObjectURL(result.blob);
         setUrls((current) => current.map((old, index) => (index === side ? url : old)));
         void client.invalidateQueries({ queryKey: queryKeys.history });
@@ -107,14 +113,18 @@ export function CompareVoices() {
   return (
     <div className="mx-auto max-w-4xl space-y-5">
       <h2 className="text-lg font-semibold">{t('compare.title')}</h2>
-      <textarea
-        aria-label={t('compare.test_phrase')}
-        value={text}
-        disabled={busy}
-        onChange={(event) => setText(event.target.value)}
-        rows={4}
-        className="w-full resize-y rounded-lg border border-input bg-transparent p-3 text-sm leading-6 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      />
+      <label className="block space-y-2 text-sm">
+        <span className="block">{t('compare.test_phrase')}</span>
+        <textarea
+          dir="auto"
+          value={text}
+          disabled={busy}
+          placeholder={t('compare.test_phrase_placeholder')}
+          onChange={(event) => setText(event.target.value)}
+          rows={4}
+          className="w-full resize-y rounded-lg border border-input bg-transparent p-3 text-sm leading-6 outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        />
+      </label>
       <div className="grid grid-cols-2 gap-5 max-md:grid-cols-1">
         {[0, 1].map((side) => (
           <section key={side} className="min-w-0 space-y-3">
@@ -178,19 +188,32 @@ export function CompareVoices() {
           </section>
         ))}
       </div>
-      <Button
-        type="button"
-        disabled={busy || !text.trim() || selected.some((voice) => !voice) || ttsBlocker !== null}
-        onClick={() => void run()}
+      <DisabledReason
+        reason={firstReason([
+          [ttsBlocker === 'engine', t('engines.none_ready_title')],
+          [!text.trim(), t('disabledReason.text_required')],
+          [selected.some((voice) => !voice), t('disabledReason.voices_required')],
+        ])}
       >
-        {t(
-          busy
-            ? stage === 0
-              ? 'compare.generating_voice_a'
-              : 'compare.generating_voice_b'
-            : 'compare.compare_btn',
+        {(describedBy) => (
+          <Button
+            type="button"
+            disabled={
+              busy || !text.trim() || selected.some((voice) => !voice) || ttsBlocker !== null
+            }
+            aria-describedby={describedBy}
+            onClick={() => void run()}
+          >
+            {t(
+              busy
+                ? stage === 0
+                  ? 'compare.generating_voice_a'
+                  : 'compare.generating_voice_b'
+                : 'compare.compare_btn',
+            )}
+          </Button>
         )}
-      </Button>
+      </DisabledReason>
       {ttsBlocker === 'engine' && <EngineNotice operation="compare" compact />}
       {ttsBlocker === 'loading' && (
         <p role="status" className="text-sm text-muted-foreground">

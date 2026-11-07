@@ -38,11 +38,15 @@ def own_venv_python() -> "Path | None":
 
 class VoxCPM2SubprocessBackend(SubprocessBackend):
     """VoxCPM2 in a killable sidecar running the engine's own venv."""
+    supports_float_transport = True
+    supports_generation_seed = True
 
     id = "voxcpm2"
     display_name = "VoxCPM2 (30 langs, studio 48 kHz, voice design)"
     supports_voice_design = True
-    applies_own_mastering = True  # native 48 kHz studio output — skip apply_mastering()
+    # Controllable cloning: instruct becomes the "(control)text" prefix.
+    instruct_directs_delivery = True
+    applies_own_mastering = True  # Its finished 48 kHz output bypasses apply_mastering().
     gpu_compat = ("cuda", "mps", "cpu")
     _DEFAULT_SAMPLE_RATE = 48_000
     # Same reference handling as VoxCPM2Backend (prepare_voxcpm_reference caps
@@ -76,7 +80,8 @@ class VoxCPM2SubprocessBackend(SubprocessBackend):
     @property
     def recv_timeout_s(self) -> float:
         # A cold load downloads several GB of weights; the sidecar heartbeats
-        # progress frames meanwhile, and each one re-arms this deadline.
+        # progress frames meanwhile (also while generating, so a slow CPU render is
+        # not mistaken for a hang), and each one re-arms this deadline.
         try:
             v = float(os.environ.get("OMNIVOICE_VOXCPM2_RECV_TIMEOUT_S", "900"))
         except (TypeError, ValueError):

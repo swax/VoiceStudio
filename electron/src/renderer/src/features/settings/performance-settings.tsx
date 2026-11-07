@@ -6,6 +6,7 @@ import {
   Trash2Icon,
   ZapIcon,
 } from 'lucide-react';
+import { GpuAcceleration } from './gpu-acceleration';
 import { SystemPreflight } from './system-preflight';
 import { PerformanceProfile } from '@/components/performance-profile';
 import { familyIcons, modelFamilies } from './model-family';
@@ -18,8 +19,11 @@ import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { apiJson, describeError } from '@/lib/api/client';
 import { useAppActivities } from '@/lib/app-activity';
+import { relaxWhenBackendBusy } from '@/lib/status-polling';
 import { SettingsSection, SettingsRow } from './settings-layout';
 import { useSettingsAction } from './use-settings-action';
+// @ts-expect-error shared JSX component has no declaration file
+import SearchableSelect from '@shared/components/SearchableSelect';
 interface DeviceState {
   value: string;
   applied: string;
@@ -28,6 +32,13 @@ interface DeviceState {
   env_pinned: boolean;
   override_ignored: boolean;
   restart_required: boolean;
+}
+interface CudaDeviceState {
+  value: string;
+  applied: string;
+  env_pinned: boolean;
+  restart_required: boolean;
+  devices: Array<{ index: number; value: string; name: string }>;
 }
 interface SystemInfo {
   platform: string;
@@ -87,7 +98,7 @@ export function PerformanceSettings() {
   const hardware = useQuery({
     queryKey: ['sysinfo'],
     queryFn: ({ signal }) => apiJson<HardwareState>('/sysinfo', { signal }),
-    refetchInterval: 5000,
+    refetchInterval: () => relaxWhenBackendBusy(5000),
   });
   const gb = (value: number | undefined) =>
     value == null || !Number.isFinite(value) ? '-' : value.toFixed(2) + ' GB';
@@ -121,6 +132,7 @@ export function PerformanceSettings() {
         })}
       </SettingsSection>
       <ComputeDevice />
+      <GpuAcceleration />
       <CompileSetting />
       <MemoryManagement />
       <SettingsSection icon={CpuIcon} title={t('settings.generate_budget_title')}>
@@ -383,7 +395,60 @@ function MemoryManagement() {
           {t('header.unload_all_flush')}
         </Button>
       </SettingsRow>
+      <OffloadAfterGeneration />
     </SettingsSection>
+  );
+}
+interface OffloadState {
+  enabled: boolean;
+  env_pinned: boolean;
+  device: string;
+}
+// #2618: opt-in — move the in-process voice model to system RAM once
+// generation finishes, so a local LLM (or anything else) can use the VRAM.
+function OffloadAfterGeneration() {
+  const { t } = useTranslation();
+  const client = useQueryClient();
+  const action = useSettingsAction();
+  const query = useQuery({
+    queryKey: ['offload-after-generation'],
+    queryFn: ({ signal }) =>
+      apiJson<OffloadState>('/api/settings/perf/offload-after-generation', { signal }),
+  });
+  const state = query.data;
+  return (
+    <>
+      <SettingsRow
+        id="offload-after-generation"
+        title={t('settings.offload_after_generation')}
+        description={
+          state?.device === 'cpu'
+            ? t('settings.offload_after_generation_cpu')
+            : t('settings.offload_after_generation_note')
+        }
+      >
+        <Switch
+          aria-label={t('settings.offload_after_generation')}
+          checked={!!state?.enabled}
+          disabled={!state || action.busy || state.env_pinned}
+          onCheckedChange={(enabled) =>
+            void action.run(async () => {
+              const saved = await apiJson<OffloadState>(
+                '/api/settings/perf/offload-after-generation',
+                { method: 'PUT', body: JSON.stringify({ enabled }) },
+              );
+              client.setQueryData(['offload-after-generation'], saved);
+            })
+          }
+        />
+      </SettingsRow>
+      {state?.env_pinned && (
+        <p className="p-4 text-sm text-muted-foreground">
+          {t('settings.generate_timeout_shadowed_note')}
+        </p>
+      )}
+      {(action.error || query.isError) && <ErrorRow retry={() => void query.refetch()} />}
+    </>
   );
 }
 function ErrorRow({ retry }: { retry: () => void }) {
@@ -401,11 +466,17 @@ function ComputeDevice() {
   const { t } = useTranslation();
   const client = useQueryClient();
   const action = useSettingsAction();
+  const cudaAction = useSettingsAction();
   const query = useQuery({
     queryKey: ['compute-device'],
     queryFn: ({ signal }) => apiJson<DeviceState>('/api/settings/compute-device', { signal }),
   });
   const state = query.data;
+  const cudaQuery = useQuery({
+    queryKey: ['cuda-device'],
+    queryFn: ({ signal }) => apiJson<CudaDeviceState>('/api/settings/cuda-device', { signal }),
+  });
+  const cuda = cudaQuery.data;
   const choose = (value: string) =>
     action.run(async () => {
       const saved = await apiJson<DeviceState>('/api/settings/compute-device', {
@@ -441,6 +512,41 @@ function ComputeDevice() {
           {state ? t('settings.device_family_' + state.effective_family) : t('common.loading')}
         </span>
       </SettingsRow>
+      {((cuda?.devices.length || 0) > 1 || cuda?.value !== 'auto') && (
+        <SettingsRow
+          id="cuda-device"
+          title={t('settings.device_family_cuda')}
+          description={t('settings.compute_device_restart')}
+        >
+          <div className="w-72 max-w-full">
+            <SearchableSelect
+              value={cuda?.value || 'auto'}
+              options={[
+                { value: 'auto', label: t('settings.compute_device_auto') },
+                ...(cuda?.value === 'disabled'
+                  ? [{ value: 'disabled', label: t('supportPlans.disabled') }]
+                  : []),
+                ...(cuda?.devices || []).map((device) => ({
+                  value: device.value,
+                  label: `${t('settings.device_family_gpu')} ${device.index} — ${device.name}`,
+                })),
+              ]}
+              onChange={(value: string) =>
+                void cudaAction.run(async () => {
+                  const saved = await apiJson<CudaDeviceState>('/api/settings/cuda-device', {
+                    method: 'PUT',
+                    body: JSON.stringify({ value }),
+                  });
+                  client.setQueryData(['cuda-device'], saved);
+                })
+              }
+              disabled={!cuda || cuda.env_pinned || cudaAction.busy}
+              ariaLabel={t('settings.device_family_cuda')}
+              menuPortal
+            />
+          </div>
+        </SettingsRow>
+      )}
       {state?.env_pinned && (
         <p className="p-4 text-sm text-muted-foreground">
           {t('settings.compute_device_env_pinned')}
@@ -454,7 +560,34 @@ function ComputeDevice() {
           {t('settings.compute_device_restart')}
         </p>
       )}
-      {(action.error || query.isError) && <ErrorRow retry={() => void query.refetch()} />}
+      {cuda?.env_pinned && (
+        <p className="p-4 text-sm text-muted-foreground">
+          {t('settings.generate_timeout_shadowed_note')}
+        </p>
+      )}
+      {cuda?.restart_required && (
+        <p role="status" className="p-4 text-sm text-muted-foreground">
+          {t('settings.compute_device_restart')}
+        </p>
+      )}
+      {(action.error || query.isError || cudaAction.error || cudaQuery.isError) && (
+        <ErrorRow
+          retry={() => {
+            void Promise.all([
+              query.refetch({ throwOnError: true }),
+              cudaQuery.refetch({ throwOnError: true }),
+            ]).then(
+              () => {
+                action.clearError();
+                cudaAction.clearError();
+              },
+              () => {
+                // Preserve the action error until both settings reload successfully.
+              },
+            );
+          }}
+        />
+      )}
     </SettingsSection>
   );
 }
@@ -469,20 +602,19 @@ function CompileSetting() {
         signal,
       }),
   });
-  // #2135: live on every platform. This used to be gated to win32 (matching
-  // the Tauri UI), which left the Linux/CUDA reporter unable to switch off the
-  // torch.compile that was killing their backend.
+  const isLoading = query.isPending;
+  // #2135 made this a host-independent recovery control, including Linux CUDA.
   return (
     <SettingsSection icon={CpuIcon} title={t('settings.perf_title')}>
       <SettingsRow
         id="torch-compile"
         title={t('settings.perf_torch_compile')}
-        description={query.data ? t('settings.perf_torch_compile_note') : undefined}
+        description={query.data === undefined ? undefined : t('settings.perf_torch_compile_note')}
       >
         <Switch
           aria-label={t('settings.perf_torch_compile')}
           checked={!!query.data?.enabled}
-          disabled={action.busy || query.isPending}
+          disabled={isLoading || action.busy}
           onCheckedChange={(enabled) =>
             void action.run(async () => {
               const state = await apiJson('/api/settings/perf/torch-compile-disabled', {

@@ -1,25 +1,21 @@
 # Integration directory
 
-Directory entries are not paid sponsors or endorsements. Only entries with a built-in setup block or setup panel carry the **Works with VoiceStudio** badge and capability chips (MCP server, Speech API, Transcription API, Workflow template, Self-hosted, Local language model, Phone calls); every other card is marked **External link**. Every card and featured logo opens the integration's page in VoiceStudio; the provider's website opens only from that page's **Website** card. Setup blocks and panels live in one registry keyed by the catalog slug (`electron/src/renderer/src/features/integrations/setup-registry.ts`), so a connector is added in one place. Icons are bundled locally so viewing the catalog sends no logo requests to providers. Brand marks belong to their respective owners.
+Directory entries are not paid sponsors or endorsements. The app lists only entries with a completed built-in setup block or setup panel. Each carries the **Works with VoiceStudio** badge and capability chips (MCP server, Speech API, Transcription API, Workflow template, Self-hosted, Local language model, Phone calls). Catalog metadata alone never creates a card or a routable detail page. Setup blocks and panels live in one registry keyed by the catalog slug (`electron/src/renderer/src/features/integrations/setup-registry.ts`), so a connector becomes visible only when its wiring is added there. The provider's website opens from the detail page's **Website** card. Icons are bundled locally so viewing the directory sends no logo requests to providers. Brand marks belong to their respective owners. Every visible entry must ship a real brand mark; a test fails if one falls back to the generic placeholder.
 
-The compact footer’s Integrations button opens the directory. Each detail page offers the provider's website as a separate action; featured sponsors also have a detail page when they are not in the directory.
+The sidebar's Integrations entry opens the directory. Each visible detail page offers the provider's website as a separate action. Featured sponsors without completed integration wiring do not receive placeholder detail pages.
 
 | Company | Official source | Icon source |
 |---|---|---|
 | Twilio | [Website](https://www.twilio.com) | Bundled site icon |
-| Plivo | [Website](https://www.plivo.com) | Bundled site icon |
-| Telnyx | [Website](https://telnyx.com) | Bundled site icon |
 | n8n | [Website](https://n8n.io) | Bundled site icon |
-| Zapier | [Website](https://zapier.com) | Bundled site icon |
-| Make | [Website](https://www.make.com) | Bundled generic mark |
-| GitHub | [Website](https://github.com) | Bundled site icon |
 | GitHub Container Registry | [Website](https://ghcr.io) | Bundled GitHub icon |
-| Docker | [Website](https://www.docker.com) | Bundled site icon |
+| Docker | [Website](https://www.docker.com) | Simple Icons 15.0.0 mark (CC0), Docker blue |
 | Model Context Protocol | [Website](https://modelcontextprotocol.io) | Bundled site icon |
-| OpenAI Agents | [Guide](https://platform.openai.com/docs/guides/agents) | Bundled local mark |
-| Claude Code | [Guide](https://docs.anthropic.com/en/docs/claude-code) | Bundled site icon |
-| Codex CLI | [Repository](https://github.com/openai/codex) | Bundled local mark |
-| VoiceStudio API | [Repository](https://github.com/debpalash/VoiceStudio) | Bundled local mark |
+| OpenAI Agents | [Guide](https://platform.openai.com/docs/guides/agents) | Simple Icons 15.0.0 OpenAI mark (CC0) on a black tile |
+| Claude Code | [Guide](https://docs.anthropic.com/en/docs/claude-code) | Simple Icons 15.0.0 Claude mark (CC0), Claude orange |
+| Cursor | [Website](https://cursor.com) | Official site icon (`cursor.com/marketing-static/favicon.svg`) |
+| Codex CLI | [Repository](https://github.com/openai/codex) | Simple Icons 15.0.0 OpenAI mark (CC0) on a black tile |
+| VoiceStudio API | [Repository](https://github.com/debpalash/VoiceStudio) | VoiceStudio app icon (`voicestudio.svg`, a copy of `electron/public/favicon.svg`) |
 
 ## Connect coding agents
 
@@ -53,8 +49,8 @@ card per route, retaining bundled logos and the correct category when entries
 overlap.
 
 Each detail page leads with the integration's category and a one-line summary.
-Pages for integrations that work with VoiceStudio add a single **Learn more**
-link to their guide; external entries link only to the provider's website. On wide windows the
+Visible detail pages add a single **Learn more** link to the integration guide
+and link to the provider's website. On wide windows the
 setup sits beside a side panel with status, capabilities and the website; on
 narrow windows the panel's status comes first and its details follow the setup.
 
@@ -107,6 +103,4 @@ tunnel, Twilio Console configuration, security model and limits.
 The [call agent](integrations/calls.md) uses the same setup to place a call from
 your request (for example, booking a table) or answer one, and holds the
 conversation in your verified or designed voice. It opens with an editable AI
-disclosure and records nothing unless you turn recording on. Twilio is an
-implemented connector; the other calling entries (Plivo, Telnyx) remain
-capability references.
+disclosure and records nothing unless you turn recording on.

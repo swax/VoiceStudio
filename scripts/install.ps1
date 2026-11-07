@@ -4,10 +4,10 @@ $ErrorActionPreference = 'Stop'
 $vsVersion = $Version
 if ($Help) {
     Write-Output @'
-VoiceStudio Electron installer (Windows x64)
-  irm https://voicestudio.sh/install | iex
-  $env:VOICESTUDIO_VERSION='X.Y.Z'; irm https://voicestudio.sh/install | iex
-  $env:VOICESTUDIO_INSTALL_MODE='main'; irm https://voicestudio.sh/install | iex
+VoiceStudio Electron installer (Windows x64 and ARM64)
+  irm https://voicestudio.sh/install.ps1 | iex
+  $env:VOICESTUDIO_VERSION='X.Y.Z'; irm https://voicestudio.sh/install.ps1 | iex
+  $env:VOICESTUDIO_INSTALL_MODE='main'; irm https://voicestudio.sh/install.ps1 | iex
 File usage: .\install.ps1 [-Version X.Y.Z] [-Main | -Source] [-Silent]
 Uninstall: .\install.ps1 -Uninstall (preserves user data)
   $env:VOICESTUDIO_INSTALL_MODE='uninstall'; irm https://voicestudio.sh/install.ps1 | iex
@@ -17,7 +17,10 @@ Only Electron releases are supported. Quit the app first; user data is preserved
     return
 }
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') { throw 'Use install.sh on macOS or Linux.' }
-if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') { throw 'Windows x64 is required.' }
+# ARM64 hardware (Snapdragon X etc.) reports ARM64 natively, or through
+# PROCESSOR_ARCHITEW6432 when this PowerShell is itself an emulated x64 process.
+$onArm = $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64'
+if (-not $onArm -and $env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -and $env:PROCESSOR_ARCHITEW6432 -ne 'AMD64') { throw 'Windows x64 or ARM64 is required.' }
 $mode = if ($Main -or $Source) { 'main' } elseif ($env:VOICESTUDIO_INSTALL_MODE) { $env:VOICESTUDIO_INSTALL_MODE } else { 'binary' }
 if ($mode -eq 'source') { $mode = 'main' }
 if ($Uninstall) { $mode = 'uninstall' }
@@ -73,7 +76,7 @@ try {
                 Run-Checked bun @('run', 'build')
                 Run-Checked bun @('run', 'build:web')
                 Run-Checked node @('tests/packaging-contract.mjs')
-                Run-Checked bun @('run', 'electron-builder', '--config', 'electron-builder.config.mjs', '--publish', 'never', '--win', '--x64')
+                Run-Checked bun @('run', 'electron-builder', '--config', 'electron-builder.config.mjs', '--publish', 'never', '--win', $(if ($onArm) { '--arm64' } else { '--x64' }))
                 Run-Checked node @('tests/update-package-contract.mjs')
             } finally { Pop-Location }
         } finally { Pop-Location }
@@ -96,12 +99,33 @@ try {
         }
         $packageDir = $work
     }
-    $asset = "VoiceStudio-Electron-$vsVersion-win-x64.exe"
+    # Releases up to v0.5.7-beta.3 named their installers VoiceStudio-Electron-*;
+    # keep pinned installs of those versions working.
+    $prefix = if ($vsVersion -match '^(0\.[0-4]\.|0\.5\.[0-6](-|$)|0\.5\.7-beta\.[1-3]$)') { 'VoiceStudio-Electron' } else { 'VoiceStudio' }
+    $asset = "$prefix-$vsVersion-win-x64.exe"
+    if ($onArm -and $mode -eq 'main') { $asset = "$prefix-$vsVersion-win-arm64.exe" }
     $package = Join-Path $packageDir $asset
     if ($mode -eq 'binary') {
         $base = "https://github.com/debpalash/VoiceStudio/releases/download/v$vsVersion"
-        Write-Output "Downloading $asset"
-        Invoke-WebRequest -UseBasicParsing "$base/$asset" -OutFile $package
+        $downloaded = $false
+        if ($onArm) {
+            # Prefer the native ARM64 shell; releases that predate it (or whose
+            # ARM64 leg did not publish) fall back to the x64 build, which runs
+            # under Windows' emulation layer.
+            $armAsset = "$prefix-$vsVersion-win-arm64.exe"
+            $armPackage = Join-Path $packageDir $armAsset
+            try {
+                Write-Output "Downloading $armAsset"
+                Invoke-WebRequest -UseBasicParsing "$base/$armAsset" -OutFile $armPackage
+                $asset = $armAsset; $package = $armPackage; $downloaded = $true
+            } catch {
+                Write-Output 'No native ARM64 build for this release; using the x64 build under emulation.'
+            }
+        }
+        if (-not $downloaded) {
+            Write-Output "Downloading $asset"
+            Invoke-WebRequest -UseBasicParsing "$base/$asset" -OutFile $package
+        }
         $sums = Join-Path $work 'SHA256SUMS.txt'
         Invoke-WebRequest -UseBasicParsing "$base/SHA256SUMS.txt" -OutFile $sums
         $pattern = '^([A-Fa-f0-9]{64})\s+' + [regex]::Escape($asset) + '$'

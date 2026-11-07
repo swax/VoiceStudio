@@ -351,3 +351,36 @@ def test_gptsovits_uses_canonical_target_language(monkeypatch, language):
     with pytest.raises(RuntimeError, match='captured request'):
         backend.generate('hello', ref_audio='voice.wav', language=language)
     assert seen[0]['text_lang'] == 'ko'
+
+
+def _cosyvoice3_backend(monkeypatch, calls):
+    from services.tts_backend import CosyVoiceBackend
+    import torch
+
+    class CosyVoice3:
+        def _record(self, name):
+            def call(*args, **kwargs):
+                calls.append((name, args))
+                return [{'tts_speech': torch.zeros(1, 10)}]
+            return call
+
+        def __getattr__(self, name):
+            return self._record(name)
+
+    backend = object.__new__(CosyVoiceBackend)
+    backend._model = CosyVoice3()
+    monkeypatch.setattr(backend, '_ensure_loaded', lambda: None)
+    return backend
+
+
+def test_cosyvoice3_in_process_prompts_carry_the_system_prompt(monkeypatch):
+    """The in-process adapter builds v3 prompts like the sidecar does."""
+    calls = []
+    backend = _cosyvoice3_backend(monkeypatch, calls)
+    backend.generate('hi', ref_audio='v.wav', instruct='Speak sadly', language='en')
+    backend.generate('hi', ref_audio='v.wav', ref_text='hello there', language='en')
+    backend.generate('hi', ref_audio='v.wav', language='en')
+    prefix = 'You are a helpful assistant.'
+    assert calls[0] == ('inference_instruct2', ('hi', f'{prefix} Speak sadly<|endofprompt|>', 'v.wav'))
+    assert calls[1] == ('inference_zero_shot', ('hi', f'{prefix}<|endofprompt|>hello there', 'v.wav'))
+    assert calls[2] == ('inference_cross_lingual', (f'{prefix}<|endofprompt|>hi', 'v.wav'))

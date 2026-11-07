@@ -3,6 +3,7 @@ import { useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { apiJson } from '@/lib/api/client';
+import { queryKeys } from '@/lib/query';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { SettingsSection, SettingsRow } from './settings-layout';
@@ -57,6 +58,11 @@ export function LlmSkills() {
         },
       );
       client.setQueryData(['llm-skills'], data);
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['translation-engines'] }),
+        client.invalidateQueries({ queryKey: ['dictation-refinement'] }),
+        client.invalidateQueries({ queryKey: queryKeys.engines }),
+      ]);
     } catch {
       setError(true);
     } finally {

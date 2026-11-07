@@ -94,7 +94,7 @@ def _fake_ffmpeg_factory(write_file: bool = True):
             # Positional cmd ends with "<output>" "-y" — scan for an abs path arg.
             out = None
             for arg in reversed(cmd):
-                if isinstance(arg, str) and arg.startswith("/") and "." in Path(arg).name:
+                if isinstance(arg, str) and Path(arg).is_absolute() and "." in Path(arg).name:
                     out = arg
                     break
             if out:
@@ -288,6 +288,108 @@ class TestDubExportUniqueness:
         assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "no-store"
 
+    def test_wav_preview_reuses_one_mix_across_range_requests(self, app_client):
+        """#2581: every range request of the audio preview re-mixed the whole
+        dub into a new never-deleted WAV; a 70-minute dub filled the disk."""
+        client, dc, dx, tmp = app_client
+        job_id, job_dir = _seed_job_with_tracks(dc, tmp)
+        exports = job_dir / "exports"
+        exports.mkdir()
+        (exports / "mixed_dub_20260101T000000-abcdef12.wav").write_bytes(b"legacy")
+        commands = []
+
+        async def fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            Path(cmd[-1]).write_bytes(b"RIFF" + b"\x01" * 60)
+            return 0, b"", b""
+
+        def mixes():
+            return sorted(path.name for path in exports.glob("mixed_*.wav"))
+
+        with (
+            patch.object(dx, "find_ffmpeg", return_value="ffmpeg"),
+            patch.object(dx, "run_ffmpeg", new=fake_run),
+        ):
+            url = f"/dub/download-audio/{job_id}"
+            full = client.get(url, params={"lang": "es"})
+            ranged = client.get(url, params={"lang": "es"}, headers={"Range": "bytes=10-19"})
+            assert full.status_code == 200, full.text
+            assert ranged.status_code == 206, ranged.text
+            assert ranged.content == full.content[10:20]
+            assert len(commands) == 1
+            assert len(mixes()) == 1 and not mixes()[0].startswith("mixed_dub_")
+
+            # A regenerated track gets a fresh mix and the old one is removed.
+            track = job_dir / "dubbed_es.wav"
+            _make_wav(track, seconds=0.75)
+            assert client.get(url, params={"lang": "es"}).status_code == 200
+            assert len(commands) == 2
+            assert len(mixes()) == 1
+            assert not list(exports.glob("*.tmp.wav"))
+
+    def test_regenerated_mix_never_prunes_a_mix_still_being_served(self, app_client):
+        """#2581: a preview that had chosen its mix lost the file when a
+        regenerated track's mix pruned it before FileResponse opened it."""
+        client, dc, dx, tmp = app_client
+        job_id, job_dir = _seed_job_with_tracks(dc, tmp)
+        exports = job_dir / "exports"
+        exports.mkdir()
+        track = job_dir / "dubbed_es.wav"
+        bg = job_dir / "no_vocals.wav"
+
+        async def fake_run(cmd, **_kwargs):
+            Path(cmd[-1]).write_bytes(b"RIFF" + b"\x01" * 60)
+            return 0, b"", b""
+
+        async def scenario():
+            first = await dx._mixed_dub_audio(str(exports), "es", str(bg), str(track))
+            _make_wav(track, seconds=0.75)
+            second = await dx._mixed_dub_audio(str(exports), "es", str(bg), str(track))
+            assert first != second
+            assert os.path.isfile(first), "pruned a mix another request is serving"
+            dx._release_mix(first)
+            assert not os.path.exists(first), "the last reader deletes a superseded mix"
+            dx._release_mix(second)
+            assert os.path.isfile(second)
+
+        with (
+            patch.object(dx, "find_ffmpeg", return_value="ffmpeg"),
+            patch.object(dx, "run_ffmpeg", new=fake_run),
+        ):
+            _asyncio.run(scenario())
+            assert client.get(f"/dub/download-audio/{job_id}", params={"lang": "es"}).status_code == 200
+        assert dx._mix_readers == {} and dx._mix_superseded == set()
+        assert len(list(exports.glob("mixed_*.wav"))) == 1
+
+    def test_mix_locks_do_not_accumulate_per_track_version(self, app_client):
+        """A lock per mix path used to live forever; each regenerated track
+        version left one behind for the life of the backend."""
+        import gc
+
+        _client, dc, dx, tmp = app_client
+        _job_id, job_dir = _seed_job_with_tracks(dc, tmp)
+        exports = job_dir / "exports"
+        exports.mkdir()
+        track = job_dir / "dubbed_es.wav"
+
+        async def fake_run(cmd, **_kwargs):
+            Path(cmd[-1]).write_bytes(b"RIFF" + b"\x01" * 60)
+            return 0, b"", b""
+
+        async def scenario():
+            for seconds in (0.5, 0.75, 1.0):
+                _make_wav(track, seconds=seconds)
+                mix = await dx._mixed_dub_audio(str(exports), "es", str(job_dir / "no_vocals.wav"), str(track))
+                dx._release_mix(mix)
+
+        with (
+            patch.object(dx, "find_ffmpeg", return_value="ffmpeg"),
+            patch.object(dx, "run_ffmpeg", new=fake_run),
+        ):
+            _asyncio.run(scenario())
+        gc.collect()
+        assert len(dx._mixed_audio_locks) == 0
+
     def test_mp4_export_refuses_when_ffmpeg_writes_nothing(self, app_client):
         client, dc, dx, tmp = app_client
         job_id, _ = _seed_job_with_tracks(dc, tmp)
@@ -418,4 +520,71 @@ class TestAudioOnlyDubbing:
 
         assert dc._detected_source_lang("yue") == "yue"
         assert dc._detected_source_lang("es_ES") == "es"
-        assert dc._detected_source_lang("unknown-language") == "en"
+        assert dc._detected_source_lang("unknown-language") is None
+
+
+class TestExportBeforeDub:
+    """#3393: a transcribed video exports with its original audio and the
+    transcript as subtitles before any dub is generated."""
+
+    def _seed_transcribed(self, dc, tmp_path):
+        job_id, job_dir = _seed_job_with_tracks(dc, tmp_path)
+        job = dc._dub_jobs[job_id]
+        job["dubbed_tracks"] = {}
+        job["segments"] = [{"id": "0", "start": 0.1, "end": 0.8, "text": "hello", "speaker_id": "Speaker 1"}]
+        return job_id, job
+
+    def test_original_video_with_burned_transcript_exports_without_a_dub(self, app_client):
+        client, dc, dx, tmp = app_client
+        job_id, _job = self._seed_transcribed(dc, tmp)
+        commands = []
+
+        async def fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            Path(cmd[-2]).write_bytes(b"\x00FAKE")
+            return 0, b"", b""
+
+        with (
+            patch.object(dx, "find_ffmpeg", return_value="ffmpeg"),
+            patch.object(dx, "run_ffmpeg", new=fake_run),
+        ):
+            response = client.get(
+                f"/dub/download/{job_id}",
+                params={"include_tracks": "original", "default_track": "original", "burn_subs": True},
+            )
+
+        assert response.status_code == 200, response.text
+        cmd = commands[0]
+        assert "0:a:0" in cmd
+        assert any("subtitles=" in arg for arg in cmd)
+        assert "subtitled_" in response.headers["content-disposition"]
+
+    def test_audio_jobs_and_excluded_original_still_need_a_dub(self, app_client):
+        client, dc, _dx, tmp = app_client
+        job_id, job = self._seed_transcribed(dc, tmp)
+        assert client.get(f"/dub/download/{job_id}", params={"include_tracks": "es"}).status_code == 400
+        job["input_type"] = "audio"
+        assert client.get(f"/dub/download/{job_id}").status_code == 400
+
+    def test_sync_transcript_stores_editor_lines_until_a_dub_exists(self, app_client):
+        client, dc, _dx, tmp = app_client
+        job_id, job = self._seed_transcribed(dc, tmp)
+        response = client.post(
+            f"/dub/sync-transcript/{job_id}",
+            json={"segments": [{"id": "0", "start": 0.2, "end": 0.9, "text": "hello there"}]},
+        )
+        assert response.status_code == 200, response.text
+        row = job["segments"][0]
+        assert row["text"] == "hello there" and row["start"] == 0.2
+        # Diarization metadata survives the edit.
+        assert row["speaker_id"] == "Speaker 1"
+        srt = client.get(f"/dub/srt/{job_id}", params={"lang": "original"})
+        assert srt.status_code == 200 and "hello there" in srt.text
+
+        job["dubbed_tracks"] = {"es": {"path": "x", "language": "Spanish"}}
+        blocked = client.post(
+            f"/dub/sync-transcript/{job_id}",
+            json={"segments": [{"id": "0", "start": 0, "end": 1, "text": "other"}]},
+        )
+        assert blocked.status_code == 409
+        assert job["segments"][0]["text"] == "hello there"

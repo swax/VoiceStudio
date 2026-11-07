@@ -1,43 +1,64 @@
-.support-shortcut {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  border: 1px solid color-mix(in oklab, var(--primary) 28%, var(--border));
-  border-radius: 8px;
-  background: color-mix(in oklab, var(--primary) 11%, var(--card));
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--foreground) 5%, transparent);
-  transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+/* Title bar shortcuts (Get Pro, GitHub Star): quiet ghost controls that share
+   the search button's height and hover, so the work area keeps the attention. */
+.support-shortcut,
+.github-star-shortcut {
+  height: 1.75rem;
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius) - 2px);
+  color: var(--toolbar-control-foreground, var(--muted-foreground));
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    border-color 150ms ease;
 }
 .support-shortcut:hover,
-.support-shortcut:focus-visible {
-  border-color: color-mix(in oklab, var(--primary) 50%, var(--border));
-  background: color-mix(in oklab, var(--primary) 17%, var(--card));
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--foreground) 8%, transparent);
+.support-shortcut:focus-visible,
+.github-star-shortcut:hover,
+.github-star-shortcut:focus-visible {
+  color: var(--foreground);
+  background: var(--toolbar-control-hover, var(--accent));
 }
-.support-shortcut::before {
-  position: absolute;
-  z-index: -1;
-  inset: -85% -45%;
-  content: '';
-  opacity: 0;
-  background:
-    radial-gradient(ellipse at 20% 40%, color-mix(in srgb, var(--primary) 30%, transparent), transparent 50%),
-    repeating-radial-gradient(ellipse at 0% 100%, transparent 0 12px, color-mix(in srgb, var(--primary) 22%, transparent) 13px 15px, transparent 16px 28px);
-  transform: translateX(-12%) rotate(-5deg);
-  transition: opacity 180ms ease;
+.support-shortcut svg {
+  color: var(--primary);
 }
-.support-shortcut:hover::before,
-.support-shortcut:focus-visible::before {
-  opacity: 1;
-  animation: support-shortcut-waves 1.8s ease-in-out infinite alternate;
+.github-star-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 0 8px;
 }
-@keyframes support-shortcut-waves {
-  from { transform: translateX(-12%) rotate(-5deg) scale(1); }
-  to { transform: translateX(12%) rotate(5deg) scale(1.08); }
+.github-star-label svg {
+  color: var(--warning);
+  transition:
+    fill 150ms ease,
+    transform 260ms ease;
+}
+.github-star-shortcut:hover .github-star-label svg,
+.github-star-shortcut:focus-visible .github-star-label svg {
+  fill: var(--warning);
+  transform: rotate(72deg);
+}
+.github-star-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px 0 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.github-star-shortcut:hover .github-star-count,
+.github-star-shortcut:focus-visible .github-star-count {
+  color: var(--foreground);
 }
 @media (prefers-reduced-motion: reduce) {
   .support-shortcut,
-  .support-shortcut::before { transition: none; }
-  .support-shortcut:hover::before,
-  .support-shortcut:focus-visible::before { animation: none; }
+  .github-star-shortcut,
+  .github-star-label svg {
+    transition: none;
+  }
+  .github-star-shortcut:hover .github-star-label svg,
+  .github-star-shortcut:focus-visible .github-star-label svg {
+    transform: none;
+  }
 }

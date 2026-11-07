@@ -89,7 +89,7 @@ def test_asr_evidence_failure_does_not_drop_tts_evidence(monkeypatch):
     monkeypatch.setattr(
         tts_backend,
         "list_backends",
-        lambda **_kwargs: [
+        lambda **kwargs: [
             {"id": "tts-ok", "available": True, "execution_evidence": evidence}
         ],
     )

@@ -23,8 +23,8 @@ process-bound admin session:
 - Direct API clients keep using `Authorization: Bearer <OMNIVOICE_API_KEY>`.
 - The browser/Tauri UI presents the master key once to create an admin session.
 - Same-origin browsers receive an `HttpOnly` session cookie.
-- Cross-origin/Tauri clients retain only the short-lived session in
-  `sessionStorage`.
+- Cross-origin/Electron clients retain only the backend-bound, short-lived
+  session in `localStorage` so reloads and new tabs remain authenticated.
 - Cross-origin WebSockets use a path-bound, single-use ticket with a 30-second
   lifetime. The master key and admin session token never enter a URL.
 - Session authorization grants consumption and admin capabilities, but never
@@ -248,11 +248,6 @@ Design constraints:
   attack lifetime, avoids a database verifier for a possibly weak operator key,
   and matches VoiceStudio's single-process backend architecture.
 
-Do not reuse `backend.worker.identity.Session` directly. Its worker/stream
-binding semantics are different. Follow its established random-token,
-hash-only, TTL-tested pattern without coupling API authentication to the worker
-package.
-
 ### Canonical authentication resolver
 
 Add one resolver used by HTTP middleware, HTTP dependencies, and WebSocket
@@ -402,8 +397,8 @@ Responsibilities:
   request. Do not route the exchange through `apiFetch`; retry/reload logic must
   never replay a master credential implicitly.
 - Use `credentials: "include"` for cookie sessions.
-- Keep bearer sessions only in `sessionStorage` and clear them on logout,
-  expiry, backend change, or API-key rotation response.
+- Keep only bearer sessions in `localStorage` and clear them on logout, expiry,
+  backend change, or API-key rotation response.
 - Fetch WebSocket tickets for cross-origin/Tauri sessions.
 - Redact credentials from all thrown errors and diagnostics.
 
@@ -595,7 +590,7 @@ Extend `tests/test_loopback_server_mode.py` and
 `tests/test_admin_route_policy.py`.
 
 For representative read, write, and side-effectful GET routes across settings,
-system, engines, media tools, MCP bindings, pronunciation, and workers, test:
+system, engines, media tools, MCP bindings and pronunciation, test:
 
 | Context                                   |                                            Read-only admin | Write/side-effect admin | Native host-path action |
 | ----------------------------------------- | ---------------------------------------------------------: | ----------------------: | ----------------------: |
@@ -663,7 +658,7 @@ Backend tests in `tests/test_capture_ws.py` plus equivalent coverage for
 - Exchanges the master exactly once and never retries automatically.
 - Uses cookie transport for same-origin browser execution.
 - Uses bearer-session transport for explicit cross-origin/Tauri execution.
-- Writes only the short-lived bearer session to `sessionStorage`.
+- Writes only the backend-bound, short-lived bearer session to `localStorage`.
 - Never writes the master to any storage API.
 - Clears session state on logout, expiry, backend base-URL change, and rotation
   failure.
@@ -982,7 +977,7 @@ The three deterministic regressions were corrected; all four are included in
 the 324-test compatibility gate above. Re-running the remaining last-failed set
 produced 33 failures, three
 setup errors, and one pass, all confined to unmodified engine/FFmpeg/IndexTTS,
-AppRun/shell, dubbing-export, worker-permission, and Windows path/permission
+AppRun/shell, dubbing-export and Windows path/permission
 tests. No failing assertion targets the new auth/session behavior, and the
 affected route/middleware suites pass in the compatibility gate above. These
 existing Windows/offline failures are recorded rather than hidden; the required

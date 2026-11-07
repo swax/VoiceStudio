@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 
@@ -132,6 +133,38 @@ def _consent_verified(parsed: pb.ParsedPersona, consent_path: str | None) -> boo
     return bool((parsed.consent.get("consent_text") or "").strip())
 
 
+def _import_design_recipe(persona: dict) -> str | None:
+    """Validate bundled design prose and preserve its authoring engine.
+
+    Portable voice bundles are untrusted input. Apply the same bounded recipe
+    validator as /profiles, retaining the engine name without requiring that
+    engine to be installed on the importer's machine.
+    """
+    if persona.get("kind") != "design":
+        return None
+    raw = persona.get("design_recipe")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="Invalid bundled Voice Design recipe")
+    from api.routers.generation import _design_recipe_json
+
+    validated = _design_recipe_json(raw)
+    if validated is None:
+        raise HTTPException(status_code=400, detail="Invalid bundled Voice Design recipe")
+    original = json.loads(raw)
+    engine_id = original.get("engine") or "omnivoice"
+    if (
+        not isinstance(engine_id, str) or len(engine_id) > 80
+        or not engine_id or not engine_id.isascii()
+        or not all(c.isalnum() or c in "-_" for c in engine_id)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Voice Design engine in bundle")
+    normalized = json.loads(validated)
+    normalized["engine"] = engine_id
+    return json.dumps(normalized, ensure_ascii=False)
+
+
 @router.post("/personas/import")
 async def import_persona(file: UploadFile = File(...)):
     """Create a new voice profile from a `.ovsvoice` (or legacy `.omnivoice`) bundle."""
@@ -139,13 +172,16 @@ async def import_persona(file: UploadFile = File(...)):
     if not name.endswith(".ovsvoice") and not name.endswith(".omnivoice"):
         raise HTTPException(status_code=400, detail="File must be a .ovsvoice or .omnivoice bundle")
 
-    content = await file.read()
+    content = await file.read(pb.MAX_BUNDLE_BYTES + 1)  # parse rejects anything larger
     try:
         parsed = pb.parse_persona_bundle(content)
     except pb.BundleError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
 
     persona = parsed.manifest.get("persona") or {}
+    if not isinstance(persona, dict):
+        raise HTTPException(status_code=400, detail="Invalid persona metadata")
+    design_recipe = _import_design_recipe(persona)
     written: list[str] = []
 
     def _gen_id() -> str:
@@ -193,14 +229,15 @@ async def import_persona(file: UploadFile = File(...)):
         ref_for_db = ref_filename or locked_filename  # at least one is set
 
         def _insert(pid: str):
+            """Store imported profile metadata and its validated design recipe."""
             with db_conn() as conn:
                 conn.execute(
                     """INSERT INTO voice_profiles
                        (id, name, ref_audio_path, ref_text, instruct, language,
                         seed, personality, is_locked, locked_audio_path, created_at,
-                        kind, vd_states,
+                        kind, vd_states, design_recipe,
                         verified_own_voice, consent_text, consent_audio_path, consent_recorded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         pid,
                         persona.get("name") or "Imported Voice",
@@ -215,6 +252,7 @@ async def import_persona(file: UploadFile = File(...)):
                         time.time(),
                         persona.get("kind") or "clone",
                         persona.get("vd_states"),
+                        design_recipe,
                         1 if verified else 0,
                         # Keep the attestation text so the user can re-attest locally,
                         # even when imported unverified.
@@ -306,7 +344,7 @@ async def inspect_persona(file: UploadFile = File(...)):
     name = (file.filename or "").lower()
     if not name.endswith(".ovsvoice") and not name.endswith(".omnivoice"):
         raise HTTPException(status_code=400, detail="File must be a .ovsvoice or .omnivoice bundle")
-    content = await file.read()
+    content = await file.read(pb.MAX_BUNDLE_BYTES + 1)  # parse rejects anything larger
     try:
         parsed = pb.parse_persona_bundle(content)
     except pb.BundleError as e:

@@ -7,7 +7,7 @@
   "license": "AGPL-3.0-only",
   "author": {
     "name": "VoiceStudio contributors",
-    "email": "VoiceStudio@palash.dev"
+    "email": "hi@voicestudio.sh"
   },
   "type": "module",
   "main": "./out/main/index.js",
@@ -18,8 +18,8 @@
     "build": "bun run locale:check && electron-vite build",
     "build:web": "bun run locale:check && vite build --config vite.web.config.ts",
     "dev:web": "vite --config vite.web.config.ts",
-    "preview": "electron-vite preview",
-    "start": "electron-vite preview",
+    "preview": "node scripts/dev.mjs preview",
+    "start": "node scripts/dev.mjs preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "lint": "vp lint",
     "lint:fix": "vp lint --fix",
@@ -27,8 +27,10 @@
     "format:check": "vp fmt --check",
     "test": "bun run locale:check && vp test --run && vp test --run --config vite.shared.config.ts",
     "test:watch": "vp test",
+    "test:desktop-ui": "node tests/local-first.test.mjs && node tests/fake-health-backend.test.mjs && node tests/desktop-harness-ports.test.mjs && node tests/desktop-harness-exit.test.mjs && node tests/desktop-ui.test.mjs",
     "smoke:server": "vite --config tests/renderer-smoke.vite.config.mjs",
     "smoke:live-routes": "node tests/live-route-health.mjs",
+    "smoke:account-live": "node tests/account-sign-in-live.mjs",
     "check": "vp check",
     "dist": "bun run build:web && electron-vite build && node tests/packaging-contract.mjs && electron-builder --config electron-builder.config.mjs && node --input-type=module -e \"if (process.platform === 'linux') await import('./scripts/embed-appimage-update.mjs')\" && node tests/update-package-contract.mjs",
     "dist:dir": "bun run build:web && electron-vite build && node tests/packaging-contract.mjs && electron-builder --config electron-builder.config.mjs --dir",
@@ -36,7 +38,6 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
-    "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
     "@fontsource-variable/inter": "^5.3.0",
     "@fontsource-variable/source-serif-4": "^5.3.0",
@@ -82,7 +83,6 @@
     "react-hot-toast": "^2.6.0",
     "react-i18next": "^17.0.14",
     "react-window": "^2.3.1",
-    "remotion": "4.0.524",
     "shadcn": "^4.21.0",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.6.0",
@@ -93,8 +93,6 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
-    "@tanstack/react-query-devtools": "^5.102.8",
-    "@tanstack/react-router-devtools": "^1.167.2",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^24.13.4",
@@ -109,11 +107,9 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.3.0",
-    "vite-plus": "^0.3.1",
-    "vitest": "4.1.11"
+    "vite-plus": "^1.5.0",
+    "vitest": "5.1.0"
   },
-  "desktopName": "VoiceStudio",
-  "productName": "VoiceStudio",
   "trustedDependencies": [
     "electron",
     "esbuild",

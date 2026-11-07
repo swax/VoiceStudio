@@ -33,7 +33,7 @@ describe('blank window fallback', () => {
   it('stays aligned with every renderer locale catalogue', () => {
     const directory = join(process.cwd(), 'src/renderer/src/i18n/locales');
     const locales = readdirSync(directory).filter((file) => file.endsWith('.json'));
-    expect(locales).toHaveLength(21);
+    expect(locales).toHaveLength(22);
     for (const file of locales) {
       const locale = file.slice(0, -5);
       const catalogue = JSON.parse(readFileSync(join(directory, file), 'utf8')) as {
@@ -111,5 +111,78 @@ describe('blank window fallback', () => {
 
     expect(() => windowEvents.emit('closed')).not.toThrow();
     expect(() => stop()).not.toThrow();
+  });
+});
+
+describe('stale blank-window probes', () => {
+  const setup = (resolveProbe: () => Promise<boolean>) => {
+    let destroyed = false;
+    const contents = Object.assign(new EventEmitter(), {
+      isDestroyed: () => destroyed,
+      executeJavaScript: vi.fn(resolveProbe),
+    });
+    const loadURL = vi.fn().mockResolvedValue(undefined);
+    const win = Object.assign(new EventEmitter(), {
+      isDestroyed: () => destroyed,
+      webContents: contents,
+      loadURL,
+    });
+    const stop = installBlankWindowGuard(win as never, 'app://voicestudio/index.html', 'en-US');
+    return { contents, win, loadURL, stop, destroy: () => (destroyed = true) };
+  };
+  const probeResult = () => {
+    let settle: (value: boolean) => void = () => {};
+    const promise = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    return { promise, settle };
+  };
+
+  it('does not reload after a main-frame navigation started during the probe', async () => {
+    vi.useFakeTimers();
+    const probe = probeResult();
+    const { contents, loadURL } = setup(() => probe.promise);
+    await vi.advanceTimersByTimeAsync(12_000);
+    contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
+    probe.settle(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loadURL).not.toHaveBeenCalled();
+  });
+
+  it('still recovers when a child-frame navigation happened during the probe', async () => {
+    vi.useFakeTimers();
+    const probe = probeResult();
+    const { contents, loadURL } = setup(() => probe.promise);
+    await vi.advanceTimersByTimeAsync(12_000);
+    contents.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false });
+    probe.settle(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loadURL).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-arms the guard when the superseding navigation never commits', async () => {
+    vi.useFakeTimers();
+    const first = probeResult();
+    const { contents, loadURL } = setup(() => first.promise);
+    await vi.advanceTimersByTimeAsync(12_000);
+    contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
+    first.settle(false);
+    contents.executeJavaScript.mockResolvedValue(false);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(loadURL).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a probe that resolves after the guard stopped or the window closed', async () => {
+    vi.useFakeTimers();
+    for (const end of ['stop', 'destroy'] as const) {
+      const probe = probeResult();
+      const { loadURL, stop, destroy } = setup(() => probe.promise);
+      await vi.advanceTimersByTimeAsync(12_000);
+      if (end === 'stop') stop();
+      else destroy();
+      probe.settle(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(loadURL).not.toHaveBeenCalled();
+    }
   });
 });

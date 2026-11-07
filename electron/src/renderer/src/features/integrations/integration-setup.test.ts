@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import {
   INTEGRATION_CATALOG,
   integrationSlug,
@@ -9,6 +9,10 @@ import {
   integrationCategoryKey,
   isIntegrationCategory,
 } from './integration-categories';
+import genericLogo from '@shared/assets/integrations/integration-generic.svg';
+import { installRandomUUID } from '../../lib/random-uuid';
+
+afterEach(() => vi.unstubAllGlobals());
 
 it('gives every catalog category its own label key, never one borrowed from another feature', () => {
   const labels = en.integrationCatalog.category as Record<string, string>;
@@ -65,6 +69,18 @@ it('never exports credentials, unsafe URLs, or unsupported client configurations
 });
 
 import { n8nSetup } from './n8n-setup';
+it('exports an n8n workflow when randomUUID is unavailable on a LAN origin', () => {
+  vi.stubGlobal('crypto', {
+    getRandomValues: (bytes: Uint8Array) => {
+      bytes.fill(7);
+      return bytes;
+    },
+  });
+  installRandomUUID();
+
+  const setup = n8nSetup('n8n', 'http://192.168.0.110:3900');
+  expect(JSON.parse(setup!.text).id).toMatch(/^[a-f0-9]{20}$/);
+});
 it('exports a manual n8n workflow to the current backend without credentials', () => {
   const setup = n8nSetup('n8n', 'https://voice.example/backend/');
   const workflow = JSON.parse(setup!.text);
@@ -279,6 +295,20 @@ it('gives Windows a PowerShell docker run with a CSPRNG key and backtick continu
     expect(ps.text.trimEnd()).toMatch(/(?:voicestudio|omnivoice-studio):stable$/);
   }
 });
+it('mounts the host model cache at the image HF_HOME and adds no dead bind knob', () => {
+  for (const slug of ['docker', 'github-container-registry']) {
+    const text = INTEGRATION_SETUPS[slug]
+      .blocks('')!
+      .map((block) => block.text)
+      .join('\n');
+    // deploy/Dockerfile: HF_HOME=/app/omnivoice_data/huggingface.
+    expect(text).toContain('.cache/huggingface:/app/omnivoice_data/huggingface');
+    expect(text).not.toContain('/root/.cache/huggingface');
+    // The image ENTRYPOINT binds 0.0.0.0 itself; the env var does nothing.
+    expect(text).not.toContain('OMNIVOICE_BIND_HOST');
+    expect(text).toMatch(/:stable\b/);
+  }
+});
 it('reads the Agents SDK key only for a remote https backend', () => {
   for (const url of ['http://192.168.1.5:3900', 'http://127.0.0.1:3900']) {
     const text = openaiAgentsSetup('openai-agents', url)!.text;
@@ -288,4 +318,12 @@ it('reads the Agents SDK key only for a remote https backend', () => {
   expect(integrationSetup('openai-agents')!.blocks('http://192.168.1.5:3900')![0].hintKey).toBe(
     'integrationCatalog.apiInsecureHint',
   );
+});
+
+it('shows an official bundled logo, never the generic placeholder, on every visible integration', () => {
+  for (const slug of Object.keys(INTEGRATION_SETUPS)) {
+    const entry = getIntegrationBySlug(slug);
+    expect(entry, slug).toBeTruthy();
+    expect(entry!.logoUrl, slug).not.toBe(genericLogo);
+  }
 });

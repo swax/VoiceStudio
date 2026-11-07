@@ -55,4 +55,19 @@ describe('loopWindow', () => {
     expect(loopEnd).toBeLessThanOrEqual(8);
     expect(loopEnd).toBeGreaterThan(loopStart);
   });
+  it('moves an end-of-buffer click back by the minimum preview width', () => {
+    const duration = 12.75;
+    const { loopStart, loopEnd, seg } = loopWindow(duration, duration, duration);
+    expect(loopEnd).toBeCloseTo(duration, 8);
+    expect(loopStart).toBeCloseTo(duration - MIN_LOOP_SEC, 8);
+    expect(seg).toBeCloseTo(MIN_LOOP_SEC, 8);
+  });
+
+  it('uses the complete buffer when it is shorter than the minimum', () => {
+    const duration = 0.0045;
+    const { loopStart, loopEnd, seg } = loopWindow(duration, duration, duration);
+    expect(loopStart).toBe(0);
+    expect(loopEnd).toBeCloseTo(duration, 8);
+    expect(seg).toBeCloseTo(duration, 8);
+  });
 });

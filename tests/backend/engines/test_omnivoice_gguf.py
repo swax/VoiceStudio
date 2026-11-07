@@ -130,7 +130,37 @@ def test_is_available_when_sha_mismatch(monkeypatch, tmp_path):
     assert "checksum mismatch" in reason.lower()
 
 
-def test_is_available_passes_when_manifest_absent(monkeypatch, tmp_path):
+@pytest.fixture
+def cached_weights(monkeypatch, tmp_path):
+    """Install the pinned GGUF pair in a throwaway HuggingFace cache.
+
+    Readiness covers the weights as well as the binary, so a test that
+    expects "ready" has to supply the pair it claims to have — the
+    engine loads only from the local cache and never downloads.
+    """
+    from huggingface_hub import constants
+
+    from engines.omnivoice_gguf.backend import _load_quant_map
+
+    quant_map = _load_quant_map()
+    revision = quant_map["_meta"]["source_commit_sha"]
+    entry = quant_map["cpu"]
+    cache = tmp_path / "hub"
+    folder = cache / "models--Serveurperso--OmniVoice-GGUF" / "snapshots" / revision
+    folder.mkdir(parents=True)
+    for name in (entry["base"], entry["tokenizer"]):
+        (folder / name).write_bytes(b"gguf-weights")
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(cache))
+    # A clean compute environment: an ambient CPU pin or native backend
+    # would change which quant the engine looks for.
+    for variable in ("OMNIVOICE_DEVICE", "OMNIVOICE_GGUF_BACKEND",
+                     "OMNIVOICE_GGUF_DEVICE", "GGML_BACKEND"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("OMNIVOICE_DEVICE", "auto")
+    return cache
+
+
+def test_is_available_passes_when_manifest_absent(monkeypatch, tmp_path, cached_weights):
     """When checksums.sha256 is missing we still report ready — the manifest
     is an integrity check, not a hard requirement (binaries are bundled
     via the installer, not by `pip`)."""
@@ -259,110 +289,112 @@ def test_generate_returns_tensor_from_stub_wav(monkeypatch, tmp_path):
     assert captured["stdin"] == "hello world"
 
 
-def test_generate_forwards_control_arguments(monkeypatch, tmp_path):
-    """The GGUF binary exposes quality/prosody controls; the adapter must not
-    silently drop them."""
-    from engines.omnivoice_gguf import backend as gguf_backend
+class _GgufRig:
+    """Wires a backend instance to throwaway model files and a fake runner."""
 
-    cls = gguf_backend._make_backend_class()
-    backend = cls()
+    def __init__(self, monkeypatch, root: Path, runner=None):
+        from engines.omnivoice_gguf import backend as mod
 
-    fake_base = tmp_path / "omnivoice-base-Q8_0.gguf"
-    fake_tok = tmp_path / "omnivoice-tokenizer-Q8_0.gguf"
-    fake_base.write_bytes(b"x")
-    fake_tok.write_bytes(b"x")
-    monkeypatch.setattr(
-        backend,
-        "_resolve_quant_paths",
-        lambda: (fake_base, fake_tok, {"base": "omnivoice-base-Q8_0.gguf",
-                                       "tokenizer": "omnivoice-tokenizer-Q8_0.gguf"}),
+        self.mod = mod
+        self.root = root
+        self.argvs: list = []
+        self.instance = mod._make_backend_class()()
+        weights, codec = root / "w-Q8_0.gguf", root / "c-Q8_0.gguf"
+        weights.write_bytes(b"0")
+        codec.write_bytes(b"0")
+        monkeypatch.setattr(
+            self.instance, "_resolve_quant_paths",
+            lambda: (weights, codec, {"base": weights.name, "tokenizer": codec.name}),
+        )
+        exe = root / "stub-tts-exe"
+        exe.write_bytes(b"\x7fELF" + b"\x00" * 16)
+        exe.chmod(0o755)
+        monkeypatch.setattr(mod, "_binary_path", lambda slug=None: exe)
+        self._runner = runner
+
+        def fake_run(argv, **_kw):
+            self.argvs.append(list(argv))
+            if self._runner:
+                self._runner(list(argv))
+            _write_3s_wav(Path(argv[argv.index("-o") + 1]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+    def flag_value(self, flag):
+        argv = self.argvs[-1]
+        return argv[argv.index(flag) + 1]
+
+
+def test_generate_translates_controls_into_flags(monkeypatch, tmp_path):
+    rig = _GgufRig(monkeypatch, tmp_path)
+    rig.instance.generate(
+        "x", instruct="whispering", duration=1.75, seed=99,
+        denoise=False, preprocess_prompt=False, chunk_duration=0, chunk_threshold=500,
     )
-    # The #1172 pre-exec preflight reads the binary, so the stub must exist
-    # on disk with a real executable magic.
-    fake_tts = tmp_path / "fake-omnivoice-tts"
-    fake_tts.write_bytes(b"\x7fELF-real-enough")
-    monkeypatch.setattr(gguf_backend, "_binary_path", lambda slug=None: fake_tts)
-
-    captured: dict = {}
-
-    def _stub_run(argv, *, input=None, text=None, capture_output=None,
-                  timeout=None, check=None, **_kw):
-        for i, a in enumerate(argv):
-            if a == "-o":
-                _write_3s_wav(Path(argv[i + 1]))
-                break
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", _stub_run)
-
-    backend.generate(
-        "hello world",
-        instruct="calm narrator",
-        duration=3.2,
-        seed=1234,
-        denoise=False,
-        preprocess_prompt=False,
-        chunk_duration=0,
-        chunk_threshold=999,
-    )
-
-    argv = captured["argv"]
-    assert argv[argv.index("--instruct") + 1] == "calm narrator"
-    assert argv[argv.index("--duration") + 1] == "3.2"
-    assert argv[argv.index("--seed") + 1] == "1234"
-    assert "--no-denoise" in argv
-    assert "--no-preprocess-prompt" in argv
-    assert argv[argv.index("--chunk-duration") + 1] == "0.0"
-    assert argv[argv.index("--chunk-threshold") + 1] == "999.0"
+    assert rig.flag_value("--instruct") == "whispering"
+    assert rig.flag_value("--duration") == "1.75"
+    assert rig.flag_value("--seed") == "99"
+    assert rig.flag_value("--chunk-duration") == "0.0"
+    assert rig.flag_value("--chunk-threshold") == "500.0"
+    assert {"--no-denoise", "--no-preprocess-prompt"} <= set(rig.argvs[-1])
 
 
-def test_generate_passes_ref_text_as_temporary_file(monkeypatch, tmp_path):
-    from engines.omnivoice_gguf import backend as gguf_backend
+def test_generate_without_controls_emits_no_extra_flags(monkeypatch, tmp_path):
+    rig = _GgufRig(monkeypatch, tmp_path)
+    rig.instance.generate("x")
+    optional = {"--instruct", "--duration", "--seed", "--no-denoise", "--no-preprocess-prompt",
+                "--chunk-duration", "--chunk-threshold", "--ref-text", "--ref-wav"}
+    assert optional.isdisjoint(rig.argvs[-1])
 
-    cls = gguf_backend._make_backend_class()
-    backend = cls()
-    fake_base = tmp_path / "omnivoice-base-Q8_0.gguf"
-    fake_tok = tmp_path / "omnivoice-tokenizer-Q8_0.gguf"
-    fake_ref = tmp_path / "reference.wav"
-    fake_base.write_bytes(b"x")
-    fake_tok.write_bytes(b"x")
-    fake_ref.write_bytes(b"x")
-    monkeypatch.setattr(
-        backend,
-        "_resolve_quant_paths",
-        lambda: (fake_base, fake_tok, {"base": fake_base.name,
-                                       "tokenizer": fake_tok.name}),
-    )
-    # The #1172 pre-exec preflight reads the binary, so the stub must exist
-    # on disk with a real executable magic.
-    fake_tts = tmp_path / "fake-omnivoice-tts"
-    fake_tts.write_bytes(b"\x7fELF-real-enough")
-    monkeypatch.setattr(gguf_backend, "_binary_path", lambda slug=None: fake_tts)
 
-    captured: dict = {}
+def test_transcript_is_handed_over_as_a_file_then_deleted(monkeypatch, tmp_path):
+    clip = tmp_path / "prompt.wav"
+    _write_3s_wav(clip)
+    seen = {}
 
-    def _stub_run(argv, *, input=None, text=None, capture_output=None,
-                  timeout=None, check=None, **_kw):
-        ref_text_path = Path(argv[argv.index("--ref-text") + 1])
-        captured["ref_text_path"] = ref_text_path
-        captured["ref_text"] = ref_text_path.read_text(encoding="utf-8")
-        for i, arg in enumerate(argv):
-            if arg == "-o":
-                _write_3s_wav(Path(argv[i + 1]))
-                break
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+    def peek(argv):
+        path = Path(argv[argv.index("--ref-text") + 1])
+        seen["path"], seen["body"] = path, path.read_bytes().decode("utf-8")
 
-    monkeypatch.setattr(subprocess, "run", _stub_run)
+    rig = _GgufRig(monkeypatch, tmp_path, runner=peek)
+    rig.instance.generate("x", ref_audio=str(clip), ref_text="caf\u00e9 au lait")
+    assert seen["body"] == "caf\u00e9 au lait"
+    assert not seen["path"].exists()
 
-    backend.generate(
-        "hello world",
-        ref_audio=str(fake_ref),
-        ref_text="reference transcript",
-    )
 
-    assert captured["ref_text"] == "reference transcript"
-    assert not captured["ref_text_path"].exists()
+def test_transcript_without_ref_audio_is_ignored(monkeypatch, tmp_path):
+    rig = _GgufRig(monkeypatch, tmp_path)
+    rig.instance.generate("x", ref_text="orphan words")
+    assert "--ref-text" not in rig.argvs[-1]
+
+
+@pytest.mark.parametrize("how", ["runner_raises", "bad_ref_audio"])
+def test_transcript_file_never_outlives_a_failed_call(monkeypatch, tmp_path, how):
+    clip = tmp_path / "prompt.wav"
+    _write_3s_wav(clip)
+    staged: list = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy(*a, **kw):
+        fd, name = real_mkstemp(*a, **kw)
+        if kw.get("suffix") == ".transcript":
+            staged.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+
+    def explode(_argv):
+        raise RuntimeError("runner failed")
+
+    rig = _GgufRig(monkeypatch, tmp_path, runner=explode if how == "runner_raises" else None)
+    if how == "runner_raises":
+        with pytest.raises(RuntimeError):
+            rig.instance.generate("x", ref_audio=str(clip), ref_text="abc")
+    else:
+        with pytest.raises(FileNotFoundError):
+            rig.instance.generate("x", ref_audio="/nonexistent-root/p.wav", ref_text="abc")
+    assert len(staged) == 1 and not staged[0].exists()
 
 
 def test_generate_blocks_freeform_ref_audio(monkeypatch, tmp_path):
@@ -557,79 +589,51 @@ def test_is_available_does_not_chmod_placeholder(monkeypatch, tmp_path):
     )
 
 
-def test_generate_zero_byte_binary_raises_typed_actionable_error(
-    monkeypatch, tmp_path
-):
-    """#1172 end-to-end at the engine layer: generate() against a 0-byte
-    binary raises InvalidBinaryError (typed, actionable) BEFORE exec —
-    never the raw OSError '[Errno 8] Exec format error'."""
-    from engines.omnivoice_gguf import backend as gguf_backend
+def _rig_without_exe(monkeypatch, root: Path, exe_bytes: bytes):
+    from engines.omnivoice_gguf import backend as mod
+
+    inst = mod._make_backend_class()()
+    weights, codec = root / "m-Q8_0.gguf", root / "k-Q8_0.gguf"
+    weights.write_bytes(b"0")
+    codec.write_bytes(b"0")
+    monkeypatch.setattr(
+        inst, "_resolve_quant_paths",
+        lambda: (weights, codec, {"base": weights.name, "tokenizer": codec.name}),
+    )
+    exe = root / "tts-candidate"
+    exe.write_bytes(exe_bytes)
+    exe.chmod(0o755)
+    monkeypatch.setattr(mod, "_binary_path", lambda slug=None: exe)
+    return inst
+
+
+def test_empty_executable_is_refused_before_spawn(monkeypatch, tmp_path):
     from services.binary_preflight import InvalidBinaryError
 
-    cls = gguf_backend._make_backend_class()
-    backend = cls()
-
-    fake_base = tmp_path / "omnivoice-base-Q8_0.gguf"
-    fake_tok = tmp_path / "omnivoice-tokenizer-Q8_0.gguf"
-    fake_base.write_bytes(b"x")
-    fake_tok.write_bytes(b"x")
-    monkeypatch.setattr(
-        backend,
-        "_resolve_quant_paths",
-        lambda: (fake_base, fake_tok, {"base": fake_base.name,
-                                       "tokenizer": fake_tok.name}),
-    )
-    placeholder = tmp_path / "omnivoice-tts-darwin-arm64"
-    placeholder.write_bytes(b"")
-    placeholder.chmod(0o755)
-    monkeypatch.setattr(gguf_backend, "_binary_path", lambda slug=None: placeholder)
-
-    def _explode(*a, **kw):
-        raise AssertionError("subprocess.run must not be called for a placeholder")
-
-    monkeypatch.setattr(subprocess, "run", _explode)
-
-    with pytest.raises(InvalidBinaryError) as exc_info:
-        backend.generate("hello")
-    msg = str(exc_info.value)
-    assert "Exec format error" not in msg
-    assert "build-omnivoice-tts.sh" in msg
+    inst = _rig_without_exe(monkeypatch, tmp_path, b"")
+    spawned = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: spawned.append(a))
+    with pytest.raises(InvalidBinaryError) as err:
+        inst.generate("say this")
+    assert spawned == []
+    text = str(err.value)
+    assert "build-omnivoice-tts.sh" in text
+    assert "Exec format error" not in text
 
 
-def test_generate_enoexec_at_spawn_becomes_typed_error(monkeypatch, tmp_path):
-    """#1172 TOCTOU leg: the file passes preflight but the OS still refuses
-    to exec it (wrong arch) — the OSError is converted to the same typed,
-    actionable InvalidBinaryError."""
+def test_kernel_refusal_at_spawn_surfaces_as_typed_error(monkeypatch, tmp_path):
     import errno
 
-    from engines.omnivoice_gguf import backend as gguf_backend
     from services.binary_preflight import InvalidBinaryError
 
-    cls = gguf_backend._make_backend_class()
-    backend = cls()
+    inst = _rig_without_exe(monkeypatch, tmp_path, b"\x7fELF" + b"\x01" * 12)
 
-    fake_base = tmp_path / "omnivoice-base-Q8_0.gguf"
-    fake_tok = tmp_path / "omnivoice-tokenizer-Q8_0.gguf"
-    fake_base.write_bytes(b"x")
-    fake_tok.write_bytes(b"x")
-    monkeypatch.setattr(
-        backend,
-        "_resolve_quant_paths",
-        lambda: (fake_base, fake_tok, {"base": fake_base.name,
-                                       "tokenizer": fake_tok.name}),
-    )
-    fake_tts = tmp_path / "omnivoice-tts-linux-x86_64"
-    fake_tts.write_bytes(b"\x7fELF-wrong-arch")
-    monkeypatch.setattr(gguf_backend, "_binary_path", lambda slug=None: fake_tts)
+    def refuse(*_a, **_k):
+        raise OSError(errno.ENOEXEC, "wrong architecture")
 
-    def _enoexec(argv, **kw):
-        raise OSError(errno.ENOEXEC, "Exec format error", argv[0])
-
-    monkeypatch.setattr(subprocess, "run", _enoexec)
-
-    with pytest.raises(InvalidBinaryError) as exc_info:
-        backend.generate("hello")
-    assert "build-omnivoice-tts.sh" in str(exc_info.value)
+    monkeypatch.setattr(subprocess, "run", refuse)
+    with pytest.raises(InvalidBinaryError, match="build-omnivoice-tts.sh"):
+        inst.generate("say this")
 
 
 def test_select_default_falls_back_on_zero_byte_placeholder(monkeypatch, tmp_path):

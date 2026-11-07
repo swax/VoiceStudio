@@ -24,6 +24,8 @@ def settings_mod(monkeypatch, clean_llm_env):
     # clean_llm_env clears the full LLM-provider env surface (not just the
     # TRANSLATE_* quartet) so 'empty state' really is empty even when an
     # earlier `main` import dotenv-loaded provider keys into os.environ (#878).
+    from services import settings_store
+    monkeypatch.setattr(settings_store, "set_secret", lambda *a, **k: None)
     import core.prefs as prefs
     monkeypatch.setattr(prefs, "set_", lambda *a, **k: None)
     monkeypatch.setattr(prefs, "delete", lambda *a, **k: None)
@@ -88,3 +90,15 @@ def test_short_key_masks_to_set(settings_mod):
         settings_mod._LLMEndpointBody(base_url="http://x/v1", api_key="abc")
     )
     assert state["api_key_masked"] == "set"
+
+
+def test_legacy_endpoint_key_never_reaches_plaintext_prefs(settings_mod, monkeypatch):
+    from services import settings_store
+    from core import prefs
+    saved, removed = [], []
+    monkeypatch.setattr(settings_store, "set_secret", lambda *args: saved.append(args))
+    monkeypatch.setattr(prefs, "set_", lambda *args: pytest.fail("plaintext secret"))
+    monkeypatch.setattr(prefs, "delete", lambda key: removed.append(key))
+    settings_mod.set_llm_endpoint(settings_mod._LLMEndpointBody(api_key="fixture"))
+    assert saved == [("translation_env.TRANSLATE_API_KEY", "fixture")]
+    assert "env.TRANSLATE_API_KEY" in removed

@@ -53,7 +53,7 @@ if (quitDuringStartup && !existing)
   throw new Error('--quit-during-startup requires VOICESTUDIO_TEST_PROFILE with a managed runtime');
 const activate = (locator) =>
   extractAndRun || wayland ? locator.dispatchEvent('click') : locator.click();
-let env = { ...process.env };
+let env = { ...process.env, OMNIVOICE_ENV_FILE: resolve(profile, 'user-env') };
 let verifyManagedShutdown = false;
 if (setup || install || existing) {
   const server = createServer();
@@ -199,7 +199,16 @@ try {
       setupLayout.scrollWidth <= setupLayout.width + 1,
       'Setup gate must not overflow horizontally',
     );
-    await window.getByRole('button', { name: 'Install local runtime', exact: true }).waitFor();
+    const setupStatus = await waitForRuntimeGate(window, 30_000);
+    const installButton = window.getByRole('button', { name: 'Install local runtime', exact: true });
+    if (process.platform === 'darwin' && targetArch === 'x64') {
+      assert.equal(setupStatus.setupIssue, 'unsupported_platform');
+      await window.getByRole('textbox', { name: 'Backend URL', exact: true }).waitFor();
+      await window.getByRole('button', { name: 'Test connection', exact: true }).waitFor();
+      assert.equal(await installButton.count(), 0, 'Intel Macs must offer remote setup');
+    } else {
+      await installButton.waitFor();
+    }
     assert.equal(
       await window.evaluate(() => typeof window.voicestudio.backend.cleanSetupRuntime),
       'function',
@@ -294,7 +303,7 @@ try {
     }
     if (firstSound) {
       const continueButton = window.getByRole('button', {
-        name: 'All good — continue',
+        name: 'Continue',
         exact: true,
       });
       const systemCheck = window.getByRole('button', {

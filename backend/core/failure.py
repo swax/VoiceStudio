@@ -15,6 +15,7 @@ Guarantees:
 """
 from __future__ import annotations
 
+import errno
 import os
 import platform
 import re
@@ -70,6 +71,40 @@ class NoAudioTrackError(ValueError):
         super().__init__(message)
 
 
+INVALID_MEDIA_FILE_MESSAGE = (
+    "The selected media file is damaged or incomplete, so its audio cannot be read. "
+    "Choose a finished, playable file or download a fresh copy."
+)
+
+
+class InvalidMediaFileError(ValueError):
+    """The source container is incomplete or unreadable before any dub work."""
+
+    code = "invalid_media_file"
+    docs_topic = "INVALID_MEDIA_FILE"
+
+    def __init__(self, message: str = INVALID_MEDIA_FILE_MESSAGE):
+        super().__init__(message)
+
+
+SOURCE_LANGUAGE_REQUIRED_MESSAGE = (
+    "Speech recognition did not report which language this video is spoken in, "
+    "so batch dubbing cannot translate it. Open the video in Dubbing and choose "
+    "its source language, or select a speech recognition model that detects the "
+    "language, then try again."
+)
+
+
+class SourceLanguageRequiredError(ValueError):
+    """ASR reported no language and nobody chose one, so there is nothing to translate from."""
+
+    code = "source_language_required"
+    docs_topic = "SOURCE_LANGUAGE_REQUIRED"
+
+    def __init__(self, message: str = SOURCE_LANGUAGE_REQUIRED_MESSAGE):
+        super().__init__(message)
+
+
 def is_no_audio_stream_stderr(text: "str | bytes | None") -> bool:
     """True when ffmpeg's stderr says the input had no audio stream to extract.
 
@@ -94,46 +129,42 @@ def no_audio_track_detail() -> dict[str, str]:
         "hint": _HINTS["NO_AUDIO_TRACK"],
     }
 
+def invalid_media_file_detail() -> dict[str, str]:
+    """Structured HTTP ``detail`` for an unreadable or non-media upload."""
+    return {
+        "code": InvalidMediaFileError.code,
+        "docs_topic": InvalidMediaFileError.docs_topic,
+        "message": INVALID_MEDIA_FILE_MESSAGE,
+        "hint": _HINTS["INVALID_MEDIA_FILE"],
+    }
+
 # One-line "what to do" per docs-taxonomy key. Keys mirror error_docs_map's
 # taxonomy; the docs URL itself stays owned by error_docs_map.
 _HINTS: dict[str, str] = {
-    "GPU_OOM": "Close other GPU-heavy apps or unload models, then retry. You can also choose CPU in Settings → Performance & Device or select a smaller TTS engine.",
+    "GPU_OOM": "Close other GPU-heavy apps or unload models, then retry. If another program is holding most of the GPU, or this computer has a second GPU, pick a different one in Settings → Performance & Device. You can also choose CPU there or select a smaller TTS engine.",
     "GPU_ARCH_UNSUPPORTED": "This PyTorch build does not support your GPU. Choose CPU in Settings → Performance & Device, or install a compatible PyTorch build.",
-    "WORKER_AT_CAPACITY": "Wait for a running job on that worker to finish, or choose another available worker and retry.",
-    "MODEL_NOT_INSTALLED": "Install or enable this engine on the worker machine, then refresh its capabilities and retry.",
-    "MODEL_NOT_DOWNLOADED": "Open Models, install this model on the selected worker, then retry when the download completes.",
-    "INSUFFICIENT_MEMORY": "Choose a worker with more free GPU memory, unload another model there, or use a smaller model and retry.",
-    "OPERATION_UNSUPPORTED": "Choose a worker whose capability list includes this operation, or run the job locally.",
-    "ACCEPT_TIMEOUT": "Check that the worker is responsive and not overloaded, then reconnect it and retry.",
-    "MODEL_LOAD_TIMEOUT": "Check the worker's model download and load status, then retry after the model is ready.",
-    "EXECUTION_TIMEOUT": "Check the worker for a stalled engine or GPU error, restart that engine if needed, then retry.",
-    "PROGRESS_LEASE_EXPIRED": "Check the worker connection and engine log, reconnect or restart the worker, then retry the job.",
-    "RESULT_DELIVERY_TIMEOUT": "Check the connection and free disk space on both machines, then reconnect the worker and retry.",
-    "INPUT_FETCH_TIMEOUT": "Check the connection to the worker and retry; keep both machines awake until the reference file finishes transferring.",
-    "INPUT_FETCH_FAILED": "Check that the source file still exists and both machines are connected, then submit the job again.",
-    "RESULT_UPLOAD_FAILED": "Check the worker connection and free disk space on this machine, reconnect the worker, then retry.",
-    "WORKER_FAILED": "Open the selected worker's log for the underlying error, fix it there, then reconnect and retry.",
-    "SESSION_EXPIRED": "Reconnect the worker; if it cannot renew its session, remove it and enroll it again.",
-    "STALE_EPOCH": "Reconnect the worker so it receives the current session, then retry the job.",
-    "STALE_ATTEMPT": "Refresh the job state and retry only if the current attempt has not already completed elsewhere.",
-    "UPGRADE_REQUIRED": "Update VoiceStudio on the machine named in the error, then reconnect the worker.",
-    "WORKER_REVOKED": "Add the worker again from Settings → System → Remote workers to create a new trusted enrollment.",
-    "AUTH_FAILED": "Remove this worker, generate a new enrollment token, and add it again.",
-    "INVALID_TASK_PARAMS": "Review the job inputs, correct the invalid or missing value named in the error, and submit it again.",
-    "MODEL_REF_REJECTED": "Select a model from VoiceStudio's catalog on that worker instead of a path or custom model reference.",
-    "RESULT_TOO_LARGE": "Shorten or split the job so each result is smaller, then render the parts separately.",
-    "ARTIFACT_TOO_LARGE": "Shorten or split the job so each uploaded artifact is smaller, then render the parts separately.",
-    "OFFSET_MISMATCH": "Reconnect the worker and retry the upload from the byte count reported by the control plane.",
-    "SIZE_MISMATCH": "Reconnect the worker and retry the result upload; if it repeats, restart the worker before rerendering.",
-    "DIGEST_MISMATCH": "Retry the result upload; if it repeats, check the worker's disk and network for corruption, then rerender.",
-    "UPLOAD_INCOMPLETE": "Reconnect the worker and resume the result upload from the byte count reported by the control plane.",
+    # #2462: the HOST ran out of RAM, not a GPU. On a CPU-only machine there is
+    # no device to spill to, so *every* out-of-memory failure there is this
+    # class — and GPU_OOM's "close other GPU-heavy apps … or choose CPU" is
+    # nonsense on a machine already running on CPU, which is why the reporter
+    # was told to go and check their engine instead. A separate class (not a
+    # wider GPU_OOM) because the remedy differs: free system RAM, not VRAM.
+    "HOST_MEMORY_EXHAUSTED": "The machine ran out of memory during generation. Close other memory-heavy apps and browser tabs, unload models you are not using with Flush models, render a shorter passage, or select a lighter TTS engine. On Windows, enlarging the page file also gives a large engine room to load.",
+    # ENOSPC/EDQUOT, Windows ERROR_DISK_FULL/ERROR_HANDLE_DISK_FULL: a write
+    # failed because the volume holding VoiceStudio's data, model cache or temp
+    # folder is full. Retrying the same request fails identically until space
+    # is freed, and no engine or device change helps.
+    "DISK_FULL": "The disk is full, so VoiceStudio could not write a file. Free space on the drive that holds VoiceStudio's data, model cache or temp folder (Settings → Storage shows disk usage, clears temporary files and lists the largest models), then try again.",
     "PKG_RESOURCES_MISSING": "Run `uv pip install --reinstall 'setuptools>=75,<80'` in the backend venv (a plain install is skipped when setuptools' metadata is present but its pkg_resources files were removed by antivirus). Restart after.",
     "GATEKEEPER_QUARANTINE": "Clear the macOS quarantine flag (xattr -cr the app), then reopen.",
     "APPIMAGE_WEBKIT_WHITESCREEN": "Launch with WEBKIT_DISABLE_DMABUF_RENDERER=1 set.",
-    "HF_AUTH_FAILED": "Set a valid HF_TOKEN in Settings → Hugging Face and retry.",
+    "HF_AUTH_FAILED": "Set a valid HF_TOKEN in Settings → Hugging Face and retry. If the model is gated, open its Hugging Face page and accept its access terms first.",
     "DIARIZATION_MODEL_MISSING": "Install or repair the selected diarisation model in Settings > Models > Diarisation, then retry transcription.",
     "DIARIZATION_LOAD_FAILED": "Open Settings > Logs > Backend for the model load error, then retry transcription after correcting it.",
     "PYANNOTE_LICENSE_REQUIRED": "Accept the pyannote model licenses on Hugging Face, then retry.",
+    # Set by the model install when a gated model fails on a mirror the user
+    # chose: mirrors never receive the token, so no token change can help.
+    "HF_MIRROR_GATED": "This model is gated, and mirrors never receive your Hugging Face token. Switch to Hugging Face (official) in Settings → Models → Hugging Face mirror, then retry.",
     "POCKETTTS_GATED_WEIGHTS": "PocketTTS weights are gated on HuggingFace. Accept the access agreement at huggingface.co/kyutai/pocket-tts, then set HF_TOKEN in Settings → Hugging Face and retry.",
     "COMPUTE_TYPE_UNSUPPORTED": "Your GPU doesn't support float16 — VoiceStudio retried on int8. If transcription still fails, set OMNIVOICE/ASR_COMPUTE_TYPE=int8 or use CPU.",
     # Literal versions, not `--constraint deploy/torch-constraints.txt`:
@@ -143,7 +174,7 @@ _HINTS: dict[str, str] = {
     # (greptile on #1377). tests/test_failure_classify.py pins these literals
     # to the constraint file so they cannot drift when the pins bump.
     "TRANSFORMERS_IMPORT": "A transformers component could not load. Missing packages and torch/torchvision version mismatches are possible causes, not a diagnosis. Check the underlying traceback and installed package versions first. If a package mismatch or incomplete install is confirmed, reinstall them together at the pinned versions (`uv pip install --python .venv --reinstall torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 transformers` in the project folder), then restart the backend. If only transcription is affected, switching ASR to faster-whisper (Use on its row in Model Catalogue) also works around it.",
-    "WINDOWS_APP_CONTROL_BLOCKED": "Windows refused to load a file VoiceStudio needs — an Application Control policy (Smart App Control, WDAC, or AppLocker) blocked it. On a personal PC: Windows Security → App & browser control → Smart App Control → Off (Windows only lets you turn it off once — re-enabling requires a Windows reset), then restart VoiceStudio. On a managed/work PC, ask IT to allow the VoiceStudio install folder.",
+    "WINDOWS_APP_CONTROL_BLOCKED": "Windows refused to load a file VoiceStudio needs. An Application Control policy blocked it. Smart App Control, WDAC, or AppLocker can cause this. If Windows Security shows that Smart App Control is on, turn it off: Windows Security → App & browser control → Smart App Control → Off, then restart VoiceStudio. On a managed/work PC, ask IT to allow the VoiceStudio install folder.",
     "WINDOWS_PAGING_FILE_TOO_SMALL": "Windows ran out of virtual memory while mapping the model into memory — its paging file is smaller than the model needs. This is not the same as your RAM being full, and closing other apps usually won't fix it: Windows has to be allowed to back the mapping. Set a bigger paging file — Settings → System → About → Advanced system settings → Performance → Settings → Advanced → Virtual memory → Change: untick \"Automatically manage\", pick your system drive, choose \"Custom size\" and set both Initial and Maximum to at least 32768 MB (more than the model's size), then OK and restart Windows. A smaller/quantized engine (OmniVoice GGUF, Supertonic-3) also avoids the large mapping entirely.",
     "WINDOWS_UNTRUSTED_MOUNT": "Windows refused to walk a folder on the way to this file because the path crosses a mount point it does not trust (WinError 448). That is a Windows rule about the VOLUME, not about VoiceStudio or the file itself — it turns up on Dev Drives, on mounted VHD/ReFS volumes, and on junctions pointing into another user profile, so retrying the same link cannot help. Point VoiceStudio at a folder on an ordinary local drive instead: Settings → Storage → data directory, or the download/output folder named in the message. If that folder has to stay where it is, trust the volume with `fsutil devdrv trust <drive>:` from an elevated prompt and restart.",
     "INPUT_TOO_SHORT": "The input was too short for this engine to process — its first convolution needs more frames than the text (or the reference clip) produced. This is a hard limit of the model, not a transient failure, so retrying the same input will fail the same way. Give it a few more words, or a longer reference clip: a short phrase rather than one or two characters, and about a second of speech rather than a fragment.",
@@ -180,6 +211,17 @@ _HINTS: dict[str, str] = {
     # stream … Error opening output files: Invalid argument", which the dub
     # page showed verbatim and which read as a disk/permission problem.
     "NO_AUDIO_TRACK": "Check that the file plays with sound in a media player. If its audio is in a separate file, choose that file instead, or merge the audio into the video first.",
+    # The ASR engine (e.g. a whisper.cpp build without language metadata)
+    # reported no language. Batch has no source picker, so Dubbing is the place
+    # to choose one; guessing English would translate the wrong language.
+    "SOURCE_LANGUAGE_REQUIRED": "Open the video in Dubbing, choose its source language and translate there, or pick a speech recognition model in Model Catalogue that detects the spoken language.",
+    "INVALID_MEDIA_FILE": "Check the source in a media player. If it cannot play, wait for the download or copy to finish, free disk space if needed, then download a fresh copy and upload it again.",
+    # #2929/#2678: the voice has no transcript and no speech-to-text model is
+    # installed to produce one, so the only advice that works is one of those two.
+    "REFERENCE_STT_MISSING": "This voice has no transcript, and no speech-to-text model is installed to write one. Type what the reference clip says into the transcript box (clips up to 20 seconds), or install a speech-to-text model in Model Catalogue (Whisper is a good default), select it, then generate again.",
+    # A Python package the engine imports is absent from VoiceStudio's
+    # environment. Not memory, not the GPU, not the network.
+    "ENGINE_DEPENDENCY_MISSING": "A Python package this engine needs is not installed in VoiceStudio's environment, so the engine could not start. Open Model Catalogue, select the engine and use Install / Repair, then restart VoiceStudio. If it still fails, switch to another engine and include the engine name in your report.",
     # HF_MIRROR_UNREACHABLE has a DYNAMIC hint (it names the configured mirror)
     # — see hf_mirror_hint(); build_failure special-cases it.
 }
@@ -255,6 +297,53 @@ _HF_CONTEXT_MARKERS = (
     "locate the file on the hub",
     "snapshot_download",
 )
+
+
+_DISK_FULL_SIGNATURES = (
+    "no space left",
+    # Linux says "Disk quota exceeded"; macOS says "Disc quota exceeded".
+    "disk quota exceeded", "disc quota exceeded",
+    "not enough space on the disk",
+)
+# The numeric spellings, bounded so ``[WinError 390]`` / ``[Errno 280]`` never
+# match. Windows ERROR_DISK_FULL (112) and ERROR_HANDLE_DISK_FULL (39); ENOSPC
+# is 28 on every platform this app ships on.
+_DISK_FULL_CODE_RE = re.compile(r"\berrno 28\b|\bwinerror (?:112|39)\b")
+
+
+def _has_disk_full_signature(low: str) -> bool:
+    return any(sig in low for sig in _DISK_FULL_SIGNATURES) or bool(_DISK_FULL_CODE_RE.search(low))
+# EDQUOT is 122 on Linux and 69 on macOS (absent on Windows) — use the platform's.
+_DISK_FULL_ERRNOS = frozenset(
+    n for n in (getattr(errno, "ENOSPC", None), getattr(errno, "EDQUOT", None)) if n is not None
+)
+
+
+def is_disk_full_error(reason: "BaseException | str | None") -> bool:
+    """True when a failure is the volume being full (ENOSPC/EDQUOT, WinError
+    112/39). ``classify`` names it DISK_FULL; install/download paths use it to
+    stop retrying.
+
+    Accepts an exception (checks ``errno``/``winerror`` through the
+    ``__cause__``/``__context__`` chain, so a wrapped ``OSError`` still counts) or
+    the text of one. Disk-full is not transient: retrying with backoff only
+    delays the message, and the generic "network hiccup" hints are wrong for it.
+    Never raises."""
+    try:
+        if isinstance(reason, BaseException):
+            seen: set[int] = set()
+            exc: "BaseException | None" = reason
+            while exc is not None and id(exc) not in seen:
+                seen.add(id(exc))
+                if getattr(exc, "errno", None) in _DISK_FULL_ERRNOS or getattr(exc, "winerror", None) in (39, 112):
+                    return True
+                if _has_disk_full_signature(str(exc).lower()):
+                    return True
+                exc = exc.__cause__ or exc.__context__
+            return False
+        return _has_disk_full_signature((reason or "").lower())
+    except Exception:
+        return False
 
 
 def is_hf_connectivity_error(reason: Optional[str]) -> bool:
@@ -353,23 +442,32 @@ _CONTEXT_FREE_HINT_CLASSES = frozenset({
     # Device allocator signatures are specific enough to attach the shared
     # recovery without exposing CUDA's process table or filesystem paths.
     "GPU_OOM",
-    # #2177: CUDA's own "no kernel image is available for execution" — a driver
-    # sentence no other failure produces, and the one class a streaming render
-    # on an unsupported card hits every single time. The non-streaming path has
-    # named this since #756; the streaming frame could only answer with the
-    # floor message, so the report arrived as a bare RuntimeError.
+    # #2462: an allocator/OS "not enough memory" string — a machine signature
+    # nothing else produces, and the ONLY memory class a CPU-only host can
+    # produce. Without it, every OOM on a machine with no GPU reached the user
+    # as the bare "Generation failed. Check the selected engine and try
+    # again." with no hint, and the reporter could only file a RuntimeError.
+    "HOST_MEMORY_EXHAUSTED",
+    # Matched on the OS's own errno/winerror (ENOSPC, EDQUOT, WinError 112/39)
+    # or its fixed "no space left on device" wording — nothing else produces
+    # them. Without it a full disk reached every context-free surface (the
+    # global 500 handler, the streaming frame) as the bare "VoiceStudio hit an
+    # internal error" even though the error journal already named DISK_FULL.
+    "DISK_FULL",
+    # CUDA's own "no kernel image is available" sentence: only a torch build
+    # lacking kernels for this GPU's architecture produces it.
     "GPU_ARCH_UNSUPPORTED",
-    # #1227's trigger is the numeric WinError (4551/1260), locale-independent
-    # and unmistakable — the same reasoning that already admits
-    # WINDOWS_UNTRUSTED_MOUNT (448) and WINDOWS_PAGING_FILE_TOO_SMALL (1455).
-    # Left out when those two were added, so a blocked load reached a streaming
-    # render with no way to learn an Application Control policy caused it.
+    # Keyed on the numeric WinError (4551/1260), which no other failure
+    # raises; previously only the non-streaming path surfaced its hint.
     "WINDOWS_APP_CONTROL_BLOCKED",
-    # Matched on the library name or ``audio_io.AUDIO_WRITE_FAILED_MARKER`` — a
-    # marker chosen over generic wording precisely so an unrelated open cannot
-    # claim the audio remedy. The desktop app already routes this topic to
-    # Settings → Storage, a recovery that could never fire while the hint was
-    # dropped before reaching the client.
+    # Matched on SOURCE_LANGUAGE_REQUIRED_MESSAGE, a sentence this app writes
+    # itself (SourceLanguageRequiredError), so no foreign text can claim it.
+    # It is terminal, and a terminal class without its hint would end a render
+    # while explaining nothing.
+    "SOURCE_LANGUAGE_REQUIRED",
+    # Keyed on the audio library's name or the audio-write marker in
+    # ``audio_io``; the desktop app already sends this topic to Settings ->
+    # Storage.
     "AUDIO_IO_FAILED",
     "SOCKS_PROXY_SUPPORT_MISSING",
     "SSL_HANDSHAKE_FAILURE",
@@ -405,29 +503,35 @@ _CONTEXT_FREE_HINT_CLASSES = frozenset({
     # Triggered by a VoiceStudio-authored sentence or ffmpeg's own no-stream
     # wording; it reaches the user through an upload's error response.
     "NO_AUDIO_TRACK",
+    # Each is matched on wording only that failure produces: a Python
+    # ModuleNotFoundError sentence and VoiceStudio's own reference-transcript
+    # sentence.
+    "ENGINE_DEPENDENCY_MISSING",
+    "REFERENCE_STT_MISSING",
 })
 
 
-#: Classes that cannot succeed on a retry of the same request. The failure is in
-#: the build, the device selection or an OS policy — none of which a second
-#: render changes — so the stream frame marks them terminal rather than
-#: inviting the "try again" the floor message ends with. #2177's reporter ran
-#: the same generation twice, ninety seconds apart, to the same result.
-#:
-#: `terminal` also stops the client re-rendering the whole text on the classic
-#: path (``shouldFallbackToClassic``), which for these classes would fail
-#: identically after paying for the render twice.
+# Classes where retrying the identical request cannot help: the cause is the
+# build, the device choice, an OS policy, or content that is simply absent.
+# Each member must also be in _CONTEXT_FREE_HINT_CLASSES, otherwise a render
+# would be declared final without saying why. Disk space and memory can
+# recover, so AUDIO_IO_FAILED / GPU_OOM / HOST_MEMORY_EXHAUSTED stay out.
 _TERMINAL_FAILURE_CLASSES = frozenset({
     "GPU_ARCH_UNSUPPORTED",
     "WINDOWS_APP_CONTROL_BLOCKED",
-    # The same file has no audio on every retry.
     "NO_AUDIO_TRACK",
+    "SOURCE_LANGUAGE_REQUIRED",
+    "ENGINE_DEPENDENCY_MISSING",
+    "REFERENCE_STT_MISSING",
 })
 
 
 def is_terminal_failure_topic(topic: str | None) -> bool:
-    """Whether repeating the same render cannot repair the diagnosed cause."""
-    return topic in _TERMINAL_FAILURE_CLASSES
+    """True when ``topic`` names a failure that a retry will reproduce."""
+    try:
+        return isinstance(topic, str) and topic in _TERMINAL_FAILURE_CLASSES
+    except Exception:
+        return False
 
 
 def append_hint(text: str) -> str:
@@ -453,6 +557,8 @@ _GPU_OOM_SIGNATURES = (
     "mps backend out of memory",
     "hip out of memory",
     "out of memory on device",
+    "xpu out of memory",           # torch's Intel XPU caching allocator
+    "out_of_device_memory",        # Intel XPU driver: UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
 )
 
 
@@ -478,22 +584,122 @@ def is_gpu_oom(error: BaseException | str) -> bool:
     return False
 
 
-def classify(reason: str) -> str:
+# Host-RAM exhaustion — the machine ran out of system memory, not a GPU (#2462).
+# Every entry is a machine string from an allocator or the OS, never a phrase a
+# dependency writes in prose: attaching a "free some RAM" remedy to an unrelated
+# failure is the #1943 failure mode, and the trigger has to be as unmistakable
+# as the device signatures above are.
+_HOST_OOM_SIGNATURES = (
+    # torch's own CPU allocator, which is what a CPU render produces:
+    #   RuntimeError: [enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator:
+    #   not enough memory: you tried to allocate 2000000000 bytes.
+    "defaultcpuallocator: not enough memory",
+    "not enough memory: you tried to allocate",
+    # c10/ATen allocation failures.
+    "can't allocate memory",
+    "cannot allocate memory",
+    # std::bad_alloc — the C++ allocator's own exception, which arrives as a
+    # RuntimeError because torch wraps it.
+    "std::bad_alloc",
+    # Windows WinError 8. Deliberately NOT matched on a bare "not enough
+    # memory": the paging-file class (WinError 1455, "the paging file is too
+    # small for this operation to complete") has its own, more specific remedy
+    # and must keep it.
+    "not enough memory to continue the execution of the program",
+    # The same condition by its number, which survives a localized OS message
+    # (ERROR_NOT_ENOUGH_MEMORY = 8, "Not enough memory resources are available
+    # to process this command"). Bracketed so WinError 80/87/1455 never match.
+    "[winerror 8]",
+)
+
+
+def is_host_oom(error: BaseException | str) -> bool:
+    """Recognize host-RAM exhaustion through wrappers without importing torch.
+
+    The twin of :func:`is_gpu_oom` for the other memory device. Kept separate
+    rather than folded into that one because the recovery differs: freeing
+    VRAM cannot help a machine with no GPU, and the existing OOM retry in
+    ``tts_backend`` calls ``free_vram()`` — advice a CPU-only host cannot
+    follow (#2462). Never raises.
+    """
+    pending: list[BaseException] = [error] if isinstance(error, BaseException) else []
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        # isinstance, so a MemoryError subclass raised to explain itself (the
+        # reference-encode preflight, #3340) keeps the host-RAM remedy.
+        if isinstance(current, MemoryError):
+            return True
+        # OSError.winerror carries the number even when the text is localized.
+        if getattr(current, "winerror", None) == 8:
+            return True
+        if any(signature in str(current).lower() for signature in _HOST_OOM_SIGNATURES):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    if isinstance(error, str):
+        return any(signature in error.lower() for signature in _HOST_OOM_SIGNATURES)
+    return False
+
+
+def classify(reason: BaseException | str) -> str:
     """Map a failure reason to a docs-taxonomy key, or "" when unknown.
 
     Heuristic substring match — mirrors the frontend ``classifyError`` so the
     backend log / diagnostic names the same class the UI deeplink will use.
+
+    Accepts an exception as well as a message (#2462). A message is all the
+    older callers have and all most rules need, but the memory classes cannot
+    work from one: a bare ``MemoryError()`` has an EMPTY message, and
+    ``generation._oom_friendly_reraise`` replaces the allocator's own wording
+    with its own "ran out of memory" prose. In both cases ``str(exc)`` carries
+    no allocator signature, so the failure that IS a host OOM classifies to
+    nothing and the user gets the floor message. The exception's TYPE, and the
+    originals re-raised behind it, are the only evidence left — so when handed
+    one, the two chain-walking memory helpers get first refusal on it and the
+    message rules run on ``str(exc)`` exactly as before.
     """
+    if isinstance(reason, BaseException):
+        # GPU first, so a real device OOM keeps GPU_OOM (and its VRAM remedy)
+        # even when the host was short too — same precedence as the message
+        # path below, so passing an exception can never disagree with a string.
+        if is_gpu_oom(reason):
+            return "GPU_OOM"
+        if is_host_oom(reason):
+            return "HOST_MEMORY_EXHAUSTED"
+        # The errno/winerror of a disk-full OSError (anywhere in the chain)
+        # survives an exception whose message was replaced or localized.
+        disk_full = is_disk_full_error(reason)
+        # Every other rule is a message rule; unchanged behavior from here.
+        reason = str(reason)
+    else:
+        disk_full = False
     low = (reason or "").lower()
     if is_gpu_oom(low):
         return "GPU_OOM"
-    # #2177: the GPU's compute capability isn't in this torch build's arch list,
-    # so CUDA refuses to launch kernels. Checked after the OOM branch so real
-    # memory pressure is never relabelled, and matched on CUDA's own sentence —
-    # nothing else produces it, which is what makes the hint safe to attach on
-    # the context-free surfaces. ``generation.py`` already re-raises this class
-    # with the same remedy; without a topic the streaming frame could only show
-    # "Generation failed. Check the selected engine and try again."
+    # #2462: the host itself ran out of RAM. After the device branch above, so a
+    # real GPU OOM keeps GPU_OOM (and its VRAM remedy) rather than being told to
+    # close memory-heavy apps; before everything else, because on a CPU-only
+    # machine this is the ONLY memory class that can occur and it used to fall
+    # all the way through to the unclassified floor message.
+    if is_host_oom(low):
+        return "HOST_MEMORY_EXHAUSTED"
+    # The volume is full (ENOSPC/EDQUOT, WinError 112/39). After the memory
+    # classes, which name RAM rather than disk; before every message rule, so a
+    # path in the OS sentence (an AppImage mount, a "quarantine" folder) or an
+    # engine/transformers wording around it can never claim the failure. The
+    # one exception is a video download, whose own class names the job folder
+    # it could not write (#1225) — a strictly more specific remedy.
+    if (disk_full or is_disk_full_error(low)) and not _is_download_write_refusal(reason, low):
+        return "DISK_FULL"
+    # The CUDA runtime's wording for "this torch build has no kernels for the
+    # GPU's compute capability". Placed after the memory/disk classes so real
+    # resource pressure keeps its own class.
     if "no kernel image is available" in low:
         return "GPU_ARCH_UNSUPPORTED"
     # Before the errno / "invalid argument" rules: ffmpeg's no-stream failure
@@ -501,6 +707,10 @@ def classify(reason: str) -> str:
     # OS write refusal and must not be handed the TEMP-folder remedy.
     if NO_AUDIO_TRACK_MESSAGE.lower() in low or is_no_audio_stream_stderr(low):
         return "NO_AUDIO_TRACK"
+    if INVALID_MEDIA_FILE_MESSAGE.lower() in low:
+        return "INVALID_MEDIA_FILE"
+    if SOURCE_LANGUAGE_REQUIRED_MESSAGE.lower() in low:
+        return "SOURCE_LANGUAGE_REQUIRED"
     if "pkg_resources" in low:
         return "PKG_RESOURCES_MISSING"
     if "quarantine" in low or "is damaged" in low or "gatekeeper" in low:
@@ -512,6 +722,8 @@ def classify(reason: str) -> str:
         or "share your contact" in low
         or "access agreement" in low
         or "access conditions" in low
+        # pocket-tts' own wording when the gated cloning weights are missing.
+        or "weights for the model with voice cloning" in low
     ) and ("pocket" in low or "kyutai" in low):
         return "POCKETTTS_GATED_WEIGHTS"
     diarisation = any(marker in low for marker in (
@@ -529,7 +741,15 @@ def classify(reason: str) -> str:
             return "DIARIZATION_MODEL_MISSING"
         if any(marker in low for marker in ("failed to load", "load failed", "runtime failed")):
             return "DIARIZATION_LOAD_FAILED"
-    if (diarisation and access_failure) or ("gated" in low and "model" in low) or "accept the" in low:
+    if diarisation and access_failure:
+        return "PYANNOTE_LICENSE_REQUIRED"
+    # Any other gated repo (Sesame CSM's prompts, Llama tokenizers, ...) is a
+    # token/access problem for THAT model. Sending it to the pyannote class
+    # told users to accept diarisation licenses for a TTS model; error_journal
+    # already files GatedRepoError under HF_AUTH_FAILED.
+    if "gatedrepoerror" in low or ("gated" in low and ("repo" in low or "model" in low)):
+        return "HF_AUTH_FAILED"
+    if "accept the" in low:
         return "PYANNOTE_LICENSE_REQUIRED"
     # ASR robustness (#551 / #549): name the class so the no-segments toast is
     # actionable. Place before the generic returns so a compute-type/transformers
@@ -552,9 +772,7 @@ def classify(reason: str) -> str:
     # under the VoiceStudio data dir, not the system temp dir. Checked first so
     # a download's errno 22 stops being handed the transcribe path's
     # "check your TEMP folder" hint, which sends the user to the wrong place.
-    if is_os_write_refusal(reason) and any(
-        marker in low for marker in _DOWNLOAD_CONTEXT_MARKERS
-    ):
+    if _is_download_write_refusal(reason, low):
         return "VIDEO_DOWNLOAD_OS_ERROR"
     # #1256: a third-party library shelled out to `ffprobe`/`ffmpeg` BY NAME and
     # the OS had nothing to run. VoiceStudio's own code always resolves the
@@ -770,6 +988,14 @@ def classify(reason: str) -> str:
     # quote keeps a legitimately-named `omnivoice_*` helper from matching.
     if "no module named 'omnivoice'" in low:
         return "BROKEN_VENV"
+    # The reference clip has no transcript and no speech-to-text model exists to
+    # write one (omnivoice.models.omnivoice._ReferenceAsrNotInstalled).
+    if "automatic reference transcription needs an installed speech-to-text" in low:
+        return "REFERENCE_STT_MISSING"
+    # Last and narrowest-by-type: an engine imported a package that is not
+    # installed. Every earlier no-module rule (encodings, omnivoice) wins first.
+    if "no module named '" in low:
+        return "ENGINE_DEPENDENCY_MISSING"
     return ""
 
 
@@ -781,7 +1007,10 @@ def classify(reason: str) -> str:
 #
 # The real diagnosis is always AFTER the banner. Strip the boilerplate so the
 # message starts at the first line that is actually about this run.
-_FFMPEG_BANNER_START = re.compile(r"^\s*(ffmpeg|ffprobe)\s+version\s", re.IGNORECASE)
+_FFMPEG_BANNER_START = re.compile(
+    r"^\s*(?:(?P<prefix>[^\n]{1,200}?):\s*)?(ffmpeg|ffprobe)\s+version\s",
+    re.IGNORECASE,
+)
 _FFMPEG_BANNER_CONT = re.compile(
     r"^\s+(built with|configuration:|lib[a-z]+\s+\d)", re.IGNORECASE
 )
@@ -799,7 +1028,11 @@ def strip_ffmpeg_banner(text: Optional[str]) -> str:
     lines = str(text).splitlines()
     kept, in_banner = [], False
     for line in lines:
-        if _FFMPEG_BANNER_START.match(line):
+        banner = _FFMPEG_BANNER_START.match(line)
+        if banner:
+            prefix = (banner.group("prefix") or "").strip()
+            if prefix:
+                kept.append(f"{prefix}:")
             in_banner = True
             continue
         if in_banner:
@@ -989,13 +1222,18 @@ _INCOMPLETE_CACHE_PHRASES = (
     # Matched as two fragments: the file list between them varies with the
     # transformers version and the requested weight variant.
     ("error no file named", "found in directory"),
+    # A snapshot may have all its weights but lack the audio tokenizer's
+    # processor config (#2984). Require the missing-config wording too:
+    # an AutoFeatureExtractor import/compatibility failure is not repairable
+    # by downloading model files.
+    ("can't load feature extractor for", "directory containing a preprocessor_config.json file"),
 )
 
 
 def is_incomplete_cache_message(text: str) -> bool:
-    """True when *text* is transformers reporting a snapshot with no weights.
+    """True when transformers reports missing weights or feature-extractor config.
 
-    Takes an already-lowercased string. Shared by :func:`classify` and
+    Accepts text in any case. Shared by :func:`classify` and
     model_manager's cache self-heal so the healer and the error message can
     never disagree about what an interrupted download looks like.
     """
@@ -1075,12 +1313,17 @@ def is_corrupt_weights_message(text: str) -> bool:
     return is_corrupt_model_file_message(text)
 
 
+def _is_download_write_refusal(reason: Optional[str], low: str) -> bool:
+    """An OS write refusal raised while saving a downloaded video (#1225)."""
+    return is_os_write_refusal(reason) and any(marker in low for marker in _DOWNLOAD_CONTEXT_MARKERS)
+
+
 def is_os_write_refusal(reason: Optional[str]) -> bool:
     """True when *reason* looks like the OS refusing a file operation (a full
     or removed drive, a read-only folder, an antivirus/cloud-sync lock) rather
     than a network or format failure. Signature match only; never raises."""
     low = (reason or "").lower()
-    return any(sig in low for sig in _OS_WRITE_REFUSAL_SIGNATURES)
+    return any(sig in low for sig in _OS_WRITE_REFUSAL_SIGNATURES) or is_disk_full_error(low)
 
 
 def describe_path_target(path: str) -> str:
@@ -1180,9 +1423,27 @@ def build_failure(
     }
     if context:
         fields["context"] = {k: sanitize(str(v)) for k, v in context.items()}
+    licence = licence_required_detail(exc_or_msg)
+    if licence is not None:
+        # The client opens the acceptance dialog from these, not from the text.
+        fields["code"] = licence["code"]
+        fields["models"] = licence["models"]
     if include_diagnostic:
         fields["diagnostic"] = diagnostic(reason=reason, error_class=error_class, stage=stage)
     return fields
+
+
+def licence_required_detail(exc: Any) -> Optional[dict]:
+    """``ModelLicenceNotAccepted.detail()`` for ``exc`` or anything it was raised from."""
+    from services.model_acceptance import ModelLicenceNotAccepted
+
+    seen = 0
+    while isinstance(exc, BaseException) and seen < 8:
+        if isinstance(exc, ModelLicenceNotAccepted):
+            return exc.detail()
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return None
 
 
 def build_failure_event(

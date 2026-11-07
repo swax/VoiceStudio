@@ -1,5 +1,4 @@
 import type { EnginesResponse } from '@/lib/api/types';
-import type { ComputeRuntimeCapability, ComputeRuntimeStatus } from '@/hooks/use-compute-target';
 
 export interface SidebarModelStatus {
   status: 'idle' | 'loading' | 'ready';
@@ -12,33 +11,11 @@ export interface SidebarModelStatus {
 
 export type RuntimeHealth = 'checking' | 'unavailable' | 'loading' | 'ready';
 
-export type RemoteRuntimeState = 'checking' | 'unavailable' | 'working' | 'ready' | 'idle';
-
-export function resolveRemoteRuntime(
-  runtime: ComputeRuntimeStatus | undefined,
-  pending: boolean,
-  failed: boolean,
-  working: boolean,
-): {
-  capability?: ComputeRuntimeCapability;
-  state: RemoteRuntimeState;
-} {
-  if (pending && !runtime) return { state: 'checking' };
-  const capability = runtime?.models[0];
-  if (
-    failed ||
-    !runtime?.remote ||
-    !capability?.supported ||
-    !capability.installed ||
-    !capability.downloaded
-  ) {
-    return { capability, state: 'unavailable' };
-  }
-  if (working) return { capability, state: 'working' };
-  return {
-    capability,
-    state: capability.resident ? 'ready' : 'idle',
-  };
+export function sidebarToolState(state: string, online: boolean) {
+  if (!online) return 'modelMaintenance.offline';
+  if (state === 'engineRuntime.idle') return 'modelSettings.available';
+  if (state === 'modelSettings.unavailable') return 'sidebarTools.checkSetup';
+  return state;
 }
 
 export function resolveRuntimeHealth(
@@ -61,4 +38,11 @@ export function resolveRuntimeHealth(
   if (selected.id === 'omnivoice' && (model?.sub_stage === 'error' || model?.error))
     return 'unavailable';
   return 'ready';
+}
+
+/** Loaded-model rows that hold a speech-to-text model in memory. */
+const RESIDENT_ASR_IDS = new Set(['asr', 'capture-asr', 'transcription-asr']);
+
+export function isResidentAsrModel(id: string) {
+  return RESIDENT_ASR_IDS.has(id);
 }

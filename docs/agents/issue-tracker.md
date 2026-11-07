@@ -15,6 +15,10 @@ CLI for all operations.
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
 
+## Install problems
+
+Track each unique install problem in [`docs/install/issue-tracker.md`](../install/issue-tracker.md). Add each new report to its row and give it the `install` label and its `install:<category>` label.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
@@ -40,8 +44,9 @@ These come from `CLAUDE.md` and apply to anything a skill opens or merges here:
 - **Gate every merge** on the "Tests (backend + frontend)" check passing and the PR
   being `MERGEABLE`.
 - **Always pass an explicit `--body` to `gh pr merge --squash`.** Letting it
-  auto-generate injects `Co-authored-by:` trailers, which this repo forbids
-  (see the no-AI-attribution rule).
+  auto-generate copies every commit message, including any agent
+  `Co-authored-by:` or "Generated with" lines, which this repo forbids (see
+  the attribution rule in `CLAUDE.md`).
 - **Check the open-PR queue** before implementing any community-reported fix — a
   contributor may already have submitted one.
 

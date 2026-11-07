@@ -9,10 +9,10 @@ burning a cold model load per voice afterwards.
 
 Trust
 =====
-``manifest.json`` is signed with the **existing Tauri release key** and verified
-against :data:`UPDATER_PUBKEY` — the same public key the updater already carries
-in ``frontend/src-tauri/tauri.conf.json``, kept in lockstep by
-``tests/test_gallery_previews.py``. Signature verification is the *only* thing
+``manifest.json`` is signed with the minisign key that signed the final Tauri
+release feeds and verified against :data:`UPDATER_PUBKEY`, which this module
+carries verbatim (``tests/test_gallery_previews.py`` checks it decodes as a
+valid minisign key). Signature verification is the *only* thing
 that makes the per-file SHA-256 digests meaningful, so a manifest that fails it
 is discarded outright (including a manifest already on disk: it is re-verified
 on every load, not trusted because it was trusted once). No new key, no new
@@ -57,12 +57,15 @@ import os
 import re
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from core.config import DATA_DIR
 from core.path_security import UnsafePath, resolve_within, safe_filename
-from worker.clock import resolve as _now
+
+def _now(value: float | None = None) -> float:
+    return time.time() if value is None else float(value)
 
 logger = logging.getLogger("omnivoice.preview_gallery")
 
@@ -71,10 +74,9 @@ logger = logging.getLogger("omnivoice.preview_gallery")
 #: was not written against, and the signature proves nothing about semantics.
 SCHEMA_VERSION = 1
 
-#: Minisign public key of the Tauri release signing key, verbatim from
-#: ``frontend/src-tauri/tauri.conf.json`` (plugins.updater.pubkey). Duplicated
-#: rather than read from the config because the frozen backend does not ship
-#: tauri.conf.json; the ratchet test keeps the two byte-identical.
+#: Minisign public key of the release signing key the final Tauri builds' updater
+#: carried. The Tauri shell and its config are gone, so this constant is now the
+#: only copy; changing it orphans every manifest signed with the old key.
 UPDATER_PUBKEY = (
     "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFMDQ1QkZCQ0I4RDlCQkYKUl"
     "dTL200M0wrMXNFamdPSGF3VkUzVjBRY1FFOE0yTkxSMVZKNUowL2wyZEw2OG1TWXNLMDlSeTQK"
@@ -401,6 +403,14 @@ def _quiet(exc: BaseException) -> None:
     logger.debug("Voice gallery unreachable (%s: %s)", type(exc).__name__, exc)
 
 
+def _report_rejected_download(exc: GalleryError, context: str) -> None:
+    """Keep a missing remote artifact quiet while reporting invalid content."""
+    if "HTTP 404" in str(exc):
+        _quiet(exc)
+        return
+    logger.warning("%s could not be accepted: %s", context, exc)
+
+
 # ── Update check ─────────────────────────────────────────────────────────────
 
 async def check_for_updates(
@@ -447,10 +457,7 @@ async def check_for_updates(
         # A signature failure is not a transient network hiccup — it is the one
         # state the user should be able to see, so record it. The app still
         # works: previews render locally.
-        if "HTTP 404" in str(exc):
-            _quiet(exc)
-        else:
-            logger.warning("Voice gallery update rejected: %s", exc)
+        _report_rejected_download(exc, "Voice gallery update")
         state["last_checked"] = ts
         state["last_error"] = str(exc)
         _save_state(state)
@@ -593,10 +600,7 @@ async def fetch_featured(
             raise GalleryError("featured tarball digest does not match the manifest")
         extracted = _extract_featured(body, manifest)
     except GalleryError as exc:
-        if "HTTP 404" in str(exc):
-            _quiet(exc)
-        else:
-            logger.warning("Featured preview set rejected: %s", exc)
+        _report_rejected_download(exc, "Featured voice set")
         return status(now=now)
     except Exception as exc:
         _quiet(exc)

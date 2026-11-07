@@ -58,6 +58,24 @@ def _activate_groq(store):
     store.text["llm.active_provider"] = "groq"
 
 
+def test_global_off_disables_direct_clients_and_readiness(skills, store, monkeypatch):
+    _activate_groq(store)
+    monkeypatch.setenv("OMNIVOICE_LLM_BACKEND", "off")
+    skills.configure_skill("cinematic_translation", provider_override="groq")
+    assert skills.resolve_skill("cinematic_translation").ready is False
+    assert skills.resolve_skill_client("cinematic_translation") is None
+
+
+def test_selected_off_matches_runtime_but_allows_explicit_skill_override(skills, store):
+    from core import prefs
+    _activate_groq(store)
+    prefs.set_("llm_backend", "off")
+    assert skills.resolve_skill("cinematic_translation").ready is False
+    assert skills.resolve_skill_client("cinematic_translation") is None
+    skills.configure_skill("cinematic_translation", provider_override="groq")
+    assert skills.resolve_skill("cinematic_translation").ready is True
+
+
 # ── Registry + resolution precedence ────────────────────────────────────────
 
 def test_all_skills_cover_every_consumption_point(skills):

@@ -35,11 +35,11 @@ def test_provider_hint_names_the_active_provider_only_for_openai_compat(monkeypa
         display_name = "OrcaRouter"
 
     monkeypatch.setattr(llm_providers, "active_provider", lambda: _P())
-    monkeypatch.setattr(llm_providers, "resolve_model", lambda p: "gpt-4o-mini")
+    monkeypatch.setattr(llm_providers, "configured_model", lambda p: "gpt-4o-mini")
     assert llm_backend._provider_hint("openai-compat") == "OrcaRouter · gpt-4o-mini"
     assert llm_backend._provider_hint("off") is None
 
-    monkeypatch.setattr(llm_providers, "resolve_model", lambda p: "")
+    monkeypatch.setattr(llm_providers, "configured_model", lambda p: "")
     assert llm_backend._provider_hint("openai-compat") == "OrcaRouter"
 
     def _boom():

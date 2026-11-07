@@ -18,6 +18,46 @@ afterEach(() => {
 });
 
 describe('parsePersistedCloneSettings', () => {
+  it('restores valid quality choices and discards invalid persisted enums', async () => {
+    const { parsePersistedCloneSettings } = await loadModule();
+    expect(parsePersistedCloneSettings('{"wavBits":32,"effectPreset":"raw"}')).toMatchObject({
+      wavBits: 32,
+      effectPreset: 'raw',
+    });
+    expect(parsePersistedCloneSettings('{"wavBits":64,"effectPreset":"unknown"}')).toMatchObject({
+      wavBits: 16,
+      effectPreset: 'broadcast',
+    });
+  });
+  it('restores only valid eight-weight emotion recipes and bounded strength', async () => {
+    const { parsePersistedCloneSettings, DEFAULT_CLONE_SETTINGS } = await loadModule();
+    const vector = [0, 0.2, 0.4, 0, 0, 0.1, 0, 0];
+    expect(
+      parsePersistedCloneSettings(
+        JSON.stringify({
+          emotionMode: 'vector',
+          emotionVector: vector,
+          emotionAlpha: 0.5,
+        }),
+      ),
+    ).toMatchObject({ emotionMode: 'vector', emotionVector: vector, emotionAlpha: 0.5 });
+    expect(
+      parsePersistedCloneSettings(
+        JSON.stringify({
+          emotionMode: 'wrong',
+          emotionVector: [3, 0],
+          emotionAlpha: 1,
+          emotionText: 'x'.repeat(501),
+        }),
+      ),
+    ).toMatchObject({
+      emotionMode: DEFAULT_CLONE_SETTINGS.emotionMode,
+      emotionVector: DEFAULT_CLONE_SETTINGS.emotionVector,
+      emotionAlpha: DEFAULT_CLONE_SETTINGS.emotionAlpha,
+      emotionText: DEFAULT_CLONE_SETTINGS.emotionText,
+    });
+  });
+
   it('returns defaults for null, malformed JSON and non-objects', async () => {
     const { parsePersistedCloneSettings, DEFAULT_CLONE_SETTINGS } = await loadModule();
     expect(parsePersistedCloneSettings(null)).toEqual(DEFAULT_CLONE_SETTINGS);
@@ -84,6 +124,39 @@ describe('cloneSettingsStore persistence', () => {
     expect(cloneSettingsStore.state.steps).toBe(DEFAULT_CLONE_SETTINGS.steps);
     expect(cloneSettingsStore.state.duration).toBe('');
     expect(cloneSettingsStore.state.denoise).toBe(true);
+  });
+
+  it('resets voice controls without changing audio quality or the draft', async () => {
+    const { cloneSettingsStore, patchCloneSettings, resetVoiceControls, DEFAULT_CLONE_SETTINGS } =
+      await loadModule();
+    const preserved = {
+      text: 'Keep script',
+      refText: 'Keep transcript',
+      instruct: 'Keep style',
+      language: 'French',
+      selectedProfileId: 'voice-123',
+      showOverrides: true,
+      autoPlay: true,
+      wavBits: 32 as const,
+      effectPreset: 'raw' as const,
+      steps: 64,
+    };
+    patchCloneSettings({
+      ...preserved,
+      cfg: 4,
+      speed: 1.5,
+      tShift: 0.9,
+      posTemp: 1,
+      classTemp: 2,
+      layerPenalty: 1,
+      duration: '5',
+      denoise: false,
+      postprocess: false,
+    });
+    resetVoiceControls();
+    expect(cloneSettingsStore.state).toEqual({ ...DEFAULT_CLONE_SETTINGS, ...preserved });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(JSON.parse(localStorage.getItem(KEY) ?? '{}')).toEqual(cloneSettingsStore.state);
   });
 
   it('setCloneSetting is a no-op for an unchanged value', async () => {

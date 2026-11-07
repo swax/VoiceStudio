@@ -1,3 +1,5 @@
+import { registerSiteBrowser } from './site-browser';
+import { portableFilename } from './portable-filename';
 import { saveFiltersFor } from './save-filters';
 import { resolveBackendDownloadUrl } from './backend-download';
 import {
@@ -6,7 +8,8 @@ import {
   authorizeModelsDirectory,
 } from './media-authorization';
 import { isTrustedRenderer } from './trusted-renderer';
-import { writeFile } from 'node:fs/promises';
+import { replaceFile } from './replace-file';
+import { encodeDownloadFailure, MAX_FAILURE_BODY_CHARS } from '../shared/download-failure';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -40,12 +43,13 @@ import { inspectDataRelocation, relocateDataDirectory } from './data-relocation'
 import { createUninstallPlan, scanUninstallTargets, type UninstallRoots } from './uninstall-data';
 import { scheduleUninstallCleanup } from './uninstall-cleanup';
 import { sendToLiveWindow } from './window-safety';
-import { activateProLicense, deactivateProLicense, proLicenseStatus } from './pro-license';
+import {
+  retainSecurityScopedDirectory,
+  securityScopedDialogOptions,
+  withSecurityScopedBookmark,
+} from './security-scoped-files';
 
 export const CHANNELS = {
-  proStatus: 'pro:status',
-  proActivate: 'pro:activate',
-  proDeactivate: 'pro:deactivate',
   permissionsGetState: 'permissions:getState',
   permissionsOpenSettings: 'permissions:openSettings',
   filesAuthorizeMediaTool: 'files:authorizeMediaTool',
@@ -56,10 +60,14 @@ export const CHANNELS = {
   backendRestart: 'backend:restart',
   backendSetupRuntime: 'backend:setupRuntime',
   backendCleanSetupRuntime: 'backend:cleanSetupRuntime',
+  backendSetupRuntimeOnCpu: 'backend:setupRuntimeOnCpu',
   backendSetRuntimeRegion: 'backend:setRuntimeRegion',
   backendChooseRuntimeLocation: 'backend:chooseRuntimeLocation',
   backendUseDefaultRuntimeLocation: 'backend:useDefaultRuntimeLocation',
   backendGetConnection: 'backend:getConnection',
+  backendHostSnapshot: 'backend:hostSnapshot',
+  backendSetupDiagnostics: 'backend:setupDiagnostics',
+  backendCheckSetupConnection: 'backend:checkSetupConnection',
   backendTestRemote: 'backend:testRemote',
   backendUseRemote: 'backend:useRemote',
   backendUseLocal: 'backend:useLocal',
@@ -149,7 +157,7 @@ function assertSaveAudioRequest(value: unknown): SaveAudioRequest {
   }
   return {
     url: assertString(req.url, 'audio url'),
-    suggestedName: assertString(req.suggestedName, 'file name'),
+    suggestedName: portableFilename(assertString(req.suggestedName, 'file name')),
     method: req.method,
   };
 }
@@ -160,11 +168,11 @@ function assertSaveDataRequest(value: unknown): SaveDataRequest {
   if (!(req.data instanceof Uint8Array)) throw new Error('Invalid file data');
   return {
     data: req.data,
-    suggestedName: assertString(req.suggestedName, 'file name'),
+    suggestedName: portableFilename(assertString(req.suggestedName, 'file name')),
   };
 }
 
-function assertTrustedMainFrame(
+export function assertTrustedMainFrame(
   event: IpcMainInvokeEvent,
   owner: BrowserWindow | null,
 ): asserts owner is BrowserWindow {
@@ -302,11 +310,23 @@ async function uninstallRoots(supervisor: BackendSupervisor): Promise<UninstallR
   return {
     data: roots.data,
     environment: app.getPath('userData'),
-    runtimeEnvironment: supervisor.ownedRuntimeRoot,
+    runtimeEnvironment: supervisor.ownedRuntimeEntries,
     logs: app.getPath('logs'),
     userEnvironment: join(homedir(), '.config', 'omnivoice'),
     models: roots.models,
   };
+}
+
+/** The failed response's status and body, encoded so the renderer can show
+ *  the backend's own `detail` instead of a bare status code (#2616). */
+async function downloadFailureMessage(res: Response): Promise<string> {
+  let body = '';
+  try {
+    body = (await res.text()).slice(0, MAX_FAILURE_BODY_CHARS);
+  } catch {
+    // Unreadable body: the status alone still goes through.
+  }
+  return encodeDownloadFailure({ status: res.status, statusText: res.statusText, body });
 }
 
 export function registerIpc(
@@ -314,6 +334,7 @@ export function registerIpc(
   getMainWindow: () => BrowserWindow | null,
   exitForUninstall: () => Promise<void> = async () => app.exit(0),
 ): void {
+  registerSiteBrowser(getMainWindow);
   let maintenanceBusy = false;
   let relocationSelection: {
     authorization: string;
@@ -322,19 +343,6 @@ export function registerIpc(
     createdAt: number;
   } | null = null;
   supervisor.subscribe((status: BackendStatus) => broadcast(CHANNELS.backendStatus, status));
-
-  ipcMain.handle(CHANNELS.proStatus, (event) => {
-    assertTrustedMainFrame(event, getMainWindow());
-    return proLicenseStatus();
-  });
-  ipcMain.handle(CHANNELS.proActivate, (event, key: unknown) => {
-    assertTrustedMainFrame(event, getMainWindow());
-    return activateProLicense(key);
-  });
-  ipcMain.handle(CHANNELS.proDeactivate, (event) => {
-    assertTrustedMainFrame(event, getMainWindow());
-    return deactivateProLicense();
-  });
 
   ipcMain.handle(CHANNELS.permissionsGetState, (event) => {
     const owner = getMainWindow();
@@ -354,6 +362,19 @@ export function registerIpc(
     return supervisor.acknowledgeLastCrash();
   });
   ipcMain.handle(CHANNELS.backendGetConnection, () => supervisor.connection);
+  ipcMain.handle(CHANNELS.backendHostSnapshot, (event) => {
+    const owner = getMainWindow();
+    assertTrustedMainFrame(event, owner);
+    return supervisor.hostSnapshot();
+  });
+  ipcMain.handle(CHANNELS.backendSetupDiagnostics, (event) => {
+    assertTrustedMainFrame(event, getMainWindow());
+    return supervisor.getSetupDiagnostics();
+  });
+  ipcMain.handle(CHANNELS.backendCheckSetupConnection, (event) => {
+    assertTrustedMainFrame(event, getMainWindow());
+    return supervisor.checkSetupConnection();
+  });
   ipcMain.handle(CHANNELS.backendTestRemote, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
@@ -415,11 +436,15 @@ export function registerIpc(
     if (supervisor.connection.remote) throw new Error('local_only');
     if (!supervisor.status.managed) throw new Error('backend_not_managed');
     const source = await backendDataDirectory(supervisor);
-    const picked = await dialog.showOpenDialog(owner, {
-      defaultPath: dirname(source),
-      properties: ['openDirectory', 'createDirectory'],
-    });
+    const picked = await dialog.showOpenDialog(
+      owner,
+      securityScopedDialogOptions<Electron.OpenDialogOptions>({
+        defaultPath: dirname(source),
+        properties: ['openDirectory', 'createDirectory'],
+      }),
+    );
     if (picked.canceled || !picked.filePaths[0]) return null;
+    retainSecurityScopedDirectory(picked);
     const plan = await inspectDataRelocation(source, picked.filePaths[0]);
     relocationSelection = {
       authorization: randomUUID(),
@@ -486,7 +511,7 @@ export function registerIpc(
       await supervisor.shutdown();
       stopped = true;
       await new Promise((resolve) => setTimeout(resolve, 600));
-      await scheduleUninstallCleanup(plan.paths);
+      await scheduleUninstallCleanup(plan.targets);
       await exitForUninstall();
       return { scheduled: true, size_bytes: plan.size_bytes };
     } catch (error) {
@@ -510,6 +535,11 @@ export function registerIpc(
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.cleanSetupRuntime();
+  });
+  ipcMain.handle(CHANNELS.backendSetupRuntimeOnCpu, (event) => {
+    const owner = getMainWindow();
+    assertTrustedMainFrame(event, owner);
+    return supervisor.setupRuntimeOnCpu();
   });
   ipcMain.handle(CHANNELS.backendSetRuntimeRegion, (event, raw: unknown) => {
     const owner = getMainWindow();
@@ -539,10 +569,14 @@ export function registerIpc(
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const kind = assertMediaTool(raw);
-    const picked = await dialog.showOpenDialog(owner, {
-      properties: ['openFile'],
-    });
+    const picked = await dialog.showOpenDialog(
+      owner,
+      securityScopedDialogOptions<Electron.OpenDialogOptions>({
+        properties: ['openFile'],
+      }),
+    );
     if (picked.canceled || !picked.filePaths[0]) return null;
+    retainSecurityScopedDirectory(picked);
     return authorizeMediaTool(await backendDataDirectory(supervisor), picked.filePaths[0], kind);
   });
 
@@ -552,10 +586,14 @@ export function registerIpc(
     if (typeof raw !== 'boolean') throw new Error('Invalid models-directory request');
     let selected = '';
     if (!raw) {
-      const picked = await dialog.showOpenDialog(owner, {
-        properties: ['openDirectory', 'createDirectory'],
-      });
+      const picked = await dialog.showOpenDialog(
+        owner,
+        securityScopedDialogOptions<Electron.OpenDialogOptions>({
+          properties: ['openDirectory', 'createDirectory'],
+        }),
+      );
       if (picked.canceled || !picked.filePaths[0]) return null;
+      retainSecurityScopedDirectory(picked);
       selected = picked.filePaths[0];
     }
     return authorizeModelsDirectory(await backendDataDirectory(supervisor), selected);
@@ -566,10 +604,10 @@ export function registerIpc(
     assertTrustedMainFrame(event, owner);
     const req = assertSaveAudioRequest(raw);
     const source = resolveBackendDownloadUrl(req.url, supervisor.baseUrl);
-    const options: Electron.SaveDialogOptions = {
+    const options = securityScopedDialogOptions<Electron.SaveDialogOptions>({
       defaultPath: req.suggestedName,
       filters: saveFiltersFor(req.suggestedName),
-    };
+    });
     const picked = owner
       ? await dialog.showSaveDialog(owner, options)
       : await dialog.showSaveDialog(options);
@@ -579,8 +617,10 @@ export function registerIpc(
       headers: supervisor.requestHeaders(),
       bypassCustomProtocolHandlers: true,
     });
-    if (!res.ok) throw new Error(`Could not download the audio (HTTP ${res.status})`);
-    await writeFile(picked.filePath, Buffer.from(await res.arrayBuffer()));
+    if (!res.ok) throw new Error(await downloadFailureMessage(res));
+    await withSecurityScopedBookmark(picked.bookmark, async () =>
+      replaceFile(picked.filePath, Buffer.from(await res.arrayBuffer())),
+    );
     return { canceled: false, path: picked.filePath };
   });
 
@@ -588,12 +628,15 @@ export function registerIpc(
     const owner = windowFor(event) ?? getMainWindow();
     assertTrustedMainFrame(event, owner);
     const req = assertSaveDataRequest(raw);
-    const picked = await dialog.showSaveDialog(owner, {
-      defaultPath: req.suggestedName,
-      filters: saveFiltersFor(req.suggestedName),
-    });
+    const picked = await dialog.showSaveDialog(
+      owner,
+      securityScopedDialogOptions<Electron.SaveDialogOptions>({
+        defaultPath: req.suggestedName,
+        filters: saveFiltersFor(req.suggestedName),
+      }),
+    );
     if (picked.canceled || !picked.filePath) return { canceled: true };
-    await writeFile(picked.filePath, req.data);
+    await withSecurityScopedBookmark(picked.bookmark, () => replaceFile(picked.filePath, req.data));
     return { canceled: false, path: picked.filePath };
   });
 
@@ -636,8 +679,7 @@ export function registerIpc(
 
 /** Push `window:maximized` to the window renderer after maximize state changes. */
 export function wireWindowMaximizeEvents(win: BrowserWindow): void {
-  const send = (maximized: boolean) =>
-    sendToLiveWindow(win, CHANNELS.windowMaximized, maximized);
+  const send = (maximized: boolean) => sendToLiveWindow(win, CHANNELS.windowMaximized, maximized);
   win.on('maximize', () => send(true));
   win.on('unmaximize', () => send(false));
 }

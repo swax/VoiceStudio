@@ -1,5 +1,11 @@
 # Electron and Tauri behavior parity
 
+> **Historical context:** this page was written while the Electron and Tauri apps
+> coexisted. Mentions of Tauri helpers, pages, tests and regression results describe
+> that migration period; the Tauri shell has since been removed and the shared code
+> now lives in `electron/src/shared/`. Existing Tauri installs: see the
+> [migration guide](electron-migration.md).
+
 This inventory tracks user-visible behavior. A row is **implemented** when Electron exposes the
 same task and backend contract. Platform-specific performance may differ. A native row stays
 **verification pending** until its real macOS, Windows, and Linux smoke gates pass.
@@ -16,9 +22,8 @@ same task and backend contract. Platform-specific performance may differ. A nati
 | Transcription and dictation | Implemented | `docs/electron-transcriptions.md`, transcription and native dictation smoke tests, plus trusted-origin audio-only Chromium permission regressions | Native hotkey/input permission matrix |
 | Projects and Tools | Implemented | `docs/electron-projects.md`, `docs/electron-tools.md`, project and tool smoke tests, plus real Windows Faster-Whisper/OmniVoice conversion and Vidstack playback | Native reveal/export matrix |
 | Model catalogue and engine selection | Implemented | model-library component tests, recommendations smoke, live install/cancel/delete/unload verification, current in-process/isolated Faster-Whisper selection and restoration, and repeatable app-managed audio.cpp v0.7.4 Sortformer inference/cancellation on Windows Vulkan | Native install matrix across model families and desktop OSes |
-| Local and remote compute target | Implemented | worker API tests, compute-target UI, remote-target recommendation smoke, Ubuntu 26.04 WSL real TTS plus disconnect/reconnect fallback | Native-machine remote run outside WSL |
 | Settings, logs, API reference and support | Implemented | settings smoke tests, responsive live runtime/hardware identity, 640 px layout smoke, packaged Linux 150% DPR/no-overflow visual smoke and `docs/electron-logs.md` | Native visual capture on macOS |
-| Updates, notifications, app/tray/taskbar branding | Implemented; published-update verification pending | updater IPC lifecycle/authorization regression, platform-specific feed names, bounded channel-aware release history, byte/SHA-512 release contract, release-matrix validation of each unpacked Electron app, branded Windows NSIS/app icon, launched AppImage and installed Debian package with shared brand assets/native helper | First signed Stable/Preview update and installed-shell visual check on macOS/Linux |
+| Updates, notifications, app/tray/taskbar branding | Implemented; published-update verification pending | updater IPC lifecycle/authorization regression, platform-specific feed names, bounded channel-aware release history, byte/SHA-512 release contract, release-matrix validation of each unpacked Electron app, branded Windows NSIS/app icon, launched AppImage and installed Debian package with shared brand assets/native helper | First signed Stable update and installed-shell visual check on macOS/Linux |
 | Watch folders and global capture | Verification pending | Windows native watch lifecycle/global shortcut/insertion plus Linux AppImage Wayland tray/watch and clipboard-fallback smokes | macOS permissions, Linux portal global shortcut and physical microphone matrix |
 | T3-inspired shell, themes, scale and keyboard navigation | Implemented | shared resizable secondary panes, sidebar, locale-layout, workspace-shell and all-route accessibility smoke tests, including 640–1920 px secondary-pane geometry, 38 routes at 1440/640 px, packaged Linux 150% DPR and main-process empty-renderer recovery with a localized asset-independent fallback | Native screen-reader pass on macOS/Linux and high-DPI pass on macOS |
 | In-app agent repair dock | Electron extension | `docs/electron-repair.md`, native smoke, packaged Codex/Claude/OpenCode acceptance on Windows, and packaged Linux host-shim rejection | Pi acceptance when installed; native macOS/Linux CLI matrix |
@@ -45,9 +50,9 @@ Clone handoff and cleanup, and round-tripped a generated take into a disposable 
 Its live route sweep remained free of renderer warnings, exceptions and API failures after
 updater, dictation, QR, locale loading, translation-file and local-agent discovery rejection paths
 were contained at their initiating UI boundaries.
-The inventory guard maps every current Tauri page, every static Electron route and every model
-family to its maintained capability or responsive-layout evidence; adding an unmapped page or route
-now fails the required test gate.
+During the migration, an inventory guard mapped every Tauri page, every static Electron route and
+every model family to its maintained capability or responsive-layout evidence; it was retired with
+the Tauri shell.
 An isolated clean Ubuntu 26.04 workspace also completed the Electron typecheck and production
 package, then passed the unpacked Linux artifact contract with its x64 app, bundled `uv`, branded
 resources and native dictation helper present.
@@ -66,6 +71,14 @@ running hash router and real backend. It fails on an error boundary, missing hea
 exception, console error or warning, failed load or HTTP error response. The 2026-09-13 live run passed every
 route with no failures.
 
+`bun run smoke:account-live` from `electron/` (after `bun run build`; under `xvfb-run` on Linux)
+checks VoiceStudio Cloud sign-in against production. It confirms that account features start off,
+that the top-right corner shows Sign in with the notifications bell to its right, and that sign-in
+opens the dashboard's app sign-in (`app.voicestudio.sh/auth/app`) with PKCE and a `127.0.0.1`
+redirect, which hands over to the sign-in form at `id.voicestudio.sh/login`. It also confirms that
+switching account features off stops sign-in and closes the loopback listener at once. Finishing
+sign-in needs a real account, so that part stays manual.
+
 ## Settings navigation
 
 Studio is the default palette for both Light and Dark on a fresh install. Selecting a palette under either appearance applies it immediately and saves it for later switches, including System mode changes. Existing saved palette choices remain unchanged.
@@ -74,10 +87,12 @@ The main workspace sidebar stays visible on Settings routes, including while the
 
 ## Navigation order
 
-In the expanded sidebar, workspace navigation sits immediately below the header and above the voice library. The status bar and Settings entry remain at the bottom; voice-library scrolling does not move the navigation.
+The expanded sidebar is a slim 216px column: workspace navigation sits immediately below the header, and the status bar and Settings entry stay at the bottom. On macOS the window's traffic lights get their own row above the brand; in full screen the brand moves into that corner. The status area is a slim speed/quality slider (a tier icon, the tier name and an icon-only Auto toggle); hovering or clicking the label, or changing the slider, opens a popover with the model for each engine, the hardware fit and the Simple/Models/Details view switch.
+
+Saved voices and Recent takes live in a context sidebar beside the navigation on Home and Clone (and as a Saved voices tab in the Design pane), so the navigation never carries a library. Any section that brings its own pane keeps navigation as the icon rail below, as in VS Code, Slack and Linear, so the window does not show two wide sidebars. The rail's gauge button opens the same speed/quality popover.
 
 In the compact rail, Voice, Stories and Dubbing open flyouts on mouse hover or click, with full-row click targets. Hover uses a short opening delay and a pointer transit delay into the flyout; touch users can click, and keyboard users can press Enter or Arrow Right/Down to open it, then Arrow Left or Escape to return to the trigger. Choosing a destination keeps its flyout mounted until the route changes; choosing the current destination closes it immediately. Outside clicks close flyouts. Double-clicking the compact rail expands the full sidebar; the header button remains the single-click control. The flyout appears beside its icon without a scale shift while the pointer moves into it.
 
 ## Sidebar expansion preference
 
-Settings → Appearance → Keep sidebar expanded persists the choice locally. It disables automatic compaction on narrower secondary-pane workspaces; the default remains automatic. The explicit close control still works, and the Profiles workspace still avoids duplicating its voice library. The header toggle and sidebar share one state. A compact rail can reopen itself on every desktop platform, using the brand icon on Windows/Linux.
+Settings → Appearance → Keep sidebar expanded persists the choice locally. It disables automatic compaction beside a section pane and on narrow windows. With the default automatic setting, windows up to 1200px wide use the rail. The explicit close control still works. The header toggle and sidebar share one state. A compact rail can reopen itself on every desktop platform, using the brand icon on Windows/Linux.

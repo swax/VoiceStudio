@@ -99,6 +99,19 @@ it('streams PCM and preserves repeated utterances without duplicating the EOF su
   expect(stopTrack).toHaveBeenCalled();
   expect(stopGraph).toHaveBeenCalled();
 });
+it('ignores empty utterance finals so pauses add no extra spaces (#3154)', async () => {
+  const result = vi.fn();
+  await live.start(result);
+  const socket = Socket.instances[0];
+  socket.frame({ type: 'final', final_kind: 'utterance', text: 'First sentence.' });
+  socket.frame({ type: 'final', final_kind: 'utterance', text: '' });
+  socket.frame({ type: 'final', final_kind: 'utterance', text: '   ' });
+  socket.frame({ type: 'partial', text: '  ' });
+  expect(live.getSnapshot().text).toBe('First sentence.');
+  socket.frame({ type: 'final', final_kind: 'utterance', text: ' Second sentence. ' });
+  expect(live.getSnapshot().text).toBe('First sentence. Second sentence.');
+  expect(result).toHaveBeenCalledTimes(2);
+});
 it('releases late microphone permission after cancellation', async () => {
   let allow!: (value: { getTracks: () => { stop: typeof stopTrack }[] }) => void;
   microphone.mockImplementation(
@@ -204,4 +217,59 @@ it('preserves a main-issued ticket for authenticated remote dictation', async ()
   expect(Socket.instances[0].url.origin).toBe('wss://gpu-box:3900');
   expect(Socket.instances[0].url.searchParams.get('ws_ticket')).toMatch(/^ovs_ws_ticket_/);
   expect(Socket.instances[0].url.searchParams.get('model')).toBe('sherpa-test');
+});
+it('drops a cancelled start whose WebSocket URL resolves after a newer session opened', async () => {
+  const pendingUrls: Array<(value: string) => void> = [];
+  mocks.bridge = {
+    backend: {
+      websocketUrl: vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            pendingUrls.push(resolve);
+          }),
+      ),
+    },
+  };
+  vi.stubGlobal('window', {
+    location: { href: 'app://voicestudio/index.html#/capture', protocol: 'app:' },
+    voicestudio: mocks.bridge,
+  });
+  const cancelled = live.start(vi.fn());
+  await vi.waitFor(() => expect(pendingUrls).toHaveLength(1));
+  live.cancel();
+
+  const result = vi.fn();
+  const current = live.start(result);
+  await vi.waitFor(() => expect(pendingUrls).toHaveLength(2));
+  pendingUrls[1]!('wss://gpu-box:3900/ws/transcribe?ws_ticket=current');
+  await current;
+  expect(live.getSnapshot().stage).toBe('recording');
+
+  pendingUrls[0]!('wss://gpu-box:3900/ws/transcribe?ws_ticket=stale');
+  await cancelled;
+  expect(Socket.instances.map((socket) => socket.url.searchParams.get('ws_ticket'))).toEqual([
+    'current',
+  ]);
+
+  await live.stop();
+  expect(Socket.instances[0]!.send).toHaveBeenLastCalledWith('EOF');
+  Socket.instances[0]!.frame({ type: 'final', final_kind: 'summary', text: 'Mine.' });
+  expect(result).toHaveBeenCalledWith(expect.objectContaining({ text: 'Mine.' }));
+  expect(live.getSnapshot().stage).toBe('done');
+});
+
+it('opens the licence dialog when dictation is refused for an unaccepted model', async () => {
+  const seen = vi.fn();
+  window.addEventListener('ov:model-licence-required', seen);
+  await live.start(vi.fn());
+  Socket.instances[0].frame({
+    type: 'error',
+    kind: 'model_licence_required',
+    code: 'model_licence_required',
+    message: 'Accept the licence',
+    models: [{ repo_id: 'org/model', license: 'x', category: 'noncommercial', fingerprint: 'fp1' }],
+  });
+  window.removeEventListener('ov:model-licence-required', seen);
+  expect(seen).toHaveBeenCalledTimes(1);
+  expect(live.getSnapshot().stage).toBe('error');
 });

@@ -25,7 +25,9 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderSettings(overrides: { tailscale?: object } = {}) {
+function renderSettings(
+  overrides: { tailscale?: object; uiPort?: number | null; check?: object } = {},
+) {
   let state: {
     enabled: boolean;
     share_port: number | null;
@@ -35,8 +37,13 @@ function renderSettings(overrides: { tailscale?: object } = {}) {
   mock.api.mockImplementation((path: string, init?: RequestInit) => {
     if (path === '/system/network/state') return Promise.resolve(state);
     if (path === '/system/info') {
-      return Promise.resolve({ backend_port: 3900, ui_port: 3902, share_port_base: 3901 });
+      return Promise.resolve({
+        backend_port: 3900,
+        ui_port: overrides.uiPort === undefined ? 3902 : overrides.uiPort,
+        share_port_base: 3901,
+      });
     }
+    if (path === '/system/network/check') return Promise.resolve(overrides.check ?? {});
     if (path === '/system/tailscale/status') {
       return Promise.resolve(overrides.tailscale ?? { installed: false, running: false });
     }
@@ -91,12 +98,50 @@ it('confirms LAN exposure, shows its PIN/QR, and stops the listener', async () =
   expect(await screen.findByRole('button', { name: 'network.share_on_network' })).toBeEnabled();
 });
 
+it('self-checks the share listener and follows a changed network address', async () => {
+  renderSettings({
+    check: {
+      enabled: true,
+      bind_host: '0.0.0.0',
+      share_port: 3901,
+      addresses: [
+        { address: '10.0.0.7', listening: true },
+        { address: '172.17.0.1', listening: false },
+      ],
+    },
+  });
+  const share = await screen.findByRole('button', { name: 'network.share_on_network' });
+  await waitFor(() => expect(share).toBeEnabled());
+  expect(screen.queryByTestId('sharing-self-check')).not.toBeInTheDocument();
+  fireEvent.click(share);
+  fireEvent.click(screen.getByRole('button', { name: 'network.enable' }));
+
+  const panel = await screen.findByTestId('sharing-self-check');
+  expect(await screen.findByText('network.listening_on')).toBeInTheDocument();
+  expect(panel).toHaveTextContent('network.firewall_hint');
+  expect(panel).toHaveTextContent('network.address_ok');
+  expect(panel).toHaveTextContent('network.address_down');
+  // The fresh address list replaces the one captured when sharing started.
+  expect(await screen.findByText('10.0.0.7:3901')).toBeInTheDocument();
+  expect(screen.queryByText('192.168.1.4:3901')).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'network.recheck' }));
+  await waitFor(() =>
+    expect(mock.api.mock.calls.filter(([path]) => path === '/system/network/check')).toHaveLength(
+      2,
+    ),
+  );
+});
+
 it('saves the share port and exposes explicit Tailscale controls', async () => {
   renderSettings({ tailscale: { installed: true, running: true } });
 
   const port = await screen.findByRole('spinbutton', { name: 'sharing.lan_share_port' });
   expect(port).toHaveValue(3901);
+  // Nothing to save until the port actually changes.
+  expect(screen.getByRole('button', { name: 'common.save' })).toBeDisabled();
   fireEvent.change(port, { target: { value: '4101' } });
+  expect(screen.getByRole('button', { name: 'common.save' })).toBeEnabled();
   fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
   await waitFor(() =>
     expect(mock.api).toHaveBeenCalledWith('/system/set-env', {
@@ -109,4 +154,15 @@ it('saves the share port and exposes explicit Tailscale controls', async () => {
   expect(await screen.findByText('https://studio.tailnet.ts.net')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'sharing.tailscale_open' }));
   expect(mock.openExternal).toHaveBeenCalledWith('https://studio.tailnet.ts.net');
+});
+
+it('shows the dev UI port and hides it for the packaged app', async () => {
+  renderSettings();
+  expect(await screen.findByText('3902')).toBeInTheDocument();
+  expect(screen.getByText('sharing.ui_port')).toBeInTheDocument();
+  cleanup();
+
+  renderSettings({ uiPort: null });
+  expect(await screen.findByText('sharing.backend_port')).toBeInTheDocument();
+  expect(screen.queryByText('sharing.ui_port')).not.toBeInTheDocument();
 });

@@ -128,6 +128,53 @@ def test_import_roundtrip_creates_profile(client):
     assert row["ref_audio_path"].startswith(pid)
 
 
+def test_native_design_recipe_survives_bundle_and_import(client):
+    """Portable voice imports preserve the complete bounded text design."""
+    original = json.dumps({
+        "description": "Warm, softly spoken Japanese narrator with airy breathiness.",
+        "picks": {"Pitch": "low pitch"},
+        "engine": "voxcpm2",
+    }, ensure_ascii=False)
+    manifest = build_manifest(
+        {
+            "name": "Native voice", "kind": "design", "seed": 42,
+            "instruct": "female", "vd_states": json.dumps({"Gender": "female"}),
+            "design_recipe": original,
+        },
+        license_spdx="CC-BY-4.0", tags=[],
+    )
+    assert manifest["persona"]["design_recipe"] == original
+    bundle = _ovsvoice(manifest_over={"persona": manifest["persona"]})
+    res = client.post("/personas/import", files=_upload(bundle))
+    assert res.status_code == 200, res.text
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM voice_profiles WHERE id=?", (res.json()["profile_id"],),
+        ).fetchone()
+    saved = json.loads(row["design_recipe"])
+    assert saved["engine"] == "voxcpm2"
+    assert saved["description"] == json.loads(original)["description"]
+    assert saved["picks"] == {"Pitch": "low pitch"}
+    assert row["kind"] == "design" and row["instruct"] == "female"
+
+
+def test_import_rejects_invalid_native_design_recipe(client):
+    """Untrusted bundles cannot bypass recipe length and category validation."""
+    for raw in (
+        "{broken", json.dumps({"description": "x" * 2200, "picks": {}}),
+        json.dumps({"description": "valid", "picks": {"invalidCategory": "value"}}),
+        json.dumps({"description": "valid", "picks": {}, "engine": "../bad"}),
+    ):
+        manifest = build_manifest(
+            {"name": "Bad voice", "kind": "design", "design_recipe": raw},
+            license_spdx="CC-BY-4.0", tags=[],
+        )
+        result = client.post(
+            "/personas/import", files=_upload(_ovsvoice(manifest_over={"persona": manifest["persona"]})),
+        )
+        assert result.status_code == 400, result.text
+
+
 def test_import_case_insensitive_extension(client):
     r = client.post("/personas/import", files=_upload(_ovsvoice(), filename="A.OVSVOICE"))
     assert r.status_code == 200

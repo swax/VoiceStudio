@@ -65,9 +65,11 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import math
 import ntpath
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -83,7 +85,11 @@ def _measure_vram_mb() -> float:
     (MM2-08). The parent can't see a child's VRAM, so we self-report it in the
     pong. Degrades to 0 on CPU / when torch isn't loaded yet — never raises."""
     try:
-        import torch  # already a dep inside the indextts venv
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
         mps = getattr(torch.backends, "mps", None)
@@ -200,13 +206,98 @@ _model = None
 _model_version = None
 
 
+#: Child-process bf16 probe budget: one torch import plus one GEMM. The
+#: fault this guards against is instant; the timeout only has to outlast a
+#: cold first import on a heavily loaded host.
+_BF16_PROBE_TIMEOUT_S = 120
+
+#: The probe runs after the 50% frame and BEFORE ``_heartbeat``'s first beat
+#: (the beat thread waits one full period before its first send), so a probe
+#: longer than the parent's silence deadline would have the parent's recv
+#: watchdog kill a healthy sidecar mid-probe — the closed-pipe death #2372
+#: exists to prevent. This mirrors IndexTTS2Backend.recv_timeout_s's env
+#: contract exactly (default 900 s, unparseable/non-finite → 900 s, floor
+#: 30 s); the sidecar cannot import the parent's engine module, so
+#: tests/test_indextts_bf16_rocm_2372.py pins the two together.
+_PARENT_RECV_ENV = "OMNIVOICE_INDEXTTS_RECV_TIMEOUT_S"
+_PARENT_RECV_DEFAULT_S = 900.0
+_PARENT_RECV_FLOOR_S = 30.0
+#: Probe end → the first frame the parent sees after it: the remaining
+#: kwargs work plus one full heartbeat period before the beat thread's
+#: first send, plus slack.
+_PROBE_DEADLINE_MARGIN_S = _HEARTBEAT_S + 5.0
+
+
+def _parent_recv_deadline_s() -> float:
+    """The silence deadline the parent applies to this sidecar (#1611)."""
+    try:
+        v = float(os.environ.get(_PARENT_RECV_ENV, "900"))
+    except (ValueError, TypeError):
+        return _PARENT_RECV_DEFAULT_S
+    if not math.isfinite(v):
+        return _PARENT_RECV_DEFAULT_S
+    return max(_PARENT_RECV_FLOOR_S, v)
+
+
+def _bf16_probe_timeout_s() -> float:
+    """The child's budget: never the fixed cap, never the parent deadline.
+
+    A short deadline only shrinks the budget, which makes a slow probe time
+    out — the safe direction: TimeoutExpired → fp32, not a killed sidecar.
+    """
+    return max(
+        1.0,
+        min(_BF16_PROBE_TIMEOUT_S, _parent_recv_deadline_s() - _PROBE_DEADLINE_MARGIN_S),
+    )
+
+#: A minimal bfloat16 GEMM — exactly the operation rocBLAS/Tensile dies on
+#: when it loads its bf16 kernel library (gfx1030, #2372). Runs as
+#: ``python -c`` inside this same venv, so it sees the same torch and GPU.
+_BF16_PROBE_CODE = (
+    "import torch\n"
+    "x = torch.randn(64, 64, device='cuda', dtype=torch.bfloat16)\n"
+    # .sum().item() synchronizes, so a deferred fault still lands in the child.
+    "torch.matmul(x, x).sum().item()\n"
+)
+
+
+def _bf16_probe() -> bool:
+    """True when one tiny bf16 GEMM survives in a child process.
+
+    ``torch.cuda.is_bf16_supported()`` claims True on ROCm parts whose
+    rocBLAS then segfaults on the first bfloat16 GEMM (gfx1030 / RDNA2,
+    #2372) — below Python, so the whole sidecar died with ``closed pipe
+    mid-generate`` on every synthesis. Running the probe in a child converts
+    that crash into a non-zero exit we can fall back from.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _BF16_PROBE_CODE],
+            capture_output=True,
+            # Never outlast the parent's silence deadline: the heartbeat that
+            # re-arms the watchdog only starts after this returns (#2424 review).
+            timeout=_bf16_probe_timeout_s(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def _torch_bf16_supported() -> bool:
     """Return whether this sidecar can safely enable IndexTTS 2.5 BF16."""
     try:
         import torch
 
         supported = getattr(torch.cuda, "is_bf16_supported", None)
-        return bool(torch.cuda.is_available() and supported and supported())
+        if not (torch.cuda.is_available() and supported and supported()):
+            return False
+        if getattr(torch.version, "hip", None):
+            # ROCm: the claim is necessary but not sufficient — verify it in
+            # a child so a Tensile segfault fails only the probe (#2372) and
+            # the model falls back to fp32 (the verified workaround was
+            # OMNIVOICE_INDEXTTS_FP16=0).
+            return _bf16_probe()
+        return True
     except Exception:
         return False
 
@@ -295,9 +386,10 @@ def _model_init_kwargs(
 
 
 def _configure_rocm_windows() -> None:
-    """ROCm on Windows: PyTorch's own convolutions instead of MIOpen's, and
+    """Legacy ROCm Torch on Windows: PyTorch's own convolutions instead of MIOpen's, and
     AOTriton attention, as the backend does (services/model_manager.py).
     MIOpen tunes every new input shape for minutes. OMNIVOICE_MIOPEN=1 keeps it.
+    Newer managed runtimes keep upstream's dispatch and precision policy.
 
     Also run by the venv probe (bootstrap.py) before it imports indextts: a
     probe that fails here makes the backend bootstrap a CUDA venv of its own,
@@ -311,7 +403,9 @@ def _configure_rocm_windows() -> None:
         return
     import torch
 
-    if getattr(torch.version, "hip", None) is None:
+    if getattr(torch.version, "hip", None) is None or not str(getattr(torch, "__version__", "")).startswith(
+        "2.9.1+rocm7.13."
+    ):
         return
     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
     if os.environ.get("OMNIVOICE_MIOPEN") != "1":
@@ -343,7 +437,12 @@ def _rocm_reduced_precision_s2mel(model) -> None:
     import torch
 
     dtype = getattr(model, "dtype", None)
-    if sys.platform != "win32" or getattr(torch.version, "hip", None) is None or dtype is None:
+    if (
+        sys.platform != "win32"
+        or getattr(torch.version, "hip", None) is None
+        or not str(getattr(torch, "__version__", "")).startswith("2.9.1+rocm7.13.")
+        or dtype not in (torch.float16, torch.bfloat16)
+    ):
         return
     cfm = model.s2mel.models["cfm"]
     inference = cfm.inference
@@ -409,7 +508,17 @@ def _wav_to_pcm_b64(wav_path: str) -> tuple[str, int, int]:
     import numpy as np
     import torchaudio  # type: ignore[import-not-found]
 
-    wav, sr = torchaudio.load(wav_path)
+    try:
+        wav, sr = torchaudio.load(wav_path)
+    except (ImportError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError) and "could not load libtorchcodec" not in str(exc).lower():
+            raise
+        # Sidecars cannot import parent services; keep decoding self-contained.
+        import soundfile as sf
+        import torch
+
+        samples, sr = sf.read(wav_path, dtype="float32", always_2d=True)
+        wav = torch.from_numpy(samples.T.copy())
     # Downmix multi-channel to mono.
     if wav.ndim == 2 and wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)

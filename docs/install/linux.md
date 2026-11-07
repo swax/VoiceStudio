@@ -1,119 +1,203 @@
 # VoiceStudio — Install on Linux
 
-## Electron desktop (current)
+VoiceStudio's Linux desktop app is built with Electron. The archived Tauri app
+is no longer maintained; if you still run it, follow the
+[migration guide](../electron-migration.md).
 
-From the repository root, install Bun and uv, then run:
+## Requirements
 
-```sh
-bun install
-bun run setup:api  # prepare Python dependencies before starting Electron
-bun run dev
+- **Linux x86_64** with a graphical desktop session (X11 or Wayland). There are
+  no ARM64 Linux packages.
+- **~10 GB free disk** for the app, its Python environment, and model weights.
+- Optional: an **NVIDIA driver** for CUDA acceleration. Without one, setup
+  installs the CPU build of PyTorch (see below). For AMD GPUs see
+  [AMD GPU (ROCm)](#amd-gpu-rocm).
+
+Python, FFmpeg/FFprobe, yt-dlp, and model weights are bootstrapped by the app
+on first launch; no toolchain is needed for the packaged app. If no FFmpeg
+resolves anywhere, the app downloads its own checksummed static build;
+**Settings → Audio tools** shows which binaries are in use and lets you
+override them or update yt-dlp.
+
+## Install (Snap, AppImage or .deb)
+
+<a id="install-snap"></a>
+
+**Snap Store** (Ubuntu and other distributions with snapd):
+
+<a href="https://snapcraft.io/voicestudio"><img src="https://snapcraft.io/en/dark/install.svg" alt="Get it from the Snap Store" height="40" /></a>
+
+or from a terminal:
+
+```bash
+sudo snap install voicestudio
 ```
 
-Use `bun run desktop-prod` to build and launch Electron, or `bun run dist`
-to create local installers without publishing. The app manages its backend.
-See [Electron setup](../../electron/README.md) and [migration notes](../electron-migration.md).
+The snap updates itself through snapd. Recording and dictation need the
+microphone interface; if VoiceStudio cannot hear you, connect it once:
 
-## Legacy Tauri installation and troubleshooting
+```bash
+sudo snap connect voicestudio:audio-record
+```
 
-The instructions below apply to the sunset Tauri app and existing Tauri installers.
+<a id="install-appimage"></a>
 
-This page is self-contained: follow it top to bottom and you'll end up with a
-working VoiceStudio install on a Debian / Ubuntu / Fedora / Arch host.
+Download a package from the
+[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest):
 
-## Prerequisites
+| Package | File |
+|---|---|
+| AppImage (any distribution) | `VoiceStudio-<version>-linux-x64.AppImage` |
+| Debian / Ubuntu package | `VoiceStudio-<version>-linux-x64.deb` |
 
-### Using the AppImage
+**AppImage:**
 
-- **Linux x86_64 with glibc 2.39+** and a desktop session (X11 or Wayland)
-  capable of running a Tauri / WebKitGTK app.
-- **~10 GB free disk** for the app, its Python environment, and model weights.
-- Optional: an **NVIDIA driver** for CUDA GPU acceleration — the app runs
-  CPU-only without one. For AMD GPUs see [AMD GPU (ROCm)](#amd-gpu-rocm).
-That's it — Python, FFmpeg/FFprobe, yt-dlp, and the model weights are bundled
-or bootstrapped by the app itself on first launch. No toolchain needed. (If no
-FFmpeg resolves anywhere, the app downloads its own checksummed static build
-in the background during setup; **Settings → Audio tools** shows exactly which
-binaries are in use and lets you override them or update yt-dlp.)
+```bash
+chmod +x VoiceStudio-*-linux-x64.AppImage
+./VoiceStudio-*-linux-x64.AppImage
+```
 
-### Building from source
+The AppImage uses the static AppImage runtime, so it does not need `libfuse2`.
+The [shell installer](script.md) (`curl -fsSL https://voicestudio.sh/install | sh`)
+downloads the latest AppImage, verifies it against the release's
+`SHA256SUMS.txt`, and installs it as `~/.local/bin/VoiceStudio`.
 
-Everything above, plus the toolchain:
+**.deb:**
 
-- **git** — `sudo apt install git` (Debian/Ubuntu), `sudo dnf install git` (Fedora), or `sudo pacman -S git` (Arch).
-- **curl** — usually preinstalled; used by the Bun and rustup install one-liners below.
-- **Python 3.11+** — typically `sudo apt install python3.11` on Debian/Ubuntu,
-  `sudo dnf install python3.11` on Fedora, or already installed on Arch.
-- **Bun** — `curl -fsSL https://bun.sh/install | bash`.
-- **Rust / Cargo** — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` or via your package manager (e.g., `sudo apt install rustc cargo`).
-  If you use rustup, reopen the shell or source `"$HOME/.cargo/env"` before running `bun run tauri:desktop-prod`.
-- **GTK/WebKit deps** for the Tauri shell:
+```bash
+sudo apt install ./VoiceStudio-<version>-linux-x64.deb
+```
+
+The in-app updater's Linux feed carries the AppImage. Update a `.deb`
+installation by installing the newer `.deb`; remove it with your package
+manager.
+
+Compare any download with the release's `SHA256SUMS.txt` before installing.
+
+### Machines without an NVIDIA GPU
+
+Laptops and desktops with Intel/AMD integrated graphics (or any GPU without
+an NVIDIA driver) run the whole app on the CPU, just slower. When no NVIDIA
+driver is found, the packaged app's runtime setup installs the small CPU build
+of PyTorch rather than the CUDA build and its ~3 GB of `nvidia-*` packages,
+and needs about 5 GiB of free disk instead of 9 GiB. Pick a light voice engine
+(KittenTTS, Supertonic-3, PocketTTS) and a small Whisper model for the best
+speed. `OMNIVOICE_TORCH_VARIANT=cuda|cpu|rocm` overrides the detection, and an
+existing install keeps working untouched. Source setup (`bun run setup:api`)
+also selects the locked CPU wheels on x86-64 hosts without NVIDIA. Linux ARM
+source installs keep their native PyPI wheels. See
+[CPU setup and overrides](../../electron/README.md#running-without-a-gpu).
+
+## Building from source
+
+Use this for development or to run current `main`. To build and install a
+desktop package from `main` without a checkout, use the shell installer's
+[`--main` mode](script.md#building-main).
+
+Prerequisites:
+
+- **git** and **curl**
+- **Bun** — `curl -fsSL https://bun.sh/install | bash`
+- **uv** — `curl -LsSf https://astral.sh/uv/install.sh | sh` (it provides the
+  managed Python 3.11 the backend uses)
+- **Node.js 22.12.0 or newer**, **Rust / Cargo**
+  (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`), and the
+  native development libraries used by the Electron native helper. If you use
+  rustup, reopen the shell or run `source "$HOME/.cargo/env"` first.
 
   ```bash
   # Debian / Ubuntu
   sudo apt-get update
-  sudo apt-get install -y \
-    libwebkit2gtk-4.1-dev libgtk-3-dev libpango1.0-dev libcairo2-dev \
-    libsoup-3.0-dev libgdk-pixbuf-2.0-dev \
-    libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev \
-    gstreamer1.0-plugins-good \
-    libasound2-dev build-essential curl wget file
+  sudo apt-get install -y build-essential pkg-config libasound2-dev libxdo-dev \
+    libxtst-dev libx11-dev libxkbcommon-dev libwayland-dev libssl-dev \
+    binutils zsync
 
   # Fedora
-  sudo dnf install webkit2gtk4.1-devel libappindicator-gtk3-devel librsvg2-devel openssl-devel libxdo-devel gstreamer1-plugins-good
+  sudo dnf install gcc gcc-c++ make pkgconf-pkg-config alsa-lib-devel libxdo-devel \
+    libXtst-devel libX11-devel libxkbcommon-devel wayland-devel openssl-devel
 
   # Arch
-  sudo pacman -S --needed base-devel webkit2gtk-4.1 libayatana-appindicator librsvg openssl xdotool gst-plugins-good
+  sudo pacman -S --needed base-devel alsa-lib xdotool libxtst libx11 libxkbcommon wayland openssl
   ```
 
-- Optional: a **Hugging Face token** for diarization + the larger TTS engines
-  (see [docs/setup/huggingface-token.md](../setup/huggingface-token.md)).
+  `bun run dist` also needs `readelf` (binutils) and `zsyncmake` (zsync) to
+  embed AppImage update information.
 
-## Install (from source)
-
-One-liner (installs prerequisites, clones, and builds; WSL works too):
-
-```bash
-curl -fsSL https://voicestudio.sh/install | sh
-```
-
-Or manually:
+Then, from a clone of the repository:
 
 ```bash
 git clone https://github.com/debpalash/VoiceStudio.git
 cd VoiceStudio
-bun install
-source "$HOME/.cargo/env"  # only needed in a shell opened before rustup finished
-bun tauri               # development build with hot reload
+node electron/scripts/node-version.mjs
 ```
 
-Use `bun run tauri:desktop-prod` instead when you need to build and launch the
-production bundle. Both commands create the Python environment via `uv`, sync
-dependencies, and start the backend automatically; do not start the backend in
-a second terminal.
-
-The first Rust build takes longer because Cargo compiles the Tauri shell. If it
-fails with `Package gdk-3.0 was not found`, `pango.pc` missing,
-`libsoup-3.0` missing, or `javascriptcoregtk-4.1` missing, install the complete
-Debian/Ubuntu package block above. Those messages mean the development
-libraries are absent, not that `PKG_CONFIG_PATH` needs changing. Verify them
-with:
+If the Node check fails, stop here, upgrade Node.js, and reopen your terminal
+before continuing. Then install dependencies and prepare the local backend
+(skip API setup when using an external backend or an Intel Mac):
 
 ```bash
-pkg-config --exists \
-  gdk-3.0 pango cairo libsoup-3.0 javascriptcoregtk-4.1 gdk-pixbuf-2.0 \
-  && echo "Tauri system libraries are ready"
+bun install
+bun run setup:api   # create the Python environment with uv
+bun run dev         # Electron with hot reload; it starts and supervises the backend
 ```
 
-`bun tauri` also checks the native `libxdo` linker input and GStreamer's
-`autoaudiosink` before starting. The latter is required even if you do not plan
-to record: WebKitGTK 2.52 aborts its renderer when a page creates an audio
-element without that plugin, which otherwise turns a running app blank. The
-launcher prints one distro-specific install command when either dependency is
-missing.
+Do not start the backend in a second terminal; Electron attaches to a backend
+already listening on port 3900, otherwise it starts its own. Other commands:
 
-The first app launch downloads model weights on demand. Subsequent launches
-reuse the Rust build, Python environment, and installed models.
+| Command | What it does |
+|---|---|
+| `bun run desktop-prod` | Build Electron and launch the production bundle |
+| `bun run dist` | Build local installers (AppImage and `.deb`) in `electron/release/` without publishing |
+| `bun run smoke-test` | Build and launch an isolated packaged app |
+
+See [Electron setup](../../electron/README.md) for backend configuration and
+quality gates. The first launch downloads model weights only when you install
+a model.
+
+### Arch Linux (AUR)
+
+```bash
+yay -S voicestudio-bin   # or paru -S voicestudio-bin
+# Development build from the current main branch:
+yay -S voicestudio-git
+```
+
+The upstream maintainer maintains `voicestudio-bin`, which repackages the
+stable release `.deb`, and `voicestudio-git`, which builds current development
+sources. Install one variant at a time. The Git package builds the Electron
+app, native desktop bridge and pinned OmniVoice GGUF runtime; it needs a
+native toolchain, network access and sufficient disk space for the build.
+Its recipe and build instructions live in
+[`packaging/aur`](../../packaging/aur/README.md).
+
+The Git-package launcher sets `VOICESTUDIO_DISABLE_UPDATER=1` so `pacman`
+handles application updates. Set the same variable for other package-managed
+installs. Model and Python runtime setup remain explicit in the app.
+
+### Nix / NixOS
+
+A community-maintained Nix flake provides development shells and an FHS environment for running from source (not tested in CI). See the [Nix / NixOS guide](nix.md):
+
+```bash
+nix develop .#fhs   # recommended for NixOS
+bun run dev
+```
+
+## ChromeOS, iPad and other devices
+
+There is no native ChromeOS or iPadOS app, and VoiceStudio does not run
+inside the browser alone: the models need a real backend.
+
+- **Chromebook with Linux development environment on x86-64:** install the
+  AppImage or `.deb` ([Install](#install-snap-appimage-or-deb)). Expect CPU-only
+  generation (the container has no GPU access on most devices) and enough RAM
+  for the model you pick. ARM Chromebooks are not supported: the Linux builds
+  are x86-64 only.
+- **Any browser, including ChromeOS, iPad and phones:** run VoiceStudio on a
+  PC, Mac or server and open its web interface from the device. On the same
+  network turn on **Network** sharing and scan the QR code; from anywhere, use
+  Tailscale. See [Sharing & Remote Access](../sharing.md); for a headless host
+  see [Docker](docker.md).
 
 ## Wayland dictation shortcut
 
@@ -158,195 +242,31 @@ See the portal project's [service integration checks](https://flatpak.github.io/
 and the Arch Linux [backend compatibility table](https://wiki.archlinux.org/title/XDG_Desktop_Portal#List_of_backends_and_interfaces)
 for concrete service and desktop-backend checks.
 
-## Install (AppImage)
-
-Download the latest AppImage from the
-[Releases page](https://github.com/debpalash/VoiceStudio/releases/latest),
-make it executable, and run:
-
-```bash
-chmod +x VoiceStudio.Studio_*.AppImage
-./VoiceStudio.Studio_*.AppImage
-```
-
-No FUSE? Use `--appimage-extract-and-run`:
-
-```bash
-./VoiceStudio.Studio_*.AppImage --appimage-extract-and-run
-```
-
-## .deb package
-
-Not currently published: `.deb` bundling is disabled in the release pipeline
-because of a `tauri-cli` bug (`Failed to create control scripts`) — see the
-comment in `.github/workflows/release.yml` for the tracking note. The
-AppImage above is the supported Linux install path until a `tauri-cli`
-version resolves it. `apt install`-able `.deb`s shipped before v0.3 (see
-[.deb ffprobe conflict](#deb-ffprobe-conflict) below) if you're upgrading
-from one of those.
-
-The desktop app uses these canonical paths (kept in sync with
-`scripts/desktop-prod.sh` by the docs-drift CI gate):
-
-<!-- validate -->
-```bash
-APP_ID="com.debpalash.omnivoice-studio"
-APP_NAME="VoiceStudio"
-```
-
-## AppImage white screen / EGL errors (Fedora 44, Ubuntu 24.04+, 26.04)
+## Blank window or GPU errors
 
 <a id="appimage-white-screen-on-fedora-44--ubuntu-2404"></a>
 
-Two separate WebKitGTK rendering issues land the Tauri window as a
-fully-white frame with no UI. Which one you have depends on your WebKitGTK
-version (`pkg-config --modversion webkit2gtk-4.1` prints it).
-
-**Modern WebKitGTK (2.48+ — Ubuntu 24.04 and newer, incl. 26.04): try this
-first.** WebKit's DMA-BUF renderer fails against some GPU drivers; the
-terminal typically shows:
-
-```
-Could not create default EGL display: EGL_BAD_PARAMETER
-```
-
-Disable the DMA-BUF renderer before launching:
+The Electron app renders with Chromium, not WebKitGTK, so the `WEBKIT_*`
+variables and the bundled-WebKit/GStreamer workarounds from the archived Tauri
+AppImage no longer apply. If the window stays blank or the terminal shows GPU
+process errors, start the app once with Chromium's GPU acceleration disabled:
 
 ```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=1 ./VoiceStudio.Studio_*.AppImage
+./VoiceStudio-*-linux-x64.AppImage --disable-gpu
 ```
 
-**WebKitGTK 2.44 / 2.46 (Fedora 44, Ubuntu 24.04 at release):** a
-compositing-mode regression blanks the surface on first paint. Disable
-compositing mode instead:
-
-```bash
-WEBKIT_DISABLE_COMPOSITING_MODE=1 ./VoiceStudio.Studio_*.AppImage
-```
-
-VoiceStudio's AppRun launcher autodetects the broken 2.44/2.46 range and sets
-this second variable for you (shipped in v0.3+). The manual env-var path
-remains the documented fallback when running from a checked-out source tree.
-
-**Last resort** — if neither variable alone helps, force software rendering
-(slower, but always paints):
-
-```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1 ./VoiceStudio.Studio_*.AppImage
-```
-
-### If no environment variable helps at all (Mesa 26.1+)
-
-On a host with **Mesa 26.1 or newer** — Arch/CachyOS, and rolling distros
-generally — none of the variables above make any difference, including
-`WEBKIT_DMABUF_RENDERER_FORCE_SHM`, `WEBKIT_SKIA_ENABLE_CPU_RENDERING`,
-`EGL_PLATFORM=surfaceless` and `MESA_LOADER_DRIVER_OVERRIDE=swrast`. That is
-expected: the failure is in EGL **display creation**, which happens before
-WebKit consults any rendering-path flag, so there is nothing left for a flag
-to change.
-
-The cause is a version pairing, not a bug in either half. The AppImage bundles
-a WebKitGTK built on Ubuntu but ships no `libEGL` of its own, so that bundled
-WebKit runs against *your* Mesa. On Mesa ≥ 26.1 it calls
-`eglGetPlatformDisplay()` in a way the newer driver rejects. Your distro's own
-WebKitGTK is fine, because it was compiled against the Mesa you are running —
-which is why building from source works on the same machine.
-
-**From v0.4.1 the AppImage handles this itself:** when your system has a
-WebKitGTK at least as new as the bundled one, the launcher lets your copy take
-precedence, and the bundled libraries fill in only what your system lacks.
-
-That check reads your WebKit version from `pkg-config`, which is only installed
-alongside the **development** package. If you have the runtime but not the dev
-package, the launcher can't compare versions and keeps the bundled copy — so
-tell it explicitly:
-
-```bash
-OMNIVOICE_PREFER_SYSTEM_WEBKIT=1 ./VoiceStudio.Studio_*.AppImage
-```
-
-(Set it to `0` to force the bundled copy — useful if your distro's WebKitGTK is
-older than ours and you'd rather keep the newer bundled one.)
-
-If you are on v0.4.0 or older, either update or build from source:
-
-```bash
-git clone https://github.com/debpalash/VoiceStudio.git
-cd VoiceStudio
-bun install
-bun run tauri:desktop-prod
-```
-
-Tracking issues: [#62](https://github.com/debpalash/VoiceStudio/issues/62),
-[#961](https://github.com/debpalash/VoiceStudio/issues/961),
-[#1258](https://github.com/debpalash/VoiceStudio/issues/1258).
-
-## AppImage: "No microphone found" while the raw binary records fine
-
-Recording from the AppImage fails with *"No microphone found. Connect or enable
-a microphone and try again."* — but `pactl list short sources` shows your
-microphones, `gst-launch-1.0 pulsesrc … ! fakesink` captures, and running
-`frontend/src-tauri/target/debug/omnivoice-studio` directly records without
-trouble. `GST_DEBUG=2` shows the real message:
-
-```text
-WARN GST_REGISTRY gst_registry_binary_check_magic:
-  Binary registry magic version is different : 1.23.90 != 1.3.0
-GStreamer element appsink not found. Please install it.
-```
-
-Same shape as the blank-window problem above, in a different library. The
-AppImage bundles the GStreamer **core** (WebKitGTK links it) but not its
-**plugins** — those are loaded dynamically at runtime, so the packaging step
-cannot see them to copy. The bundled core then reads *your* plugin directory,
-whose plugins were built against *your* core, the version check rejects them,
-and the scan produces nothing. `appsink` is one of the elements that goes
-missing, and it is the one WebKit needs to hand over a capture stream — so
-`getUserMedia()` reports no device. Your raw binary works because it uses your
-core with your plugins, which agree.
-
-**From v0.4.3 the launcher prefers your system's GStreamer**, which is the only
-core that can match the plugins that will actually load. It does that by
-preloading that one library (`LD_PRELOAD`) rather than by putting your system
-library directory ahead of the bundle — your GStreamer shares that directory
-with most of the system, so hoisting it would quietly replace every *other*
-bundled library too. If your distro's GStreamer is itself broken and you would
-rather fall back to the bundled core:
-
-```bash
-OMNIVOICE_PREFER_SYSTEM_GSTREAMER=0 ./VoiceStudio.Studio_*.AppImage
-```
-
-The launcher checks first that your GStreamer can actually load alongside the
-libraries the AppImage bundles — a system core built against newer GLib than we
-ship would fail to load and take the whole app down with it, which is worse than
-a missing microphone. If that check fails it prints a warning, keeps the bundled
-core, and the app still starts (with capture still broken); building from source
-avoids the mismatch entirely.
-
-The AppImage also keeps its plugin-scan cache to itself, at
-`~/.cache/VoiceStudio/gstreamer-registry.bin`, rather than in the shared
-`~/.cache/gstreamer-1.0/`. GStreamer names that shared file by architecture
-alone, so two cores of different versions overwrite each other's — which both
-makes this failure depend on whichever application ran last, and lets the
-AppImage corrupt the cache every other GStreamer app on your machine reads.
-
-If you set `XDG_CACHE_HOME`, the path follows it
-(`$XDG_CACHE_HOME/VoiceStudio/gstreamer-registry.bin`); `~/.cache` is the default
-when it is unset.
-
-Tracking issue: [#1333](https://github.com/debpalash/VoiceStudio/issues/1333).
+On Wayland sessions you can also try forcing X11 (XWayland) with
+`--ozone-platform=x11`. If either flag helps, report your distribution, desktop
+and GPU driver in a GitHub issue.
 
 ## .deb ffprobe conflict
 
 <a id="deb-ffprobe-conflict"></a>
 
-Pre-v0.3 `.deb` packages installed `ffprobe` into `/usr/bin/ffprobe` and
-clobbered the system copy on some distros. v0.3+ relocates the bundled
-binary into `/usr/lib/omnivoice-studio/bin/ffprobe` and the `postrm` script
-runs `dpkg --search` to undo the old conflict on upgrade. If you upgraded
-from a pre-v0.3 .deb and `ffprobe -version` now reports the wrong binary,
-re-install the system package:
+This applies only to upgrades from **pre-v0.3** `.deb` packages, which
+installed `ffprobe` into `/usr/bin/ffprobe` and could clobber the system copy.
+If `ffprobe -version` reports the wrong binary after such an upgrade,
+reinstall the system package:
 
 ```bash
 sudo apt install --reinstall ffmpeg
@@ -358,21 +278,26 @@ If `uv` times out fetching the python-build-standalone tarball or PyPI:
 
 ```bash
 # Use a faster Python source mirror (China only — verify a current mirror)
-export UV_PYTHON_INSTALL_MIRROR=https://ghproxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
+export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
 
-# Use a PyPI mirror
+# Use a PyPI mirror (source checkouts that resolve packages themselves; the
+# locked dependency install downloads the wheel URLs pinned in uv.lock)
 export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Or skip the download entirely if you have a compatible system Python
 export UV_PYTHON_PREFERENCE=only-system
 
 # Be tolerant of slow links
-export UV_HTTP_TIMEOUT=120
+export UV_HTTP_TIMEOUT=900
 export UV_HTTP_RETRIES=5
 ```
 
-The Phase 3 install milestone (INST-07..11) ships an OS-level mirror cascade
-that picks these defaults automatically; for v0.3 set them by hand.
+Packaged setup already tries a Python download mirror and raises the uv
+network budget automatically; set these to force a specific mirror, or before
+`bun run setup:api` in a source checkout. See
+[troubleshooting](troubleshooting.md#first-run-setup-fails-on-a-restricted-network-githubpypi-blocked).
+If the dependency download is slow or stalls, see
+[First-run setup is slow or stalls on a download](troubleshooting.md#first-run-setup-is-slow-or-stalls-on-a-download).
 
 ## AMD GPU (ROCm)
 
@@ -384,39 +309,48 @@ an AMD-only machine `torch.cuda.is_available()` is `False` and VoiceStudio runs
 on CPU until you opt into the ROCm variant.
 
 > **Running in Docker or Podman instead?** There's a prebuilt ROCm image —
-> `ghcr.io/debpalash/voicestudio:rocm` — with GPU acceleration out of the
+> `ghcr.io/debpalash/voicestudio:stable-rocm` — with GPU acceleration out of the
 > box; see [docker.md](docker.md#pull-and-run-amd-gpu--rocm). The rest of this
-> section is about source/desktop installs. (On Windows there is no ROCm path
-at all — PyTorch publishes no Windows ROCm wheels; see
-[windows.md](windows.md#gpu-support).)
+> section is about source/desktop installs. Windows has its own opt-in ROCm
+> setup; see [windows-rocm.md](windows-rocm.md).
 
-Three ways to opt in, in order of preference:
+**Radeon RX 9000 series (RDNA4: RX 9060 / 9070 / 9070 XT, `gfx1200`/`gfx1201`)**
+is supported natively by the ROCm build below (torch 2.8.0 from the `rocm6.4`
+index includes both architectures), so it needs no `HSA_OVERRIDE_GFX_VERSION`.
+The host needs an `amdgpu` kernel driver new enough for RDNA4 (AMD's ROCm
+6.4.1+ driver, or a recent distribution kernel); `rocminfo` listing your card
+as `gfx1200`/`gfx1201` confirms it. Never remap an RDNA4 card onto `11.0.0`:
+RDNA3 kernels cannot run on it.
 
-**1. First-run setup screen (recommended).** On Linux the setup screen's
-**Compute** card offers **"AMD GPU (ROCm, Linux)"** next to the default
-**Auto**. When VoiceStudio detects an AMD GPU *and* the ROCm userspace
-(`/opt/rocm` present, or `rocminfo` on PATH), the ROCm option is pre-selected;
-with an AMD GPU but no ROCm runtime it stays offered-but-unselected — install
-ROCm first (or continue on CPU). Choosing ROCm makes the bootstrap reinstall
-`torch`/`torchaudio` from the ROCm wheel index
-(`https://download.pytorch.org/whl/rocm6.4` by default) right after the
-dependency sync — matched to the app's pinned `torch==2.8.0` (the rocm6.2
-index only ever published up to torch 2.5.1, so it silently failed the
-reinstall and left the CPU-only CUDA build in place).
+Ways to opt in, in order of preference:
 
-**2. Environment variable (existing installs / headless / source).** Set
-`OMNIVOICE_TORCH_VARIANT=rocm` before launching — the next bootstrap performs
-the same ROCm reinstall. Source installs honour it too:
-`OMNIVOICE_TORCH_VARIANT=rocm bun run tauri` swaps torch right after
-`uv sync` and launches the backend without re-syncing, so the wheel is not
-reverted on the next start (#1665). Without the variable, `bun run tauri`
-restores the lockfile's CUDA build — a hand-swapped ROCm wheel does not
-survive it. `OMNIVOICE_TORCH_INDEX=<url>` overrides the wheel
-index when you need a different ROCm version — e.g. AMD publishes newer
-driver-matched builds (7.2.x) at `repo.radeon.com` as a `--find-links` page
-rather than a PyPI-style index:
+**1. Packaged app (environment variable).** Install the ROCm userspace
+(`/opt/rocm` or `rocminfo` on PATH), then launch VoiceStudio once with
+`OMNIVOICE_TORCH_VARIANT=rocm` set, for example
+`OMNIVOICE_TORCH_VARIANT=rocm ./VoiceStudio-*-linux-x64.AppImage`.
+Once setup finishes, the choice is saved in `~/.config/omnivoice/env`, so later
+launches and app updates keep ROCm without the variable. To leave ROCm, launch
+once with `OMNIVOICE_TORCH_VARIANT=cpu`.
+Runtime setup then reinstalls `torch`/`torchaudio`/`torchvision` from the ROCm
+wheel index (`https://download.pytorch.org/whl/rocm6.4` by default) right after
+the dependency sync, leaving every other package on the regular index, matched to the app's pinned `torch==2.8.0` (the rocm6.2 index
+only ever published up to torch 2.5.1). **Settings → Performance → GPU
+acceleration** reports which PyTorch build is installed. The option is ignored
+on macOS; on Windows it selects the opt-in stack in
+[windows-rocm.md](windows-rocm.md).
+
+**2. Source checkout.** `OMNIVOICE_TORCH_VARIANT=rocm bun run setup:api` swaps
+torch right after `uv sync`; `bun run dev` then starts the backend from that
+environment, and `bun run dev:api` launches it without re-syncing, so the
+wheel is not reverted (#1665).
+Running `bun run setup:api` again without `OMNIVOICE_TORCH_VARIANT` restores
+the lockfile's CUDA torch build, replacing any ROCm wheel you installed by
+hand. To choose another ROCm release, set `OMNIVOICE_TORCH_INDEX=<url>`; AMD
+publishes newer driver-matched 7.2.x wheels on `repo.radeon.com` as a
+`--find-links` page rather than a PyPI-compatible index, for example:
 ```bash
-uv pip install --reinstall torch==2.8.0 torchaudio==2.8.0 \
+uv pip install --reinstall-package torch --reinstall-package torchaudio \
+  --reinstall-package torchvision torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 \
   --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/
 ```
 run that manually if you want a specific ROCm point release; the
@@ -431,15 +365,27 @@ keeps the default torch build and warns instead of breaking the install.
 # From the project directory (source install), into VoiceStudio's uv venv.
 # Matches the app's torch==2.8.0 pin — a different ROCm point release
 # (e.g. rocm6.2, rocm7.x) may not carry that exact torch build.
-uv pip install --reinstall torch torchaudio \
-  --index-url https://download.pytorch.org/whl/rocm6.4
+# Swap all three torch packages together: a CUDA torchvision left beside a
+# ROCm torch fails at generation time ("operator torchvision::nms does not
+# exist"). Keep PyPI as the main index: PyTorch's index has no Pillow 13, so
+# `--index-url` with `--reinstall` cannot resolve (#3158).
+uv pip install \
+  --reinstall-package torch --reinstall-package torchaudio --reinstall-package torchvision \
+  torch==2.8.0+rocm6.4 torchaudio==2.8.0+rocm6.4 torchvision==0.23.0+rocm6.4 \
+  --extra-index-url https://download.pytorch.org/whl/rocm6.4 \
+  --index-strategy unsafe-best-match
 ```
 
 Once a ROCm build of PyTorch is in the venv, detection is automatic —
 `get_best_device()` returns the GPU (ROCm-built PyTorch reports through
 `torch.cuda.is_available()`), and VoiceStudio auto-sets
-`HSA_OVERRIDE_GFX_VERSION` for consumer cards whose GFX ID isn't in the
-official ROCm support matrix. Relaunch and the Settings → System panel should
+`HSA_OVERRIDE_GFX_VERSION` when your card's GFX ID is missing from the
+installed wheel's architecture list. The target comes from that list, not from
+a fixed table: the closest architecture of the same generation and the same or
+an older revision (gfx1152 → gfx1100, gfx1035 → gfx1030, gfx1201 → gfx1200 on
+a wheel that only ships gfx1200). It never crosses a generation, nor RDNA1/RDNA2
+(gfx101x/gfx103x) or Vega/CDNA within gfx9, so an RDNA4
+card on a wheel without any gfx12 target gets no override and a clear message. Relaunch and **Settings → Performance → GPU acceleration** should
 report the GPU device instead of `cpu`. Verify the wheel sees your card:
 
 ```bash
@@ -450,8 +396,13 @@ Notes:
 - ROCm is exercised far less than the default CUDA/MPS/CPU paths — it works,
   but expect rough edges on consumer cards and report what you hit.
 - Unsupported GFX (e.g. some consumer RDNA cards): if it still won't run, set
-  `HSA_OVERRIDE_GFX_VERSION` yourself (e.g. `export HSA_OVERRIDE_GFX_VERSION=11.0.0`)
-  to the nearest supported architecture before launching.
+  `HSA_OVERRIDE_GFX_VERSION` yourself to a supported architecture **of the same
+  generation** before launching (e.g. `export HSA_OVERRIDE_GFX_VERSION=11.0.0`
+  for a gfx11xx card, `10.3.0` for a gfx103x card; RDNA1 gfx101x cannot use
+  `10.3.0`). A remap across generations cannot
+  work, so RDNA4 (gfx12xx) cards need a ROCm build that lists them instead.
+  When the build lacks your card, VoiceStudio's GPU architecture notification
+  names the exact value to try, or says that no remap exists.
 - ZLUDA (CUDA-on-ROCm translation) can work but is unsupported here — prefer a
   native ROCm wheel.
 

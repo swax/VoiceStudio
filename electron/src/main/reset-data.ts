@@ -1,5 +1,6 @@
-import { lstat, readdir, rm } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, parse, relative, resolve } from 'node:path';
+import { lstat, readdir, realpath, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 
 export const FRONTEND_RESET_SCOPES = ['ui_prefs', 'history'] as const;
 export const DISK_RESET_SCOPES = [
@@ -46,6 +47,16 @@ async function stat(path: string) {
 }
 
 export async function directorySize(path: string): Promise<number> {
+  let physical: string;
+  try {
+    physical = await realpath(path);
+  } catch {
+    return 0;
+  }
+  return directorySizePhysical(physical);
+}
+
+async function directorySizePhysical(path: string): Promise<number> {
   const info = await stat(path);
   if (!info || info.isSymbolicLink()) return 0;
   if (info.isFile()) return info.size;
@@ -57,7 +68,9 @@ export async function directorySize(path: string): Promise<number> {
     return 0;
   }
   const sizes = await Promise.all(
-    children.map((entry) => (entry.isSymbolicLink() ? 0 : directorySize(join(path, entry.name)))),
+    children.map((entry) =>
+      entry.isSymbolicLink() ? 0 : directorySizePhysical(join(path, entry.name)),
+    ),
   );
   return sizes.reduce((sum, size) => sum + size, 0);
 }
@@ -88,13 +101,14 @@ export function normalized(path: string): string {
 
 export function within(path: string, root: string): boolean {
   const rel = relative(normalized(root), normalized(path));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-async function hasAppSignature(path: string): Promise<boolean> {
+async function hasAppSignature(path: string, allowModelCache = false): Promise<boolean> {
   for (const marker of ['omnivoice.db', 'prefs.json', 'voices', 'outputs', 'engines']) {
     if (await stat(join(path, marker))) return true;
   }
+  if (!allowModelCache) return false;
   const hub = await stat(join(path, 'hub'));
   if (hub?.isDirectory()) return true;
   try {
@@ -104,24 +118,106 @@ async function hasAppSignature(path: string): Promise<boolean> {
   }
 }
 
-export async function isValidVoiceStudioRoot(path: string, home: string | null): Promise<boolean> {
-  if (!isAbsolute(path) || dirname(path) === path || components(path).length < 2) return false;
-  if (home && normalized(path) === normalized(home)) return false;
-  const owned = new Set([
-    'omnivoice',
-    '.omnivoice',
-    'voicestudio',
-    'com.debpalash.omnivoice-studio',
-    'huggingface',
-  ]);
-  if (components(path).some((part) => owned.has(part.toLocaleLowerCase('en-US')))) return true;
-  return hasAppSignature(path);
+async function canonical(path: string): Promise<string | null> {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
 }
 
-export function modelsAreShared(models: string, data: string): boolean {
-  if (within(models, data)) return false;
-  const appPrivate = new Set(['omnivoice', '.omnivoice', 'voicestudio']);
-  return !components(models).some((part) => appPrivate.has(part.toLocaleLowerCase('en-US')));
+const APP_NAMES = new Set([
+  'omnivoice',
+  '.omnivoice',
+  'voicestudio',
+  'com.debpalash.omnivoice-studio',
+]);
+const MANAGED_CHILDREN = new Set([
+  'data',
+  'logs',
+  'runtime',
+  'shell',
+  'project',
+  '.uv-cache',
+  '.python',
+  '.tmp',
+  'tmp',
+]);
+
+// Folders the OS (or the installer) keeps per-app directories in. A bare app-named
+// directory anywhere else, such as ~/Documents/VoiceStudio, is the user's own unless it
+// carries the app's signature.
+const APP_PARENTS = new Set([
+  'application support',
+  'caches',
+  'logs',
+  'roaming',
+  'local',
+  'programs',
+  '.config',
+  '.cache',
+  'share',
+  'state',
+]);
+
+function appParent(appDir: string, home: string | null): boolean {
+  const parent = dirname(appDir);
+  if (home && normalized(parent) === normalized(home)) return true;
+  const parts = components(parent).map((part) => part.toLocaleLowerCase('en-US'));
+  const name = parts.at(-1);
+  if (!name || !APP_PARENTS.has(name)) return false;
+  // `share` and `state` only count as ~/.local/share and ~/.local/state.
+  return (name !== 'share' && name !== 'state') || parts.at(-2) === '.local';
+}
+
+function exactManagedLayout(path: string, home: string | null): boolean {
+  const parts = components(path).map((part) => part.toLocaleLowerCase('en-US'));
+  const leaf = parts.at(-1);
+  const parent = parts.at(-2);
+  if (!leaf) return false;
+  if (APP_NAMES.has(leaf)) return appParent(path, home);
+  // A known runtime child is specific enough on its own: setup can place the whole
+  // app folder on any drive (#2971).
+  if (parent && APP_NAMES.has(parent) && MANAGED_CHILDREN.has(leaf)) return true;
+  return (
+    parts.length >= 3 &&
+    parts.at(-3) !== undefined &&
+    APP_NAMES.has(parts.at(-3)!) &&
+    parts.at(-2) === 'runtime' &&
+    MANAGED_CHILDREN.has(leaf)
+  );
+}
+
+function exactModelLayout(path: string): boolean {
+  const parts = components(path).map((part) => part.toLocaleLowerCase('en-US'));
+  return (
+    (parts.at(-1) === 'huggingface' && parts.at(-2) === '.cache') ||
+    (parts.at(-1) === 'hub' && parts.at(-2) === 'huggingface')
+  );
+}
+
+export async function isValidVoiceStudioRoot(
+  path: string,
+  home: string | null = homedir(),
+  allowModelCache = false,
+): Promise<boolean> {
+  if (!isAbsolute(path)) return false;
+  const physical = await canonical(path);
+  if (!physical || dirname(physical) === physical || components(physical).length < 2) return false;
+  const physicalHome = await canonical(home ?? homedir());
+  if (physicalHome && normalized(physical) === normalized(physicalHome)) return false;
+  return (
+    exactManagedLayout(physical, physicalHome) ||
+    (allowModelCache && exactModelLayout(physical)) ||
+    hasAppSignature(physical, allowModelCache)
+  );
+}
+
+export async function modelsAreShared(models: string, data: string): Promise<boolean> {
+  const [physicalModels, physicalData] = await Promise.all([canonical(models), canonical(data)]);
+  if (!physicalModels || !physicalData) return true;
+  if (!(await isValidVoiceStudioRoot(physicalData))) return true;
+  return !within(physicalModels, physicalData);
 }
 
 async function scopeTargets(key: DiskResetScope, roots: ResetRoots): Promise<string[]> {
@@ -159,23 +255,34 @@ async function scopeTargets(key: DiskResetScope, roots: ResetRoots): Promise<str
   }
 }
 
-async function allowedTarget(
+async function authorizedTarget(
+  key: DiskResetScope,
   path: string,
   roots: ResetRoots,
   home: string | null,
-): Promise<boolean> {
+): Promise<string | null> {
+  const physicalTarget = await canonical(path);
+  if (!physicalTarget) return null;
   if (
-    normalized(dirname(path)) === normalized(roots.temp) &&
+    key === 'caches' &&
+    normalized(dirname(physicalTarget)) === normalized((await canonical(roots.temp)) ?? '') &&
     basename(path).toLocaleLowerCase('en-US').startsWith('omnivoice')
   ) {
-    return true;
+    return physicalTarget;
   }
-  for (const root of [roots.data, roots.models, roots.logs].filter((value): value is string =>
-    Boolean(value),
-  )) {
-    if (within(path, root) && (await isValidVoiceStudioRoot(root, home))) return true;
-  }
-  return false;
+  const root =
+    key === 'models'
+      ? roots.models
+      : key === 'logs' && roots.logs && within(physicalTarget, (await canonical(roots.logs)) ?? '')
+        ? roots.logs
+        : roots.data;
+  const physicalRoot = await canonical(root);
+  const allowed = Boolean(
+    physicalRoot &&
+    within(physicalTarget, physicalRoot) &&
+    (await isValidVoiceStudioRoot(physicalRoot, home, key === 'models')),
+  );
+  return allowed ? physicalTarget : null;
 }
 
 export async function scanResetScopes(roots: ResetRoots): Promise<ResetScope[]> {
@@ -197,7 +304,7 @@ export async function scanResetScopes(roots: ResetRoots): Promise<ResetScope[]> 
       paths: present,
       size_bytes: sizes.reduce((sum, size) => sum + size, 0),
       exists: present.length > 0,
-      shared: key === 'models' && modelsAreShared(roots.models, roots.data),
+      shared: key === 'models' && (await modelsAreShared(roots.models, roots.data)),
       needs_restart: true,
     });
   }
@@ -220,14 +327,15 @@ export async function purgeResetScopes(
   for (const key of wanted) {
     for (const target of await scopeTargets(key, roots)) {
       if (!(await stat(target))) continue;
-      if (!(await allowedTarget(target, roots, home))) {
+      const physicalTarget = await authorizedTarget(key, target, roots, home);
+      if (!physicalTarget) {
         report.refused.push(target);
         continue;
       }
       const size = await directorySize(target);
       try {
-        await rm(target, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
-        report.removed.push(target);
+        await rm(physicalTarget, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+        report.removed.push(physicalTarget);
         report.freed_bytes += size;
       } catch {
         report.failed.push(target);

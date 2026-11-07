@@ -4,6 +4,8 @@ The top 10 errors users have actually hit on `v0.2.x`, with their causes and
 fixes. Most have a deeplink anchor that the in-app error UI's "Open docs for
 this error" button targets directly.
 
+To see whether a problem is already known or fixed, check the [install issue tracker](issue-tracker.md).
+
 ## Start here: self-diagnosis
 
 Electron native-crash reports preserve the fatal-error header and the current
@@ -48,23 +50,196 @@ Before digging through the entries below, let the app diagnose itself:
   the engine. Subprocess engines report memory visibility as false because
   their accelerator allocations belong to the child process.
 
+## Install failure codes
+
+On Windows, the setup screen warns before the download if Smart App Control is on, and setup runs the pinned Python once before downloading packages, so a blocked machine finds out early. If you opt in to anonymous stats, which is off unless you say yes, setup sends the code and setup stage with the app version, platform and install channel. File names, antivirus names and logs are never part of it.
+
+Install and startup failures show a code on the failure screen and in the in-app report. Reports include the facts behind the code, and you review them on GitHub before submitting. Nothing is sent otherwise. A failure with no code means VoiceStudio has no evidence for a specific cause yet; the report still has the raw message.
+
+### `WINDOWS_APP_CONTROL_BLOCKED`
+
+Windows Smart App Control, WDAC or AppLocker refused to run the engine or load one of its files. Antivirus exclusions cannot help. With Smart App Control, either turn it off (Windows Security → App & browser control → Smart App Control settings), connect VoiceStudio to an engine on another computer, or run the engine in WSL or [Docker](docker.md). On a work PC, ask IT to allow the runtime folder.
+
+### `ANTIVIRUS_BLOCKED`
+
+Your antivirus quarantined or refused an engine file. Restore the file, add the runtime folder to its exclusions, then retry.
+
+### `EXEC_REFUSED`
+
+The OS refused to run the engine and left no evidence of what refused it. Add the runtime folder to your security software's exclusions, make sure it is not in a cloud-synced folder, then retry. If it persists, send the in-app report: it records the program, its signature and any blocks Windows logged.
+
+### `GATEKEEPER_QUARANTINE`
+
+macOS quarantined the engine. See [Gatekeeper quarantine](macos.md#gatekeeper-quarantine).
+
+### `EXEC_NOEXEC_MOUNT`
+
+The runtime folder is on a drive mounted with `noexec`. Choose a folder on another drive, or remount without `noexec`.
+
+### `RUNTIME_DOWNLOAD_STALLED`
+
+A runtime download received no data for a long time. Retry keeps finished packages and resumes large multi-connection downloads, but other partial downloads start again. Try another network, turn off your VPN or choose another download region.
+
+### `RUNTIME_DOWNLOAD_INTERRUPTED`
+
+The connection dropped during a runtime download, as in `peer closed connection without sending TLS close_notify`. Retry keeps finished packages and resumes large multi-connection downloads, but other partial downloads start again. The same advice as `RUNTIME_DOWNLOAD_STALLED` applies if it repeats.
+
+### `DISK_FULL`
+
+The drive holding the runtime is full. Free space or choose another folder, then retry.
+
+### `RUNTIME_FOLDER_DENIED`
+
+VoiceStudio cannot write to the runtime folder. Choose another folder, or fix the folder's permissions.
+
+### `RUNTIME_FILES_LOCKED`
+
+Another program has runtime files open, usually a second VoiceStudio or a security scan. Close it, wait for the scan to finish, then retry.
+
+### `RUNTIME_IN_SYNCED_FOLDER`
+
+The runtime is inside OneDrive, Dropbox, iCloud Drive, Google Drive or Nextcloud, whose placeholders and locks break it. Move it to a plain local folder.
+
+### `SYSTEM_LIBRARY_PROBLEM`
+
+A system library the engine needs is missing or too old. The setup screen names it; see the [Linux guide](linux.md).
+
+### `UNSUPPORTED_PLATFORM`
+
+This computer cannot run the local engine, or this is the wrong download for it. See the [macOS guide](macos.md), or connect to an engine on another computer.
+
+### `SOURCE_ENV_INCOMPLETE`
+
+This source checkout's `.venv` is missing or incomplete. Run `bun run setup:api` in the checkout, let it finish, then press Retry.
+
+### `BROKEN_VENV`
+
+The managed Python environment is damaged and automatic repair did not fix it. Use **Clean & Retry** on the setup screen.
+
+### `NATIVE_ACCESS_VIOLATION`
+
+The engine crashed below Python (`0xC0000005` or `SIGSEGV`). Update your GPU driver and try CPU mode. Send the in-app report if it persists.
+
+### `NATIVE_ILLEGAL_INSTRUCTION`
+
+The engine hit an instruction this computer could not run (`0xC000001D` or `SIGILL`). The processor may lack a feature its libraries need. Send the in-app report with your processor model.
+
+### `NATIVE_CRASH`
+
+The engine crashed below Python with another native fault. Send the in-app report: it carries the exit code.
+
+### `STARTUP_TIMEOUT_SILENT`
+
+The engine printed nothing before the startup budget ran out, usually a slow disk or a security scan of new files. Retry, exclude the runtime folder from real-time scanning, or raise `OMNIVOICE_STARTUP_BUDGET_S`.
+
+### `STARTUP_TIMEOUT_OUTPUT`
+
+The engine was still loading when the startup budget ran out. Close memory-heavy apps and retry. Later starts are much faster.
+
+### `BACKEND_STARTUP_FAILED`
+
+The engine stopped at a named startup step. The message says which; send the in-app report if it is not something you can change.
+
+### `PORT_IN_USE`
+
+Another program holds the engine's port. See [Backend cannot bind its local port](#backend-cannot-bind-its-local-port).
+
+### `ROCM_NOT_CONFIGURED`
+
+An AMD GPU needs ROCm, which is missing or incomplete. See [Windows ROCm](windows-rocm.md) or the [Linux guide](linux.md).
+
+## Backend cannot bind its local port
+
+Windows can reserve port ranges even when no process is listening. If the OS
+denies binding the default port 3900, Electron's managed backend selects another
+loopback port before launching; its API proxy and health checks follow that port
+automatically. Candidates advance by 1000, up to 16 alternatives, so additional
+app windows discover and attach to the same backend. A fresh launch retries the
+default after a fallback backend stops. This recovery is available on all desktop platforms.
+Occupied fallback ports must carry VoiceStudio's backend response marker before
+attachment; unrelated listeners are skipped. This marker distinguishes services,
+not malicious processes running as the same local user.
+If an identified backend is still starting, Electron waits within its startup
+budget instead of launching another process on that occupied port.
+It does not override an explicit `OMNIVOICE_PORT`, a custom backend command, or an
+externally managed backend. For those configurations, choose an allowed port in
+your launch environment. An ordinary “address already in use” conflict still uses
+the existing backend-attachment/conflict flow; VoiceStudio does not stop unrelated
+processes or change firewall rules.
+
+If the backend log ends with `FATAL: the operating system refused to let
+VoiceStudio listen on port …` (`[Errno 13]` / WinError 10013), the OS denied the
+bind rather than reporting a taken port. On Windows a possible cause is a
+reserved range (Hyper-V, WSL, Docker and WinNAT reserve them); another process
+holding the port exclusively gives the same error. List the reserved ranges with
+`netsh interface ipv4 show excludedportrange protocol=tcp` and set
+`OMNIVOICE_PORT` to a port outside every range that no other app uses. On
+macOS and Linux, ports below 1024 need elevated rights. A default launch already
+skips reserved ports on its own; this message appears only when the port was
+chosen explicitly.
+
 ## Generation failure diagnosis
+
+OmniVoice's in-process and subprocess engines both reuse an installed speech
+recognizer when reference audio has no transcript, including short clips sent
+through batch or API callers. A supplied transcript is preserved for short
+references. Subprocess reference recognition runs inside the killable child,
+under its synthesis watchdog, releasing reference ASR weights before loading TTS.
+Sidecar stderr is scrubbed for home directories and secrets before logging.
+This does not download an ASR model automatically: if no installed
+recognizer can transcribe the clip and no local model fallback is available,
+provide the matching transcript or explicitly install a speech-to-text model.
+The Clone page offers an **Install** button for the model recommended for your
+hardware (it downloads only after you click it) and then retries the transcript.
+The transcript preview also uses any other installed speech-to-text model when
+the selected one is not on disk.
+Unknown or unverifiable ASR selections are skipped for automatic reference
+transcription. An explicitly selected OpenAI-compatible ASR provider retains its
+opt-in behavior; it does not need local model weights. Default ASR remains local.
 
 Streaming and HTTP generation failures can identify these causes. Electron and
 web clients show the recovery guidance in the selected language; API clients
 receive a stable `docs_topic` and a safe fallback message, never private exception text.
 
+In the desktop app every diagnosed topic (the full list is in
+`backend/core/failure.py`) shows a short message in the app language and, where
+the app can fix it, a button that does so: **Install speech-to-text model** and
+**Add transcript** for `REFERENCE_STT_MISSING`, **Free memory** for `GPU_OOM` and
+`HOST_MEMORY_EXHAUSTED`, **Open Storage** for a full or unwritable drive,
+**Choose device** for an unsupported GPU, **Open Audio tools** for a missing
+ffmpeg, **Add token** for Hugging Face access errors, and the matching Models
+page for missing or damaged models. **Open docs** and **Copy diagnostic** stay
+next to it, and the backend's English text stays under **Details**.
+
 | Topic | Recovery |
 | --- | --- |
 | `GPU_ARCH_UNSUPPORTED` | The installed PyTorch build cannot run kernels on this GPU. Select CPU in Settings → Performance & Device, or use a PyTorch build compatible with the GPU. |
+| `HOST_MEMORY_EXHAUSTED` | The machine ran out of system memory, so the engine could not finish. Close other memory-heavy apps, unload unused models with **Flush models**, render a shorter passage, or select a lighter TTS engine. On Windows, enlarging the page file also helps. A CPU-only machine has no GPU memory to free — this is RAM, not VRAM. Preparing a voice-clone reference on the CPU takes about 0.75 GB plus 0.07 GB per second of clip, so VoiceStudio refuses up front when free RAM plus swap cannot hold it: use a 3-10 second reference. Set `OMNIVOICE_SKIP_REF_MEMORY_CHECK=1` to skip that check. |
+| `DISK_FULL` | The drive holding VoiceStudio's data, model cache or temp folder is full (`[Errno 28] No space left on device`, `Disk quota exceeded`, or Windows `WinError 112`). Free space on that drive — Settings → Storage shows disk usage, clears temporary files and lists the largest models — then try again. Transcription, generation and dubbing all report this class instead of a generic internal error. |
 | `WINDOWS_APP_CONTROL_BLOCKED` | Windows application control blocked a required file. Ask the administrator to allow the trusted VoiceStudio runtime, then restart the app. |
 | `AUDIO_IO_FAILED` | Check the audio format, free disk space, and file permissions; review the folder in Settings → Storage. |
+| `ENGINE_DEPENDENCY_MISSING` | A Python package the engine imports is not installed. Open Model Catalogue, select the engine and use **Install / Repair**, then restart VoiceStudio. Terminal: retrying the same request fails the same way. |
+| `REFERENCE_STT_MISSING` | The voice has no transcript and no speech-to-text model is installed to write one. Type the reference clip's words into the transcript box (clips up to 20 seconds), or install and select a speech-to-text model in Model Catalogue. |
 | `HF_MIRROR_UNREACHABLE` | The configured Hugging Face mirror could not be reached while fetching the engine's weights. Restore the official endpoint in Settings → Models → Hugging Face mirror, then retry. |
+
+Every unclassified 500 also carries `error_type` (the Python exception class, never
+its message), and bug reports record it as "Backend error class" together with the
+"Backend failure topic". A reverse proxy that times out (`502`/`504` with its own HTML
+page) is reported as a proxy problem, not a VoiceStudio one: raise its read timeout
+(for nginx, `proxy_read_timeout`) for long generations. Streamed generations
+(`/generate` with `stream=true`) and long-form renders (Audiobook, Stories, resume)
+send a keepalive every 15 seconds of silence (a blank NDJSON line or an SSE comment)
+and ask proxies not to buffer, so an idle cutoff such as Cloudflare's `524` does not
+end them while a slow chunk or chapter renders. Choosing the best 15-second
+window of a long reference clip happens before the generate time budget starts, so a
+slow CPU speech-to-text model no longer causes `TTS generate exceeded 300s`.
 
 Unsupported GPU builds and application-control blocks are terminal for the current
 stream: the client does not automatically render the whole passage again. After
-correcting the cause, start a new generation. Unknown failures retain generic
-guidance; a report with only `RuntimeError` does not establish which cause applies.
+correcting the cause, start a new generation. Host RAM exhaustion is *not*
+terminal — freeing memory genuinely repairs it, so a retry can succeed.
+Unknown failures retain generic guidance; a report with only `RuntimeError` does
+not establish which cause applies.
 
 An engine downloads its weights the first time it is used, so the first
 generation with a newly selected engine can fail on the download rather than on
@@ -79,7 +254,7 @@ retry.
 
 <a id="pkg_resources-missing"></a>
 
-**Symptom:** the splash screen shows `ModuleNotFoundError: No module named
+**Symptom:** the setup screen shows `ModuleNotFoundError: No module named
 'pkg_resources'` during WhisperX import, and the app never advances past the
 "Setting up models" step.
 
@@ -217,11 +392,11 @@ before the token works for downloads.
 
 **Fix:**
 
-1. Open **Settings → API Keys** in the app and paste a working HF token (or set
+1. Open **Settings → Credentials** in the app and paste a working HF token (or set
    `HF_TOKEN` in your env). See [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
 2. Visit https://huggingface.co/pyannote/speaker-diarization-3.1 while signed
    in with the same HF account → click **"Agree and access repository"**.
-3. Retry the job. The token state in **Settings → API Keys** should now show
+3. Retry the job. The token state in **Settings → Credentials** should now show
    the "App" row with a green check next to your username.
 
 If the token and license are already valid but an older build still reports
@@ -246,7 +421,7 @@ itself does not grant access.
 1. Visit https://huggingface.co/kyutai/pocket-tts while signed in, review the
    license and prohibited-use conditions, share the requested contact details,
    and accept the conditions.
-2. Open **Settings → API Keys** and save a read token from that same account.
+2. Open **Settings → Credentials** and save a read token from that same account.
 3. Open **Model Catalogue**, review and accept the PocketTTS terms locally,
    then retry. VoiceStudio stores this acknowledgement only on your machine.
 
@@ -254,28 +429,26 @@ itself does not grant access.
 
 **Symptom:** "VoiceStudio.app is damaged and can't be opened."
 
-**Cause:** the app is not yet notarised (signing is wired in `release.yml` and
-activates once the maintainer adds the Apple cert secrets) — until then macOS
-quarantines every download.
+**Cause:** Gatekeeper cannot verify the app's Apple Developer identity — the
+build is unsigned or ad-hoc signed (local `bun run dist` packages, or a release
+published without notarization; signing and notarization run in
+`electron-release.yml` when the Apple credentials are configured).
 
 **Fix:** see [macos.md#gatekeeper-quarantine](macos.md#gatekeeper-quarantine).
 
-## 4. AppImage white screen / EGL errors (Fedora 44, Ubuntu 24.04+, 26.04)
+## 4. Linux: blank window or GPU errors
 
-**Symptom:** the AppImage window opens fully white. No UI ever appears. On
-newer distros (Ubuntu 24.04 and later, incl. 26.04) the terminal often shows
-`Could not create default EGL display: EGL_BAD_PARAMETER`.
+**Symptom:** the Linux app window opens blank, or the terminal shows GPU
+process errors.
 
-**Cause:** WebKitGTK rendering regressions — the DMA-BUF renderer on modern
-WebKitGTK (2.48+), or the 2.44 / 2.46 compositing mode.
+**Cause:** the Electron app renders with Chromium; some GPU driver and
+compositor combinations fail to initialise hardware acceleration. (The
+`WEBKIT_*` variables from older versions of this entry applied only to the
+archived Tauri app, which rendered with WebKitGTK.)
 
-**Fix:** try `WEBKIT_DISABLE_DMABUF_RENDERER=1` first (modern WebKitGTK / the
-EGL error), then `WEBKIT_DISABLE_COMPOSITING_MODE=1` — full walkthrough incl.
-the software-rendering last resort:
+**Fix:** launch once with `--disable-gpu` (and on Wayland, optionally
+`--ozone-platform=x11`) — see
 [linux.md#appimage-white-screen-on-fedora-44--ubuntu-2404](linux.md#appimage-white-screen-on-fedora-44--ubuntu-2404).
-
-**Linked issues:** [#62](https://github.com/debpalash/VoiceStudio/issues/62),
-[#961](https://github.com/debpalash/VoiceStudio/issues/961)
 
 ## 5. Windows Triton / torch.compile OOM
 
@@ -290,41 +463,29 @@ peak memory footprint that exceeds free VRAM. Windows-only quirk.
 
 **Linked issue:** [#65](https://github.com/debpalash/VoiceStudio/issues/65)
 
-## 5a. Backend dies on the first `/generate` (older NVIDIA GPUs, e.g. Tesla T4)
+## GPU self-test failed
 
-**Symptom:** the backend starts fine, `/health` reports your GPU, the model
-preloads — and then the first generation request returns
-`RemoteDisconnected: Remote end closed connection without response`. Every call
-after it gets `ConnectionRefused`, because the backend process is gone. No
-Python traceback is printed.
+On startup, VoiceStudio runs a small task on your GPU in a separate process. If that
+task fails or crashes, models load on the CPU so the app keeps working, more slowly,
+and a notice shows the error.
 
-**Cause:** `torch.compile(mode="reduce-overhead")` captures CUDA graphs. On
-pre-Ampere cards (Turing sm_75 / Volta sm_70 — the Tesla T4 on Google Colab is
-the common case) that capture can abort the process from inside the native CUDA
-library. It happens below the interpreter, so no `except` in the app can catch
-it and nothing is logged.
+1. Update your GPU driver and restart the app. The test runs again on every start
+   until it passes.
+2. On Linux with an AMD card, see [AMD GPU (ROCm)](linux.md#amd-gpu-rocm).
+3. To try the GPU anyway, set `OMNIVOICE_FORCE_CUDA=1` or choose a device in
+   **Settings**. Either one skips the test.
 
-**Fix:** update — VoiceStudio now selects the compile mode per GPU and does not
-capture CUDA graphs below sm_80, so this should no longer happen. If you still
-see a crash in the generate path on any GPU, turn compilation off entirely:
+Sidecar engines, which run in their own environments, don't use this result.
 
-- **In the app:** Settings → Performance → **"Disable torch.compile"**.
-- **From the CLI / from source:** `TORCH_COMPILE_DISABLE=1` before launching.
-  This is honoured on every platform and by every engine, in-process or
-  sidecar.
+## 5a. Backend exits on the first `/generate` on an older NVIDIA GPU
 
-**Getting a traceback:** the backend now arms `faulthandler`, so a native crash
-writes the faulting thread's Python stack to `backend_err.log` on the way down.
-Include that stack when reporting — without it a native crash is unattributable.
-(`OMNIVOICE_DISABLE_FAULTHANDLER=1` turns it off.)
+**Symptom:** the backend starts, `/health` identifies the GPU, and model preload succeeds, but the first generation ends with `RemoteDisconnected` or “remote end closed.” Later requests get `ConnectionRefused`, often without a Python traceback. Tesla T4 machines, including common Colab hosts, are a typical example.
 
-**Extra containment:** to keep a crashing engine from taking the API down with
-it, run the engine in a killable child process — select
-**OmniVoice (subprocess-isolated)** in Settings → Engines, or
-`OMNIVOICE_TTS_BACKEND=omnivoice-subprocess`. The parent then returns an HTTP
-error and respawns the sidecar instead of dying.
+**Cause:** CUDA-graph capture in the graph-oriented compile mode can abort the process natively on pre-Ampere GPUs such as Turing sm_75 and Volta sm_70.
 
-**Linked issue:** [#2135](https://github.com/debpalash/VoiceStudio/issues/2135)
+**Fix:** update VoiceStudio. Compile mode is selected from the detected GPU, and devices below sm_80 keep compiled kernels without graph capture. If the crash remains, enable **Settings → Performance → Disable torch.compile**, or set `TORCH_COMPILE_DISABLE=1` before a CLI/source launch. Both in-process and sidecar engines honour this on every platform.
+
+For diagnosis, the backend arms Python's fatal-signal handler early and writes the dying thread stack to `backend_err.log`; attach that file to a report. Set `OMNIVOICE_DISABLE_FAULTHANDLER=1` to turn this diagnostic off. For additional containment, select **OmniVoice (subprocess-isolated)** under **Settings → Engines**, or launch with `OMNIVOICE_TTS_BACKEND=omnivoice-subprocess`. A native engine failure then becomes an HTTP error and the parent respawns the sidecar. See [#2135](https://github.com/debpalash/VoiceStudio/issues/2135).
 
 ## 5b. RTX 50-series (Blackwell, sm_120): backend crashes during `ml_imports`
 
@@ -333,29 +494,25 @@ ready. The desktop app sits on "starting backend", `/health` returns 503, and
 `/startup/progress` shows `ml_imports` active. From source you see `import
 torch` die with a native access violation rather than a Python traceback.
 
-**Cause:** not established. The pinned build is not missing Blackwell code:
-`torch 2.8.0+cu128` lists `sm_120` in `torch.cuda.get_arch_list()`, and that
-build imports and runs CUDA normally on some Blackwell cards. What is confirmed
-is that on the Windows setups in
-[#1931](https://github.com/debpalash/VoiceStudio/issues/1931) `import torch`
-faults inside the native library before Python can raise an error, and moving
-the torch trio to 2.9.x clears it.
+**Cause:** unknown so far. The pinned `torch 2.8.0+cu128` build advertises
+`sm_120` in `torch.cuda.get_arch_list()`, and on some Blackwell cards it runs
+CUDA fine. The Windows machines in #1931 fault inside `import torch` itself,
+natively, before Python gets a chance to raise; upgrading the torch trio to
+2.9.x made that stop.
 
-If `import torch` crashes for you, that crash *is* the symptom — skip straight
-to the fix below. Where torch does import, this shows what the build actually
-contains:
+**See what your build ships:**
 
 ```bash
 uv run python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
 ```
 
-`sm_120` in that list means the kernels are present and the crash is elsewhere
-in the native init path. Either way the upgrade below is the known workaround.
+With `sm_120` listed, kernels exist for your GPU and the crash comes from
+somewhere else in torch's native start-up. If the command itself dies, that is
+the symptom described above. The upgrade is the known workaround in both cases.
 
-**Fix:** move the whole torch trio to 2.9.x. They must move together —
-upgrading one past the ABI the others were built against gives you
-`RuntimeError: operator torchvision::nms does not exist`, which is the next
-section's problem instead.
+**Fix:** bump `torch`, `torchaudio` and `torchvision` to 2.9.x in one step. A
+partial bump leaves them mismatched and fails with `RuntimeError: operator
+torchvision::nms does not exist` (covered in the next section).
 
 Edit **both** pin lists, keeping them identical:
 
@@ -394,17 +551,25 @@ which VoiceStudio used to call unguarded — that turned this upgrade into a
 different hard startup crash (`AttributeError` inside `ml_imports`). It is
 guarded now, so the upgrade path above is clean on a current checkout.
 
-**Keeping the change:** these are the repo's own pins, so a `git pull` that
-touches them will conflict or overwrite. Re-apply after updating until the
-default pin moves — the default cannot move for everyone until the newer torch
-is verified across the older GPUs VoiceStudio supports, since a newer build can
-drop older architectures. Which ones varies by torch release, not by the CUDA
-variant alone: the pinned 2.8.0+cu128 build reports `sm_70` first, while the
-cu128 arch list captured in #1285 still carried `sm_61`.
+**Keeping the change:** the pins are shared project files, so a `git pull` that
+touches them may conflict with your edit or silently replace it. Re-apply the
+edit after pulling until the default pin moves. It has not moved because a newer
+torch can stop shipping kernels for older GPUs, and which architectures go
+differs per release and CUDA variant: the pinned 2.8.0+cu128 starts its list at
+`sm_70`, while the cu128 list captured in #1285 still included `sm_61`. The
+default only changes once newer torch is verified on those older cards.
 
 **Linked issue:** [#1931](https://github.com/debpalash/VoiceStudio/issues/1931)
 — thanks to the reporter for the full diagnosis, including the verification
 commands above.
+
+## 5c. OmniVoice is not preloaded at startup
+
+Startup only preloads the native OmniVoice model when OmniVoice is the selected
+TTS engine (and the host uses its native backend). Selecting another engine,
+such as VoxCPM2, leaves OmniVoice unloaded at startup to preserve memory for
+that engine. `OMNIVOICE_TTS_BACKEND`, when set, takes precedence over the saved
+engine choice. Models still load on demand when requested.
 
 ## 6. `uv venv` Python download fails (restricted network)
 
@@ -414,7 +579,7 @@ Russia, sometimes on corporate proxies.
 
 **Fix:** see [linux.md#restricted-networks-china--russia](linux.md#restricted-networks-china--russia)
 (same env vars work on macOS and Windows — `UV_PYTHON_INSTALL_MIRROR`,
-`UV_HTTP_TIMEOUT=120`, `UV_HTTP_RETRIES=5`, `UV_PYTHON_PREFERENCE=only-system`).
+`UV_HTTP_TIMEOUT=900`, `UV_HTTP_RETRIES=5`, `UV_PYTHON_PREFERENCE=only-system`).
 
 **Linked issues:**
 [#57](https://github.com/debpalash/VoiceStudio/issues/57),
@@ -449,6 +614,14 @@ If a running install ever reports "Media engine unavailable":
    `sudo apt install ffmpeg`, `winget install ffmpeg`) also works — press
    **Use system copy** afterwards.
 
+Transcription tells these apart from other failures. If a dub transcription
+reports that it needs ffmpeg, follow the steps above; VoiceStudio also exposes
+its resolved FFmpeg under the bare name `ffmpeg` to the engines it launches, so
+a library that runs plain `ffmpeg` no longer fails with `[Errno 2] No such file
+or directory: 'ffmpeg'`. A "lost its output pipe" (`[Errno 32] Broken pipe`)
+reply means the app that launched the backend closed or relaunched; restart
+VoiceStudio.
+
 The same panel updates **yt-dlp** (video imports): site support changes
 faster than app releases, so when video-URL imports start failing, press
 **Update** there — the new version survives app updates, and **Restore tested
@@ -468,7 +641,9 @@ cookie database automatically, never saves the export in your project, and
 never uploads it anywhere except to your own VoiceStudio backend. Use an export
 limited to YouTube where your browser extension supports domain filtering.
 For a backend on another machine, the picker is enabled only over HTTPS; plain
-HTTP is accepted solely on the desktop app's loopback connection.
+HTTP is accepted solely on the desktop app's loopback connection. Electron's
+main process supplies a desktop-origin transport marker for both packaged and
+development requests; renderer-supplied origins and markers are discarded.
 Remote backends must also use `OMNIVOICE_API_KEY` as the bearer key and remain
 restricted to a private tailnet; see [API authentication](../api-auth.md).
 
@@ -483,7 +658,8 @@ URLs, which is wrong when the UI is reached from a different LAN host.
 **Fix:** the frontend derives its API/media base from the page's own origin.
 When running behind a reverse proxy where the UI and API are on different
 origins, set the runtime override `OMNIVOICE_PUBLIC_API_BASE` (works on the
-prebuilt image via `docker run -e`) — see
+prebuilt image via `docker run -e`) and list the UI's origin in
+`OMNIVOICE_ALLOWED_ORIGINS` — see
 [docker.md#lan-access](docker.md#lan-access).
 
 ## 9. Apple Silicon `mlx-whisper` unavailable on Intel mac
@@ -512,8 +688,10 @@ restarted it, and the next attempt killed it again
 ([#1371](https://github.com/debpalash/VoiceStudio/issues/1371)). VoiceStudio now
 checks whether cuDNN 8 will load *before* selecting a CTranslate2 engine and
 falls back to PyTorch Whisper instead, so a missing library costs you WhisperX's
-word-level alignment — not the backend. The repair below is still worth doing to
-get WhisperX back.
+word-level alignment — not the backend. Direct or already-selected CTranslate2
+adapters also check the CUDA libraries before loading and use their CPU path
+when cuDNN is missing. Hosts with working CUDA libraries keep GPU acceleration.
+The repair below is still worth doing to get WhisperX back.
 
 **Cause:** WhisperX and faster-whisper run on **CTranslate2**, which needs
 **cuDNN 8**, but PyTorch 2.8 ships cuDNN 9. VoiceStudio side-loads a cuDNN-8 copy
@@ -576,35 +754,86 @@ won't launch.
 **Cause:** on Windows/Linux NVIDIA machines, VoiceStudio installs the CUDA PyTorch
 build (`torch` + `torchaudio`) from PyTorch's own index. That CUDA wheel is
 large (~2.5 GB), so a flaky or restricted network drops it partway. This is a
-download/network problem, **not** a bug in VoiceStudio — but the CUDA wheels come
-from a *named, explicit* index that a PyPI mirror (`UV_DEFAULT_INDEX`) cannot
-redirect, so the generic mirror trick doesn't help here.
+download/network problem, **not** a bug in VoiceStudio. The install fetches the
+exact URLs pinned in `uv.lock`, so neither a PyPI mirror (`UV_DEFAULT_INDEX`)
+nor the **China** download region redirects it: PyTorch's index has no mirror.
 
 **Fix, in order:**
 
 1. **Clean & Retry.** Large downloads frequently succeed on a second attempt —
    VoiceStudio already retries each request 5× with long timeouts, and a fresh
-   attempt restarts cleanly.
+   attempt reuses every file that finished downloading. The CUDA `torch` wheel
+   downloads over several connections and resumes from the parts it already
+   has (see below).
 2. **Use a VPN** if your network throttles or blocks the PyTorch CDN.
-3. **Provide the wheels manually (offline path).** Download the two wheels that
-   match your machine from a source you *can* reach (the official
-   [pytorch.org](https://pytorch.org/get-started/locally/) wheel index or a
-   regional mirror), then drop them in the wheel folder and **Clean & Retry** —
-   VoiceStudio will install from your local copies instead of the network:
-   - Folder: **`<env dir>/wheels`** (the exact path is printed in the error
-     message and in the setup log; `<env dir>` is your chosen install/storage
-     location).
-   - Files: the `torch` **and** `torchaudio` wheels for your exact Python/OS/CUDA
-     — e.g. `torch-2.8.0+cu128-cp311-cp311-win_amd64.whl` and the matching
-     `torchaudio-2.8.0+cu128-cp311-cp311-win_amd64.whl`. They must match the
-     pinned versions (shown in the failing URL).
-   - On retry, VoiceStudio re-resolves the install using those local wheels; the
-     rest of the (small) dependencies still come from PyPI/your mirror.
+3. See [First-run setup is slow or stalls on a download](#first-run-setup-is-slow-or-stalls-on-a-download)
+   for what the setup screen shows and what a retry keeps.
+
+If it keeps failing, or a download stays stuck for five minutes, click **Install the
+CPU version instead** on the setup screen. It's a much smaller download, and everything
+works, but voices generate more slowly. The choice is saved in
+`~/.config/omnivoice/env` (`%USERPROFILE%\.config\omnivoice\env` on Windows). To try
+the GPU build again, launch once with `OMNIVOICE_TORCH_VARIANT=cuda`.
 
 If you don't have an NVIDIA GPU, you don't need the CUDA build at all — a CPU /
-Apple-Silicon install skips this index entirely.
+Apple-Silicon install skips this index entirely. Electron source and packaged
+setup select CPU wheels when no NVIDIA driver is detected. Set
+`OMNIVOICE_TORCH_VARIANT=cpu` before `bun run setup:api` or the packaged install
+action to choose them explicitly; see [CPU setup](../../electron/README.md#running-without-a-gpu).
+An unusable NVIDIA driver is a setup warning for CPU-capable engines;
+GPU-only engines still require supported hardware.
 
 **Linked issue:** [#569](https://github.com/debpalash/VoiceStudio/issues/569)
+
+## 12b. My AMD Radeon GPU is not used (CPU is busy, GPU is idle)
+
+**Symptom:** generation or transcription is slow, Task Manager shows the CPU
+busy and the Radeon idle, and **Settings → About → Run self-check** says the
+compute device is `cpu`.
+
+**Cause:** the default install has the NVIDIA CUDA build of PyTorch (or the
+CPU-only build when no NVIDIA driver is present), and neither can drive AMD GPUs. This is not a driver problem on your side.
+ROCm is opt-in on Linux and Windows (macOS has no ROCm), so the installer never
+picks it on its own; the setup screen's GPU check names the installed build and
+the opt-in for your OS. Open
+**Settings → Performance → GPU acceleration**: it names your card, the installed
+PyTorch build and, for every engine, whether it uses the GPU.
+
+**Fix, by platform:**
+
+- **Windows:** supported Windows 11 Radeon cards, including the RX 9070 /
+  9070 XT (RDNA4), can opt into VoiceStudio's ROCm 7.2.1 setup — see the
+  [Windows ROCm guide](windows-rocm.md). Otherwise PyTorch engines stay on the
+  CPU; engines with their own GPU runtime — today audio.cpp (Vulkan) — still use
+  a Radeon: install its runtime from **Settings → Models**.
+- **Linux:** set `OMNIVOICE_TORCH_VARIANT=rocm` and run setup again, or use the
+  ROCm Docker image — [linux.md — AMD GPU (ROCm)](linux.md#amd-gpu-rocm). The
+  ROCm build supports RX 9000 (RDNA4) cards natively; do not set
+  `HSA_OVERRIDE_GFX_VERSION=11.0.0` for them. If the
+  panel says PyTorch has ROCm but cannot open the device, check that the `amdgpu`
+  driver is loaded and your user can open `/dev/kfd` (`render` and `video`
+  groups).
+
+**Linked issue:** [#2468](https://github.com/debpalash/VoiceStudio/issues/2468)
+
+## 12c. Intel Arc (XPU): model load fails, or every generation fails after one out-of-memory error
+
+**Symptom (load):** with a PyTorch `+xpu` build on Windows, every model load
+fails and the log shows `doesn't support querying the available free memory`.
+
+**Symptom (after OOM):** one generation fails with
+`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` or `XPU out of memory`. After that, every
+generation fails the same way until the app restarts.
+
+**Cause:** the Arc Windows driver does not implement the free-memory query that
+model loading calls. Separately, the failed request's memory used to stay held
+after an out-of-memory error.
+
+**Fix:** update VoiceStudio. Free memory is now estimated from total minus
+reserved, and the failed request's memory is released right after the error.
+If generations still run out of memory, use a smaller model or shorter text,
+or press **Flush** to unload models. Intel Arc support is experimental — see
+[windows.md — GPU support](windows.md#gpu-support).
 
 ## 13. Stuck on the download page / incomplete model cache ("only `refs/`")
 
@@ -612,6 +841,14 @@ Apple-Silicon install skips this index entirely.
 reach the main app. Looking in the HF cache, a model folder
 (`models--k2-fsa--OmniVoice`, `models--Systran--faster-whisper-large-v3`) has
 `refs/` and maybe `config.json` but **no weight files** (`blobs/` empty or tiny).
+
+A partial cache can also have its weights but be missing
+`audio_tokenizer/preprocessor_config.json`. In that case synthesis reports
+"Can't load feature extractor" and names that file. VoiceStudio now routes
+this error through the existing cache repair and retries loading. With
+`HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` enabled, it leaves downloads disabled
+and reports that repair needs network access. If automatic repair fails, use
+the clean re-download steps below.
 
 **Cause:** the download started but the large weight shards never finished —
 almost always the connection **dropping, throttling, or being blocked** mid-pull
@@ -640,7 +877,7 @@ order:
   corporate/school networks.
 - **Region mirror** — if `huggingface.co` is slow/blocked where you are,
   VoiceStudio normally handles this automatically: with no endpoint explicitly
-  configured it probes both the official endpoint and the `hf-mirror.com`
+  configured (including with the China region selected) it probes both the official endpoint and the `hf-mirror.com`
   community mirror and downloads from whichever works (downloads are
   checksum-verified either way; see
   [downloading-models.md](../downloading-models.md)). To check or re-test the
@@ -650,6 +887,23 @@ order:
   set it as an env var before launching and relaunch:
   - macOS/Linux: `export HF_ENDPOINT=https://hf-mirror.com`
   - Windows (PowerShell): `[Environment]::SetEnvironmentVariable("HF_ENDPOINT","https://hf-mirror.com","User")`
+
+  Automatic selection checks model-file metadata, so a mirror that only
+  redirects to the official host without supplying download metadata is not
+  selected. If you pinned a mirror explicitly and downloads fail with an
+  invalid etag or missing metadata, restore automatic selection in the same
+  panel or choose the official endpoint. Old automatic decisions are checked
+  again during setup after this update.
+
+A segmented download refuses a response whose status or Content-Range does not match the requested bytes and file size. An invalid response is not published as the model file; retry through a server or mirror that supports correct byte ranges.
+
+Segmented download resume records are reused only with an existing partial file of the expected size and valid byte-range entries. If a partial file is missing, truncated, or oversized, or its sidecar is malformed, the download fetches those bytes again instead of treating preallocated zeros as completed data. Oversized partial files are resized before restarting so old trailing bytes cannot prevent verification of the new download. Stale checkpoints are removed before resizing or recreating partial files, so a failed fetch cannot make the next retry trust stale or zero-filled bytes. If that stale checkpoint cannot be removed, the restart stops before changing the partial file or destination.
+
+**Check space before installing.** The first-run runtime screen lists the folder the Python environment will be installed to together with the free space on that drive (highlighted when it is below the roughly 9 GB needed); use **Change** there to pick a roomier drive before pressing Install.
+
+**Disk filled up mid-install.** A model or engine install that runs out of space stops immediately (it is not retried with backoff) and reports how much space is free and where; free space or move the model cache to a larger volume, then retry. The download resumes from the part that already finished. During first-run setup, the one-time `uv` installer download is attempted up to three times (two retries) on connection resets, timeouts, and HTTP 5xx/429 before it reports failure.
+
+**Exports named after a video title.** Download and export names built from a video title replace characters Windows rejects (`< > : " / \ | ? *`, control characters, trailing dots/spaces, device names such as `CON`) with `_` on every OS, so `How to X: a guide?` exports as `How to X_ a guide_` instead of failing with `[Errno 22] Invalid argument`.
 
 **Manual fallback** (if downloads keep failing), pull the weights yourself into
 the same cache, then relaunch:
@@ -714,6 +968,12 @@ and `OMNIVOICE_GENERATE_TIMEOUT_S` (generation) — both in seconds, default 300
 default 120). **Raise** them for very long single files/generations, **lower**
 them to fail faster on a small machine.
 
+Saving a cloned voice without a transcript transcribes the reference with an
+installed speech-to-text model for at most 60 seconds
+(`OMNIVOICE_PROFILE_TRANSCRIBE_TIMEOUT_S`). After that the voice is saved
+without a transcript, and the first generation with it reuses the finished
+transcription. Installed models load from disk, so saving works offline.
+
 CPU-only hosts use a bounded 600-second generation floor because correct CPU
 synthesis can take longer than the accelerated five-minute budget. Override it
 with `OMNIVOICE_CPU_GENERATE_TIMEOUT_S` — an explicit value here always
@@ -731,6 +991,25 @@ states — and if an external env var (shell profile, `.env`, Docker `-e`,
 systemd unit, …) is already providing the same key, the panel says so instead,
 since that external value keeps winning on every future restart too, not just
 this one.
+
+**While the backend is busy, the app now stays usable.** The desktop shell polls
+the backend's `/health` endpoint while you work, and a long GPU job can hold the
+Python event loop long enough to miss those probes. The shell knows the process
+is still alive (it checks for an exit before reacting), so it now shows a
+**recoverable busy state** instead of an error: the status-bar dot pulses amber,
+your workspace stays open, and requests wait for the current job to finish
+rather than failing with "Can't reach the local backend". Nothing to do — it
+clears itself as soon as the job releases the event loop. If the dot turns
+**red** and names an exit code, that is a real crash; use the sections above.
+
+The backend also never waits on its own log output: stdout/stderr go through a
+bounded buffer when the shell reads them through pipes, so a slow log reader (a
+model download's progress bar, a busy shell) can no longer freeze the event
+loop. The request log goes through the same buffer, so it cannot block the loop
+either. If the buffer overflows, the log shows one `[log] N output chunk(s)
+dropped` line. Set `OMNIVOICE_BLOCKING_STDIO=1` to restore plain blocking
+writes. When the loop does stall, the backend log names the blocking call
+(`OMNIVOICE_LOOP_STALL_S`, default 4 s, `0` disables).
 
 **Two things changed here** ([#1190](https://github.com/debpalash/VoiceStudio/issues/1190)):
 
@@ -783,7 +1062,10 @@ call.
 > the last error output). Use **Report this bug** from that notice — the crash
 > evidence is attached to the prefilled GitHub issue automatically, with home
 > paths scrubbed. The raw markers live next to the backend logs in
-> `backend_crash_markers.json`. Markers are per-version: after you update the
+> `backend_crash_markers.json`. The report dialog asks for a one-line
+> description (required, so issues are never titled just "[Bug]") and lists
+> exactly what will be sent before the browser opens; nothing is posted from
+> the app. Markers are per-version: after you update the
 > app, notices recorded by the previous version are cleaned up rather than
 > resurfacing — the update may well have fixed that crash.
 >
@@ -874,6 +1156,20 @@ Where the forensics live: `omnivoice.log`, `run_sentinel.json`, and
 Windows, `~/.omnivoice` on Linux, or `$OMNIVOICE_DATA_DIR` — the Docker image
 mounts it as the `omnivoice_data` volume).
 
+### Google Colab: the UI loads but every action fails with 403
+
+The [Colab notebook](../../notebooks/OmniVoice_Studio_Colab.ipynb) opens the UI
+through Colab's port proxy, on a per-session
+`https://<id>-3900-colab.googleusercontent.com` address. The backend refuses
+browser API calls from host names and origins it does not know (DNS-rebinding
+and cross-site protection), so the notebook's launch cell (cell 5) asks Colab
+for that proxy address and starts the backend with exactly that origin in
+`OMNIVOICE_ALLOWED_ORIGINS` and that host in `OMNIVOICE_ALLOWED_HOSTS`. No other
+origin is trusted. If you see 403s, the backend was started some other way or
+by an older copy of the notebook: stop it (`!kill $(lsof -t -i:3900)`), then
+re-run cells 5 and 6 from the browser. Most API routes have no `/api` prefix
+(`/generate`, `/profiles`, …), so `curl …/api/generate` returning 404 is expected.
+
 ## 14d. "Can't reach the local VoiceStudio backend" when the backend never started
 
 **Symptom (older builds):** the app opened, but every action failed with
@@ -904,63 +1200,23 @@ because the backend could not start, you get:
 The reason is also **retained** across a Retry or an automatic respawn, so a
 later attempt can't erase the diagnosis of the first one.
 
-**From source (`bun desktop`)?** If the app builds but the window never comes
-up, the shell now prints the exit code and where to look (the cargo/tauri
-output above it, plus `omnivoice.log` and `backend_err.log` in your VoiceStudio
-data folder) instead of exiting silently.
-
-If Cargo stops before the window is built with `Package gdk-3.0 was not found`,
-`pango.pc` missing, `libsoup-3.0` missing, or `javascriptcoregtk-4.1` missing,
-the Ubuntu/Debian WebKitGTK development packages are absent. Install the full
-package block in the [Linux source-build guide](linux.md#building-from-source),
-then rerun `source "$HOME/.cargo/env"` and `bun desktop`. Do not set a custom
-`PKG_CONFIG_PATH` unless the libraries were deliberately installed outside the
-system package manager.
+**From source (`bun run dev`)?** Run `bun run setup:api` first so the
+backend's Python environment exists. If the window never comes up, read the
+terminal output plus `omnivoice.log` and `backend_err.log` in your VoiceStudio
+data folder. If a packaging build (`bun run dist`) stops while compiling the
+Rust native helper with a missing `pkg-config` library, install the package
+block in the [Linux source-build guide](linux.md#building-from-source).
 
 **Still stuck?** Open the details, copy the output, and file it with **Report**
 — that output is the thing that makes the failure diagnosable.
 
-## 15. Stuck at "preparing" forever after a crash / BSOD (Windows)
+## 15. Archived Tauri app: stuck at "preparing" after a crash (Windows)
 
-**Symptom:** after an unclean shutdown (Windows BSOD, forced power-off), every
-launch sits on the "preparing" splash indefinitely — even though the backend is
-actually healthy (its log shows models loaded, and
-`http://127.0.0.1:3900/health` answers `{"status":"ok"}` in a browser). The
-WebView log contains:
-
-```
-IPC custom protocol failed, Tauri will now use the postMessage interface instead
-TypeError: Failed to fetch
-```
-
-**Cause:** the crash corrupted cache directories inside the WebView2 profile at
-`%LOCALAPPDATA%\com.debpalash.omnivoice-studio\EBWebView`. Both the IPC custom
-protocol *and* its postMessage fallback break, so the splash never hears the
-"ready" signal from the app shell (issue #879).
-
-**Fix:** current builds handle this automatically — if the splash gets no IPC
-signal within ~10 s it checks the backend over plain HTTP and proceeds on its
-own; if the backend isn't up either, after ~45 s a recovery panel appears with
-**Repair and restart** (Windows), which clears cache-only directories and
-relaunches. It deliberately preserves `Default\Local Storage` and
-`Default\IndexedDB`, where browser-owned settings and long-form projects live.
-
-On older builds (≤ 0.3.8), or if the automatic repair fails, do it manually:
-quit VoiceStudio, delete only the cache directories below, then start the app
-again. Do not delete the whole `EBWebView` profile; doing so also deletes
-browser-owned projects and settings.
-
-<!-- validate: skip -->
-```powershell
-$voiceStudioWebView = "$env:LOCALAPPDATA\com.debpalash.omnivoice-studio\EBWebView"
-@(
-  "Default\Cache", "Default\Code Cache", "Default\GPUCache", "Default\DawnCache",
-  "Default\Service Worker\CacheStorage", "Default\Service Worker\ScriptCache",
-  "GPUCache", "DawnCache", "ShaderCache", "GrShaderCache", "GraphiteDawnCache"
-) | ForEach-Object {
-  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $voiceStudioWebView $_)
-}
-```
+This entry covered a corrupted WebView2 profile in the archived Tauri app
+(`IPC custom protocol failed, Tauri will now use the postMessage interface
+instead`, issue #879). The Electron app does not use WebView2. Install Electron
+with the [migration guide](../electron-migration.md); if the Electron app hangs
+at startup, see [14d](#14d-cant-reach-the-local-voicestudio-backend-when-the-backend-never-started).
 
 ## 16. macOS: microphone permission never prompts, VoiceStudio never appears in System Settings
 
@@ -969,26 +1225,23 @@ System Settings → Privacy & Security → Microphone and enable VoiceStudio" �
 but VoiceStudio never appears in that list, so there's nothing to enable.
 `NSMicrophoneUsageDescription` is present in the app's `Info.plist`, and
 resetting the permission (`tccutil reset Microphone
-com.debpalash.omnivoice-studio`) followed by a relaunch changes nothing — no
+com.voicestudio.desktop`) followed by a relaunch changes nothing — no
 system prompt ever appears.
 
 **Cause:** the app bundle was missing the Hardened Runtime *entitlement* for
-microphone access. An earlier revision of this section blamed an upstream
-Tauri/WebKit limitation — that was wrong (a community contributor,
-[@MahdiHedhli](https://github.com/MahdiHedhli), read the sources more
-carefully and found the real gap). wry's `WKUIDelegate` already grants the
-WebKit-layer media-capture request; but Tauri's macOS bundler enables
-Hardened Runtime by default, and Hardened Runtime blocks microphone hardware
-access unless `com.apple.security.device.audio-input` is present in the
-signed binary's entitlements — regardless of `Info.plist`'s
-`NSMicrophoneUsageDescription` (that only supplies the prompt *text*).
-Without the entitlement, macOS's TCC layer never registers a request, which
-is exactly why the app never appears in the System Settings list.
+microphone access. Hardened Runtime blocks microphone hardware access unless
+`com.apple.security.device.audio-input` is present in the signed binary's
+entitlements — regardless of `Info.plist`'s `NSMicrophoneUsageDescription`
+(that only supplies the prompt *text*). Without the entitlement, macOS's TCC
+layer never registers a request, which is exactly why the app never appears in
+the System Settings list. (Diagnosed in the archived Tauri app by
+[@MahdiHedhli](https://github.com/MahdiHedhli).)
 
-**Fix:** ships in the release after v0.3.12 (the bundle now carries
-`src-tauri/entitlements.plist` — [#1016](https://github.com/debpalash/VoiceStudio/pull/1016),
-contributed by the same person who diagnosed it). Update and live recording
-works, with a normal macOS permission prompt on first use.
+**Fix:** fixed since the release after v0.3.12
+([#1016](https://github.com/debpalash/VoiceStudio/pull/1016)); the Electron app
+signs with the same entitlement (`electron/build/entitlements.mac.plist`).
+Update and live recording works, with a normal macOS permission prompt on
+first use.
 
 **Workaround on older builds (≤ v0.3.12):** record your voice sample in any
 other app (Voice Memos, QuickTime, etc.) and upload the resulting file in
@@ -1022,51 +1275,22 @@ install `.pth` embeds that path in UTF-8, which is rarely a valid byte
 sequence in the active ANSI code page (`gbk`, `shift_jis`, etc.), and the
 interpreter can never start (#1783).
 
-**Fix:** current builds resolve the managed environment through Windows' 8.3
-short filename for any path containing non-ASCII bytes (the same trick
-already used for the HuggingFace cache — see
-[`backend/core/config.py`](../../backend/core/config.py)) whenever there is
-no usable environment yet, or an existing one shows exactly this crash — so
-a first-time install, and an install already broken by this bug, both land
-at an ASCII-safe path automatically with no user action needed. The old
-broken environment (if any) is left in place, not deleted, in case manual
-recovery is ever needed. An existing environment that already works — ASCII
-path or not — is never touched or relocated.
+**Fix:** VoiceStudio now rewrites those `.pth` entries to ASCII-only paths after
+each runtime install and before each launch, so existing environments recover
+on the next start. If the backend still cannot start, keep the app
+environment on an ASCII-only path. On the first-run
+setup screen, press **Change…** beside **App environment** and pick a folder
+such as `C:\VoiceStudio` before setup starts. An environment that cannot start
+fails VoiceStudio's runtime check, so setup opens again: choose an ASCII-only
+App environment location there. The broken environment is left in place for
+manual removal.
 
-**Prevention, on a brand new install:** on the first-run setup screen (before
-clicking through it), the **Change…** button on the "App environment" row
-(or "Portable folder" in portable mode) lets you pick an ASCII-only path up
-front — nothing below is needed if you do this before setup completes.
-
-If it still happens — most likely because Windows' 8.3 short filenames are
-off on the system drive, or the affected folder already existed before this
-fix shipped — the app names this cause specifically rather than the generic
-"backend never reported ready." By the time this message can appear, setup
-has already been confirmed (it's only reached after the first-run screen
-hands off to the installer), so the error screen you're actually looking at
-offers only **Retry** and **Clean & Retry** — neither changes where the
-environment is stored, so both fail identically, and the first-run picker
-above is no longer reachable either. The right fix depends on which install
-mode you're in:
-
-- **Standard (non-portable) install:** quit VoiceStudio, open (creating it
-  if it doesn't exist) `%LOCALAPPDATA%\com.debpalash.omnivoice-studio\config.json`
-  in a text editor, add `"env_dir": "C:/VoiceStudio/env"` (any path using
-  only English letters/numbers — forward slashes are fine on Windows), save,
-  and relaunch.
-- **Portable install:** the `env_dir` config key above does **not** apply —
-  portable mode resolves its own environment folder from the portable
-  location and never consults it. Quit VoiceStudio, then either move the
-  whole VoiceStudio folder (the app plus its `OmniVoiceStudio-Data` folder)
-  to an ASCII-only path and run it from there, or create a `portable.path`
-  text file beside the app containing one line — an absolute ASCII-only path
-  for the data folder (e.g. `C:\VoiceStudio\Data`) — and relaunch.
+The archived Tauri app's automatic 8.3 short-path relocation and its
+`env_dir` / `portable.path` overrides do not apply to the Electron app.
 
 Re-enabling 8.3 short filenames (`fsutil 8dot3name`) is deliberately **not**
-recommended here: the setting is per-volume and only affects directories
-created *after* it's changed, so toggling it does nothing for a folder that
-already exists — it would not actually fix this without also recreating the
-folder, which the ASCII-path options above already do more reliably.
+recommended: the setting is per-volume and only affects directories created
+*after* it's changed, so it does nothing for a folder that already exists.
 
 **Linked issue:** [#1783](https://github.com/debpalash/VoiceStudio/issues/1783) (auto-captured from [#1771](https://github.com/debpalash/VoiceStudio/issues/1771))
 
@@ -1102,15 +1326,107 @@ VoiceStudio now tries, in order: the default GitHub host → a gh-proxy mirror �
    tick *"Add Python to PATH"*), then relaunch — VoiceStudio will use it.
 2. **Point at a reachable mirror** for the Python download:
    - `UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download`
-3. **Point at a PyPI mirror** for the dependency install (`uv sync`):
-   - China: `UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple` (or `https://mirrors.aliyun.com/pypi/simple`)
-   - Fully-blocked networks (e.g. some regions): use a VPN — there is no
-     government-blessed PyPI mirror to rely on.
-4. The bootstrap already raises the network budget for you
-   (`UV_HTTP_TIMEOUT=120`, `UV_HTTP_CONNECT_TIMEOUT=30`, `UV_HTTP_RETRIES=5`);
+3. **In China, keep Auto-detect or pick the China download region** on the
+   setup screen. Auto-detect uses the Aliyun mirror when a quick speed check
+   finds it faster; China always uses it. Packaged setup then downloads the PyPI wheels pinned in `uv.lock` from the Aliyun
+   PyPI mirror (`mirrors.aliyun.com`). PyTorch wheels still come from
+   `download-r2.pytorch.org`.
+4. **Use a VPN or proxy for the dependency install.** The install downloads
+   the exact wheel URLs pinned in `uv.lock`, so a PyPI mirror setting
+   (`UV_DEFAULT_INDEX`, `UV_INDEX_URL`) does **not** redirect it. Packaged
+   setup uses your system proxy, or `HTTPS_PROXY` when it is set. See
+   [First-run setup is slow or stalls on a download](#first-run-setup-is-slow-or-stalls-on-a-download).
+5. The bootstrap already raises the network budget for you
+   (`UV_HTTP_TIMEOUT=900`, `UV_HTTP_CONNECT_TIMEOUT=30`, `UV_HTTP_RETRIES=5`);
    you can raise them further in the environment if a mirror is very slow.
 
 **Linked issues:** [#130](https://github.com/debpalash/VoiceStudio/issues/130), [#60](https://github.com/debpalash/VoiceStudio/issues/60), [#57](https://github.com/debpalash/VoiceStudio/issues/57)
+
+## First-run setup is slow or stalls on a download
+
+**Symptom:** first-run setup sits on **Installing…** for a long time, shows a
+low speed (about 1 MB/s) on a fast connection, or shows **No data from
+`<host>` for N s**.
+
+**What the screen shows:** while dependencies download, the setup screen names
+the host the current download comes from. When no data has arrived for 45
+seconds, it says the download has stalled and names that host. The setup log
+(**Details** or **Download setup log**; see
+[Reading the first-run install log](#reading-the-first-run-install-log-after-setup-finishes))
+records each source host, a progress line every 30 seconds, and when the
+download stalled or resumed. Attach those lines to a bug report.
+
+**Where the downloads come from:** the wheels pinned in `uv.lock`, nothing else:
+
+| Host | What |
+|---|---|
+| `files.pythonhosted.org` (PyPI) | Most packages, and on Linux the `nvidia-*` CUDA libraries (~3 GB) |
+| `download-r2.pytorch.org` (PyTorch) | `torch`, `torchaudio`, `torchvision` on Windows and Linux x64. On Windows the CUDA `torch` wheel is one file of about 3 GB |
+
+**Why it can be slow:** uv downloads each file over a single connection, and it
+cannot resume a file that stopped partway. A speed test opens many connections
+at once, so a network or CDN that limits each connection looks fast in a speed
+test and slow here. One large file (the Windows CUDA `torch` wheel) then decides
+the total time.
+
+**Large wheels use several connections:** before uv runs, setup asks uv which
+wheels it still has to download and fetches every one larger than 64 MB itself,
+in byte ranges over 8 connections, from the same URL in `uv.lock` (or the
+regional mirror). Each file is checked against the sha256 pinned in `uv.lock`
+before uv installs it from disk. The setup log shows `Fetching torch (3.2 GB)
+from download-r2.pytorch.org over 8 connections` and how long it took. If a
+server refuses byte ranges or the download fails, the log says so and uv
+downloads that file as before. The files wait in the runtime's `.wheel-prefetch`
+folder and are deleted once the dependency install succeeds, including the
+partial parts of any file that fell back to uv's own download. Set `OMNIVOICE_SETUP_CONNECTIONS`
+to change the number of connections (up to 16), or to `1` to turn this off.
+
+**What Cancel keeps:** every file that finished downloading stays in the
+runtime's `.uv-cache` folder, and the next attempt reuses it, including after
+**Clean & Retry**. A large wheel fetched over several connections keeps every
+finished 8 MB part in `.wheel-prefetch`, so a retry continues where it stopped.
+A file uv itself was still downloading starts again from zero.
+The next attempt deletes the unfinished parts a cancelled attempt left behind,
+so repeated retries do not fill the disk.
+
+**Resume after an interrupted setup** keeps the existing Python environment and
+installs only what is missing, from the same `.uv-cache`; it never evicts wheels
+that already finished downloading. A runtime whose setup finished is never shown
+as interrupted, even if an old setup marker was left behind in
+`runtime\project`: VoiceStudio sees that setup completed after it and opens
+normally.
+
+**What to do:**
+
+1. **If the bytes are still moving, let it run.** A stall notice only appears
+   after 45 seconds without data.
+2. **If it stalls, cancel and retry.** Finished files are kept.
+3. **Use a VPN or a proxy.** Setup uses your system proxy; to force one, set
+   `HTTPS_PROXY` (macOS/Linux: `export HTTPS_PROXY=http://host:port`; Windows
+   PowerShell: `[Environment]::SetEnvironmentVariable("HTTPS_PROXY","http://host:port","User")`),
+   then restart VoiceStudio.
+4. **No NVIDIA GPU, or you don't need it?** The CPU build skips the large CUDA
+   downloads. Setup picks it when no NVIDIA driver is found; set
+   `OMNIVOICE_TORCH_VARIANT=cpu` to choose it.
+
+The **download region** choice on the setup screen changes where the Python
+interpreter downloads from. With **China** selected, setup also downloads the
+`files.pythonhosted.org` wheels from the Aliyun PyPI mirror
+(`mirrors.aliyun.com`), which serves the same files: each one is still checked
+against the hash pinned in `uv.lock`. The setup log names the mirror. With
+**Auto-detect**, setup runs a quick speed check first: it reads the first
+256 KB of one locked wheel from `files.pythonhosted.org` and from the Aliyun
+mirror at the same time (one request each, 6-second limit, no retries) and
+uses the mirror only when it answers and is clearly faster. Any doubt keeps
+`files.pythonhosted.org`; the setup log line `PyPI speed check: ...` shows the
+result. **Global** never runs the check; **China** always uses the mirror. If the
+mirror fails, setup retries once from `files.pythonhosted.org` and keeps every
+file that finished. The PyTorch wheels on `download-r2.pytorch.org` have no
+mirror and download from there in every region. PyPI mirror variables
+(`UV_DEFAULT_INDEX`, `UV_INDEX_URL`) do not redirect the locked wheels
+([#3444](https://github.com/debpalash/VoiceStudio/issues/3444)).
+
+**Linked issue:** [#3411](https://github.com/debpalash/VoiceStudio/issues/3411)
 
 ## Workspace navigation crashes with `insertBefore` / `NotFoundError`
 
@@ -1128,20 +1444,55 @@ The Activity panel on the first-run screen shows the install as it happens, and
 that screen closes the moment setup succeeds — so it is not where you go
 afterwards to check what was installed, or to attach the log to a bug report.
 
-The same lines are written to **`bootstrap.log`**, beside the backend logs:
+Electron retains a redacted, timestamped **`setup.log`** across retries and app
+restarts. **Download setup log** works during installation, after failure, and
+when resuming an interrupted installation, before the backend is available.
+It saves `voicestudio-setup.log` to a location you choose. Nothing is uploaded.
+Normal app shutdown waits for pending setup log writes before exiting.
+
+Default locations of the retained log (portable/profile configurations may differ):
 
 | Platform | Location |
 |---|---|
-| macOS | `~/Library/Logs/OmniVoice/bootstrap.log` |
-| Windows | `%LOCALAPPDATA%\OmniVoice\Logs\bootstrap.log` |
-| Linux | `~/.local/state/OmniVoice/bootstrap.log` |
+| macOS | `~/Library/Application Support/VoiceStudio/setup.log` |
+| Windows | `%APPDATA%\VoiceStudio\setup.log` |
+| Linux | `~/.config/VoiceStudio/setup.log` |
 
-`OMNIVOICE_LOG_DIR` moves it, along with the other logs.
+The log includes attempt times, phases, download hosts, effective uv timeouts,
+proxy presence (not proxy credentials), progress, connection-check results, and
+error chains. Export adds the app version, OS, architecture and current status.
+Credentials, signed URL query strings and home-directory usernames are redacted.
+The retained history is bounded: when full, it keeps the initial context and
+latest lines, marking omitted content. Review the file before attaching it.
 
-It covers the current run only — it is truncated when a bootstrap starts, so a
-retry replaces the previous attempt rather than appending to it. If you need
-the log from an attempt that has already been superseded, copy it before
-retrying.
+After **five minutes without download progress**, setup offers **Report a bug**,
+**Get help on Discord**, and **Check download connection**. These also appear
+immediately after an installation failure. The warning clears when progress
+resumes; it does not cancel the installation. GitHub opens a prefilled report
+for you to review and submit; attach the downloaded log manually. Discord opens
+the official server. No report or log is submitted automatically.
+
+**Check download connection** makes a user-requested, bounded sample download
+from the affected package's pinned URL, using setup's proxy settings. It requests
+only artifacts from the lockfile compiled into the app, so changing a local
+runtime lockfile cannot redirect the diagnostic request. The check requests
+256 KiB and stops after at most 15 seconds, including connection setup. It can
+identify a blocked or failing package host; a successful sample does not prove
+that a multi-gigabyte download will finish. If no matching artifact is known,
+the check reports that it is unavailable instead of testing an unrelated host.
+The existing Auto region speed check only compares PyPI and its regional mirror;
+it does not choose a mirror for PyTorch's own servers.
+
+Setup defaults to `UV_HTTP_TIMEOUT=900` (15 minutes),
+`UV_HTTP_CONNECT_TIMEOUT=30`, and `UV_HTTP_RETRIES=5` for uv commands, including
+sync retries and fallbacks. Explicit environment overrides are preserved.
+The five-minute support prompt is independent of these timeouts. A large file
+may take longer than 15 minutes in total while continuing to make progress.
+
+If the error chain ends with `cannot decrypt peer's message`, the package
+connection failed while reading encrypted data. The preceding cache-write error
+does not by itself mean the disk is full. Resume to try again, and share the
+setup log if it repeats; completed downloads are retained.
 
 ## RTX 50-series (Blackwell, `sm_120`): backend never starts
 
@@ -1149,16 +1500,14 @@ retrying.
 and the backend log ends inside the `ml_imports` phase — often with a native
 crash (exit code `0xffffffff` / `-1073741819`) rather than a Python traceback.
 
-**Cause.** Not established. `torch 2.8.0+cu128` does contain Blackwell code:
-`sm_120` is in `torch.cuda.get_arch_list()`, and that build imports and runs
-CUDA normally on some Blackwell cards, so this is not simply a wheel without
-kernels for your GPU. What is confirmed is that on the Windows setups in
-[#1931](https://github.com/debpalash/VoiceStudio/issues/1931) `import torch`
-dies natively before any VoiceStudio code can classify it, which is why the app
-can only say the backend did not start. Moving to torch 2.9.x clears it for the
-users who hit it.
+**Cause.** Unknown so far. The pinned torch build does ship `sm_120` kernels,
+and some of these cards run CUDA on it. On the Windows machines in #1931,
+`import torch` crashes natively before VoiceStudio can inspect anything, so all
+the app can show is that the backend never started. Moving to torch 2.9.x fixed
+it for those users.
 
-**Fix.** Move to torch 2.9.x. From a source checkout, in the project folder:
+**Fix.** Upgrade to torch 2.9.x. From a source checkout, run these steps in the
+project folder:
 
 1. Edit `pyproject.toml` → `[tool.uv] constraint-dependencies` and raise the
    torch constraint to `torch==2.9.1+cu128` (matching `torchaudio` /
@@ -1184,6 +1533,31 @@ in the same phase. Update VoiceStudio, or delete that line in
 **Why the pin has not moved.** Raising it for everyone changes the CUDA build
 on every platform, in Docker, and in CI, so it is a deliberate decision rather
 than a patch. Track it in [#1931](https://github.com/debpalash/VoiceStudio/issues/1931).
+
+## Windows Smart App Control blocks an engine DLL (`An Application Control policy has blocked this file`)
+
+On Windows 11, Smart App Control (or a WDAC/AppLocker policy on a work PC) can
+let the engine's `python.exe` start and then block a DLL it loads, for example
+`ImportError: DLL load failed while importing _sqlite3: An Application Control
+policy has blocked this file`. The engine runtime is made of thousands of DLLs
+built and published by other projects — the Python interpreter and packages
+such as PyTorch, NumPy and ONNX Runtime — and many of them are unsigned. Signing
+VoiceStudio's installer does not sign those files, so Smart App Control can
+block one even when the app itself is trusted (#3209, #1779). Smart App Control
+has no per-app exceptions. Your options:
+
+- **Turn Smart App Control off** in Windows Security → App & browser control →
+  Smart App Control settings, then restart VoiceStudio. Current Windows
+  updates can turn it back on from the same page; older Windows versions may
+  need a reset to re-enable it.
+- **Keep it on and run the engine where it does not apply:** a WSL2 Linux distro
+  or [Docker](docker.md) on the same PC (both run Linux binaries, which Smart App
+  Control does not check), or another computer, then connect to it in
+  Settings → Sharing → **Remote backend** ([remote-gpu.md](../remote-gpu.md)).
+  A source checkout on Windows itself does not help: it downloads the same
+  Python packages.
+- **Work PC:** ask IT to allow VoiceStudio's runtime folder in the
+  application-control policy.
 
 ## Uninstalling / removing all of VoiceStudio's data
 
@@ -1215,7 +1589,7 @@ VoiceStudio pins pedalboard to `>=0.9.14,<0.9.21` while [upstream portable-wheel
 
 ### TorchCodec unavailable
 
-When torchaudio requires an unavailable TorchCodec installation, VoiceStudio writes through soundfile and reads reference audio through its FFmpeg fallback. Reference amplitude is normalized using the decoded sample representation, including 8-, 24-, and 32-bit PCM.
+When torchaudio requires an unavailable TorchCodec installation, VoiceStudio writes through soundfile and reads audio (reference clips, dub segments, cached-segment headers) through soundfile or its FFmpeg fallback, so dub assembly works on torchaudio 2.9 without TorchCodec. Reference amplitude is normalized using the decoded sample representation, including 8-, 24-, and 32-bit PCM.
 
 ### Isolated engine timeouts
 
@@ -1232,6 +1606,14 @@ Per-engine receive overrides include `OMNIVOICE_CONFUCIUS4_RECV_TIMEOUT_S`, `OMN
 ### FFprobe alongside FFmpeg
 
 When FFprobe is not on PATH, VoiceStudio also checks beside the selected FFmpeg binary. Parent folders named `ffmpeg` remain unchanged; only the executable name becomes `ffprobe` (or `ffprobe.exe` on Windows).
+
+### Environment file encoding
+
+Project `.env` files may use UTF-8 or BOM-marked UTF-16 or UTF-32. If a file
+cannot be decoded, VoiceStudio skips it for that launch and logs a warning;
+save it as UTF-8 to restore its settings. The saved per-user environment file
+uses UTF-8 and is left untouched if it cannot be read. Check the log and correct
+the file before relying on its settings.
 
 ### Subtitle and manuscript encodings
 
@@ -1270,6 +1652,100 @@ Python traceback may not exist; include the captured crash details and system/GP
 information when reporting them. The name identifies the failure category, not
 its cause: it does not by itself prove a driver, model, or memory problem.
 
+On macOS, stopping a timed-out engine or installer operation can race with its
+supervisor exiting. VoiceStudio briefly rechecks that exact owned supervisor before
+treating a process-group permission error as already-completed cleanup;
+permission failures for a live operation still surface as errors.
+
+### Backend would not start (Windows: `spawn UNKNOWN`, "did not answer", "environment incomplete")
+
+Three different startup failures share the same screen. The app now names the
+program it tried to launch, quotes what the backend last printed (or says it
+printed nothing, or that nothing was spawned), and adds a localized hint under
+the message:
+
+If Windows refuses to launch the selected Python interpreter during the initial
+dependency check, the failure names that interpreter and uses the same launch
+guidance below, without automatically reinstalling it. With no custom runtime
+selected, VoiceStudio can still reuse another compatible runtime; a blocked,
+unused legacy runtime does not prevent setup of a missing default runtime.
+An explicitly selected runtime remains authoritative. Missing interpreters and
+import errors still use the normal setup or repair flow.
+
+When the app recognises the cause it also names it in one line and puts the
+matching action first: **Choose another folder** for a missing environment, a
+write-permission error or a cloud-synced folder (installed app only; a source
+checkout gets **Retry**, which re-checks its `.venv` after `bun run setup:api`), **Copy diagnostics** for a
+native crash such as exit code `3221225477`, and **Retry** otherwise.
+
+The failure screen shows a single status pill (Starting, Recovering or Failed)
+with the elapsed time; repeated identical failures count up on the pill instead
+of redrawing the screen, and the raw message and log tail sit under **Details**.
+While a running engine is only busy, a slim bar at the bottom says it is
+reconnecting automatically; the workspace stays usable.
+
+- **`Could not start <program>: spawn UNKNOWN`** — Windows (or your security
+  software) refused to run the Python runtime; `UNKNOWN` is how the OS reports a
+  blocked executable. Add VoiceStudio's runtime folder to your antivirus
+  exclusions (Windows Security → Virus & threat protection → Manage settings →
+  Exclusions) and make sure it is not inside OneDrive, then retry.
+- **`… spawn UNKNOWN. Windows Smart App Control blocked it.`** — Smart App
+  Control (Windows 11) blocks programs without a known reputation, including the
+  runtime's `python.exe`; Event Viewer → Applications and Services Logs →
+  Microsoft → Windows → CodeIntegrity → Operational shows event 3077 for it.
+  Unlike antivirus it has **no per-app exceptions**, so an exclusion cannot help.
+  Either turn it off (Windows Security → App & browser control → Smart App
+  Control settings) or connect
+  VoiceStudio to an engine running on another computer. The app says this only
+  when it reads Smart App Control as on or in evaluation
+  (`VerifiedAndReputablePolicyState` 1 or 2 under
+  `HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy`); otherwise it shows the
+  antivirus advice above (#3224).
+- **`Backend exited (exit code 1): Windows refused to load one of the engine's
+  files.`** — the engine started, but Windows blocked one of its DLLs, e.g.
+  `ImportError: DLL load failed while importing _sqlite3: An Application Control
+  policy has blocked this file`. When Windows reports it in English, the message
+  names who blocked it: **Smart App Control** (same options as above), **your
+  antivirus** (add the runtime folder to its exclusions), or **a Windows
+  application control policy** your organization set (ask your administrator to
+  allow the runtime folder). On other Windows display languages only Smart App
+  Control is recognized (from its registry setting); otherwise check those three
+  in that order. The
+  files themselves are intact, so VoiceStudio does not download the runtime
+  again, which would be blocked the same way (#3209).
+- **`Backend did not answer on port 3900 within N s`** — the wait for the
+  backend ran out. The budget (`OMNIVOICE_STARTUP_BUDGET_S`) now starts when the
+  backend process is spawned, not when the launch began, defaults to 300 s (600 s
+  on a machine with four or fewer cores or 8 GB of RAM or less, where a PC
+  without a dedicated GPU is usually found), and is extended while the backend is
+  still printing, up to three times the budget. The runtime health probe that
+  runs before the launch also gets 180 s instead of 30 s, and a probe that merely
+  ran out of time is treated as inconclusive instead of sending an intact
+  runtime back to the setup screen. The first start after an install is the
+  slowest because antivirus scans every new file; later starts are much faster.
+- **Installed app, Python environment deleted** (antivirus, disk cleanup, interrupted update): VoiceStudio rebuilds it by itself on the next launch with the normal setup progress screen, once per launch. If that repair fails the setup screen says so; check the engine log and press Retry. Your voices and projects are never touched.
+- **`The Python environment in <folder> is missing`** or **`… is incomplete:
+  <reason>`** (running from a source checkout, e.g. `bun run dev`; an installed app never shows this message and repairs its own runtime from the setup screen) — run `bun run setup:api` in the
+  repository, let it finish, then press **Retry** (the message names the folder to open the terminal in; it is never taken from the terminal's working directory, so running from `C:\Windows\System32` does not matter). A folder without `pyproject.toml` is not a source checkout: install from the release installer instead. *Missing* means no `.venv` exists yet.
+  *Incomplete* quotes the import that failed, e.g. `ModuleNotFoundError: No
+  module named 'sentencepiece'` (setup did not finish: rerun it) or `ImportError:
+  DLL load failed` (Windows: rerun setup, which installs the Visual C++
+  runtime). If the folder is inside OneDrive, Dropbox, iCloud Drive or Google
+  Drive, move the checkout to a plain local folder first: online-only
+  placeholders and file locking break the Python environment. The same applies to `error loading dynamically imported module: http://localhost:3902/@fs/…/node_modules/.vite/deps/…` from a dev server running inside OneDrive (installed builds never load from a dev server).
+- **`EPERM: operation not permitted, rename …\.previous-backend`** or **`… rename …\.incoming-backend -> …\backend`** — a scanner, OneDrive or a VoiceStudio backend still running held the runtime folder while VoiceStudio refreshed it. The app retries each rename, copy and cleanup step for about 10 s, then updates the files in place. If a file stays locked through all of that, setup says **Another program is using VoiceStudio's files**: pause OneDrive (or other sync apps), exclude the runtime folder from antivirus, quit any VoiceStudio left in Task Manager, then press Retry.
+
+A native crash (`3221225477`, `-1073741819`) right after pressing Generate
+shortly after launch was caused by the startup preload and the first generation
+loading the TTS model at the same time. Cold loads are now serialized across both
+paths; if a load ever wedges past its deadline, retries fail immediately with a
+"restart the backend" message instead of queueing behind it. If a native crash
+persists, attach the full faulthandler dump (the `Windows fatal exception` block
+including every `Thread` section) from Settings → Logs → Backend. Bug reports
+already carry a condensed copy: the crash message names the faulting frame, and
+the report keeps the faulting thread's VoiceStudio frames (which model or job
+was loading) plus the frame each other thread was running.
+
 ### ASR initialization errors
 
 A PyTorch Whisper initialization failure can come from an import, checkpoint,
@@ -1279,3 +1755,62 @@ prove that torch and torchvision versions are mismatched. Save the diagnostic
 bundle and check package versions in the environment running the backend before
 reinstalling anything. Faster Whisper is an alternative when only transcription
 is affected; it does not diagnose or repair the original environment.
+
+## Concurrent migration backups
+
+Concurrent pre-migration database snapshots reserve distinct backup counters before copying. Reservation files are not recovery backups. A reservation left by an interrupted writer is skipped by subsequent snapshots rather than reused.
+
+## "This model can't be used until you accept its licence"
+
+VoiceStudio does not own or license the models it runs. Models whose licence is
+not plainly commercial (non-commercial, conditional or unidentified terms, such
+as the default OmniVoice model) are blocked until you accept their licence once.
+Accept it in the dialog that appears, or in **Model Manager → the model's
+Licence icon**. Nothing is re-downloaded. Headless and API users can accept with
+`POST /models/licenses/accept`; see
+[Licence acceptance before use](../licensing/model-review-workflow.md#licence-acceptance-before-use).
+
+### Setup stops at `VOICESTUDIO_CUDNN8_PROBE` on a CPU-only computer
+
+If an older installer exits with code `3221225477` at this probe, install the
+updated desktop build and retry **Install local runtime**. CPU and ROCm setup
+now skip the native CUDA compatibility probe; runtime imports are still verified
+before setup finishes. If verification also fails, include the new setup log in
+your report rather than deleting saved voices or projects. The probe is also
+advisory now: if it still crashes natively, setup continues and the import
+verification decides whether the runtime works.
+
+The import verification now prints `VOICESTUDIO_IMPORT=<module>` before loading
+each runtime module, and a crash names the module in the error (`the import
+check stopped while importing "<module>"`). Include that line from the setup log
+in your report: the last `VOICESTUDIO_IMPORT=` line is the module that crashed.
+
+If that module is `sentencepiece` (or another C++ library) and the system's
+Visual C++ runtime is older than 14.40, setup now says so: **This Windows
+system's Microsoft Visual C++ Redistributable (x64) is too old**, with the
+`MSVCP140.dll` path and version it found. Newer wheels such as sentencepiece
+0.2.2 are built with Visual Studio 2022 17.10 or later and crash with
+`3221225477` against an older `MSVCP140.dll`. Install the latest
+[Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+and press Retry; reinstalling the Python packages cannot update a system library.
+
+### "Backend exited unexpectedly (exit code 3221225477)" while loading a model
+
+A cut-off model download makes Windows kill the backend with an access violation
+(`0xC0000005`) when the weights are read. VoiceStudio now checks each
+`.safetensors` file's header against its size before loading and re-downloads a
+truncated file automatically. If you point `OMNIVOICE_CHECKPOINT` at your own
+folder, it names the incomplete file instead; delete it and download it again.
+
+### "Backend is running but busy / not responding on port 3900"
+
+If the log shows `Event loop has not run for N s`, the stack dump right below it
+names the call that blocked the backend; include it in your report. Set
+`OMNIVOICE_LOOP_STALL_S` to change the 4 s threshold (`0` turns it off).
+
+### Backend exits with code 3 and "[Errno 13] error while attempting to bind"
+
+Windows or another program refused access to the port, often a reserved range
+(Hyper-V, WSL, Docker). Check with
+`netsh interface ipv4 show excludedportrange protocol=tcp`, then set
+`OMNIVOICE_PORT` to a different free port.

@@ -82,14 +82,10 @@ def test_fallback_version_resolves_to_pyproject():
     assert _fallback_version() == pyproject
 
 
-def test_frozen_build_collects_package_metadata():
-    """backend.spec must copy_metadata('omnivoice') so the frozen backend reads
-    its real version via importlib.metadata instead of the fallback literal."""
+def test_ios_app_reads_the_full_version():
+    # CFBundleShortVersionString is X.Y.Z only; About and licence receipts must show
+    # the root version like Android's versionName (AppVersion.full).
     from pathlib import Path
-
-    spec = (Path(__file__).resolve().parents[1] / "backend.spec").read_text(
-        encoding="utf-8"
-    )
-    assert (
-        "copy_metadata('omnivoice')" in spec or 'copy_metadata("omnivoice")' in spec
-    ), "backend.spec must copy_metadata('omnivoice') (frozen-build version reporting)"
+    sources = (Path(__file__).resolve().parents[1] / "mobile/ios/VoiceStudio").rglob("*.swift")
+    offenders = [p.name for p in sources if "CFBundleShortVersionString" in p.read_text(encoding="utf-8")]
+    assert not offenders

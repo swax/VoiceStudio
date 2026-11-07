@@ -28,12 +28,14 @@ own pins.
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from services.expression import OMNIVOICE_INLINE_TAGS
 from services.subprocess_backend import SubprocessBackend
 
 if TYPE_CHECKING:
@@ -44,9 +46,14 @@ logger = logging.getLogger("omnivoice.omnivoice_subprocess")
 
 class OmniVoiceSubprocessBackend(SubprocessBackend):
     """The resident OmniVoice model in a killable sidecar process."""
+    supports_float_transport = True
+    supports_native_omnivoice_controls = True
 
     id = "omnivoice-subprocess"
     display_name = "OmniVoice (subprocess-isolated, killable on timeout)"
+    instruct_vocabulary = "tags"
+    inline_tags = OMNIVOICE_INLINE_TAGS
+    supports_voice_design = True
     _DEFAULT_SAMPLE_RATE = 24000
     gpu_compat = ("cuda", "rocm", "mps", "cpu")
     # Match OmniVoiceBackend: the measured floor below which a render that
@@ -68,21 +75,14 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
         passage = None
         audio = kw.get("ref_audio")
         if isinstance(audio, str):
-            from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
-            from services.tts_backend import (
-                _reuse_or_rank_passage,
-                omnivoice_ref_text,
-                reference_duration_s,
-            )
+            from services.tts_backend import omnivoice_inline_reference
 
-            duration = reference_duration_s(audio)
-            if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
-                selected = _reuse_or_rank_passage(audio)
-                if selected is not None:
-                    kw["ref_audio"], kw["ref_text"] = selected
-                    passage = selected[0]
-                elif kw.get("ref_text"):
-                    kw["ref_text"] = omnivoice_ref_text(audio, kw["ref_text"])
+            ref_text = kw.get("ref_text")
+            selected_audio, selected_text, passage = omnivoice_inline_reference(audio, ref_text)
+            if passage is not None:
+                kw["ref_audio"], kw["ref_text"] = selected_audio, selected_text
+            elif ref_text:
+                kw["ref_text"] = selected_text
         try:
             return super().generate(text, **kw)
         finally:
@@ -94,14 +94,24 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
-        # Same probe as OmniVoiceBackend: the package must be importable. The
+        # The package must be installed. This engine runs the model in a
+        # sidecar, so the parent never needs the module: importing it here
+        # cost seconds of torch/transformers import on every backend start
+        # (reconcile_active_profile probes availability at boot) for no use.
+        # The sidecar reports its own import failures when it spawns. The
         # interpreter is the parent's own (sys.executable), so there is no
         # separate venv to validate.
         try:
-            import omnivoice.models.omnivoice  # noqa: F401
+            found = importlib.util.find_spec("omnivoice.models.omnivoice") is not None
         except Exception as e:
             return False, f"omnivoice package missing: {e}"
+        if not found:
+            return False, "omnivoice package missing: omnivoice.models.omnivoice not found"
         return True, "ready"
+
+    @classmethod
+    def shares_parent_torch(cls) -> bool:
+        return True
 
     @classmethod
     def venv_python(cls) -> Path:
@@ -149,6 +159,7 @@ class OmniVoiceMPSSubprocessBackend(OmniVoiceSubprocessBackend):
 
     id = "omnivoice"
     display_name = "VoiceStudio (k2-fsa/OmniVoice, 600+ languages)"
+    instruct_vocabulary = "tags"
     supports_native_omnivoice_controls = True
 
     def generate(self, text: str, **kw):

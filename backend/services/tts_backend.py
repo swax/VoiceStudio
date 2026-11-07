@@ -19,17 +19,22 @@ dub generator consumes whole segments today.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import os
 import re
+import contextlib
 import threading
+import uuid
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from contextlib import contextmanager
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
+
+from services.expression import COSYVOICE_INLINE_TAGS, OMNIVOICE_INLINE_TAGS, expression_caps
 
 logger = logging.getLogger("omnivoice.tts")
 
@@ -203,8 +208,35 @@ class TTSInputError(ValueError):
     surface as opaque 500s like "need at least one array to concatenate")."""
 
 
+def _lease_render(method):
+    """Keep engines resident for every render caller, including dub and batch.
+
+    Also the one place a regional variant name ("Portuguese (Portugal)",
+    #3143) becomes the base language engines know: the bundled vocabulary and
+    every adapter have a single Portuguese, so passing the variant through
+    would fail their lookups. The dialect itself is applied before synthesis
+    (text normalization) and reported to the UI by ``language_dialects``.
+    """
+    @functools.wraps(method)
+    def render(instance, *args, **kwargs):
+        if "language" in kwargs:
+            from core.language_variants import base_language
+            kwargs["language"] = base_language(kwargs["language"])
+        with engine_in_use(instance):
+            return method(instance, *args, **kwargs)
+    return render
+
+
 class TTSBackend(ABC):
     """Every TTS engine exposes the same surface, regardless of vendor."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Enforce lifetime at the engine boundary so every caller is covered.
+        for name in ("generate", "generate_batch", "_ensure_loaded", "convert_voice"):
+            method = cls.__dict__.get(name)
+            if method is not None:
+                setattr(cls, name, _lease_render(method))
 
     #: Unique id for config + UI (e.g. "omnivoice", "voxcpm2").
     id: str = "base"
@@ -232,7 +264,11 @@ class TTSBackend(ABC):
 
     #: Whether this engine supports voice design from a text description
     #: (e.g. "young female, warm tone, British accent") without reference audio.
-    supports_voice_design: bool = False
+    #: ``False`` engines need a reference clip for the timbre, so Voice Design
+    #: is refused up front (UI and ``/generate``) instead of failing inside the
+    #: engine. ``None`` = not declared: design stays allowed and the engine
+    #: decides. Read through :func:`voice_design_support`.
+    supports_voice_design: Optional[bool] = None
 
     #: Whether this engine understands the graded-emotion generate kwargs
     #: (``emo_vector`` / ``emo_text`` + ``use_emo_text`` / ``emo_alpha``).
@@ -242,6 +278,24 @@ class TTSBackend(ABC):
     #: that don't set it still ignore the kwargs (every generate() takes **kw),
     #: so this is a discoverability hint, not an enforcement gate.
     supports_emotion: bool = False
+
+    #: How this engine reads the ``instruct`` text of a request. ``"tags"`` is
+    #: a closed list of voice-design attributes (the OmniVoice family) and
+    #: anything else must be filtered out; ``"freeform"`` means the text is
+    #: used as written or ignored. Reported by ``list_backends()`` so clients
+    #: know whether to sanitise before sending.
+    instruct_vocabulary: Literal["tags", "freeform"] = "freeform"
+
+    #: Inline reaction tags (``[laughter]``, ``[breath]``) this engine's own
+    #: tokenizer renders where they are typed (#3422). The text reaches every
+    #: engine verbatim, so an engine that doesn't list a tag speaks it as
+    #: words; Insert menus offer only these. Declare only verified tags.
+    inline_tags: tuple[str, ...] = ()
+
+    #: Whether ``instruct`` steers the *delivery* of a cloned voice ("sound
+    #: scared") rather than only designing a new one (#3422). True for
+    #: CosyVoice's instruct2 and VoxCPM2's controllable cloning.
+    instruct_directs_delivery: bool = False
 
     def ensure_ready(self) -> None:
         """Load model weights now (blocking), so callers can separate the
@@ -287,6 +341,17 @@ class TTSBackend(ABC):
     #: to the raw ISO / display token as the language picker renders it.
     language_display_names: dict[str, str] = {}
 
+    @classmethod
+    def configured_identity(cls) -> Optional[str]:
+        """What a fresh instance would load now, for engines whose model is a
+        construction-time preference. ``None`` means construction is not
+        preference-dependent and a cached instance never goes stale."""
+        return None
+
+    def built_identity(self) -> Optional[str]:
+        """The preference-dependent identity this instance was constructed with."""
+        return None
+
     def _normalize_language_code(self, language: object) -> Optional[str]:
         """Resolve picker names and region tags without treating unknown names as Auto."""
         if language is None:
@@ -298,8 +363,10 @@ class TTSBackend(ABC):
             return None
         from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
+        from core.language_variants import VARIANT_CODES
+
         # Reuse the same complete, bundled mapping as the language picker.
-        aliases = {"mandarin": "zh", "arabic": "ar", "tagalog": "tl"}
+        aliases = {"mandarin": "zh", "arabic": "ar", "tagalog": "tl", **VARIANT_CODES}
         if value in aliases:
             return aliases[value]
         if value in LANG_NAME_TO_ID:
@@ -383,11 +450,17 @@ class TTSBackend(ABC):
             out.append(f"{code} ({label})" if label else code)
         return out
 
-    #: Whether this engine already emits mastered, studio-grade audio and should
-    #: therefore skip the shared apply_mastering() chain (highpass + Compressor,
-    #: tuned for OmniVoice's 24 kHz output). Studio engines like VoxCPM2 (native
-    #: 48 kHz) set this True so their clean output isn't pumped. Loudness
-    #: normalisation is applied regardless — it's a benign peak scale.
+    #: Regional dialects whose accent this engine renders by itself (BCP-47,
+    #: e.g. ``("pt-BR",)``), #3143. Empty — the default and every bundled
+    #: engine today — means the engine has one model per language, so a
+    #: regional pick changes spelling and number words but the accent follows
+    #: the reference voice. Read through :func:`rendered_dialects`.
+    rendered_dialects: tuple[str, ...] = ()
+
+    #: True bypasses ``apply_mastering()``: its high-pass filter and compressor
+    #: target the default engine's 24 kHz cloned audio. Finished high-rate
+    #: engines such as VoxCPM2 opt out to avoid damaging their studio output;
+    #: loudness normalisation is still applied independently.
     applies_own_mastering: bool = False
 
     #: Whether this engine can clone an arbitrary voice from reference audio
@@ -396,6 +469,21 @@ class TTSBackend(ABC):
     #: (issue #312 class) before committing to a job that needs it, instead
     #: of silently falling back to OmniVoice or mis-cloning per segment.
     supports_cloning: bool = True
+
+    #: Whether :meth:`convert_voice` works: speech-to-speech conversion that
+    #: keeps the source recording's timing, rhythm and intonation and changes
+    #: only the timbre (#3421). Convert's "Keep my delivery" mode routes to an
+    #: engine that declares it instead of transcribing and re-speaking.
+    supports_voice_conversion: bool = False
+
+    def convert_voice(self, source_audio: str, *, ref_audio: str, seed: Optional[int] = None) -> torch.Tensor:
+        """Re-voice the speech in ``source_audio`` with ``ref_audio``'s timbre.
+
+        Both are local WAV paths. Returns a ``(1, n_samples)`` tensor at
+        :attr:`sample_rate` that follows the source's timing. Engines that
+        declare :attr:`supports_voice_conversion` override this.
+        """
+        raise NotImplementedError(f"{self.id} does not support voice conversion")
 
     #: Longest stretch of a reference clip this engine actually conditions on,
     #: in seconds, and how it chooses that stretch from a longer clip:
@@ -406,17 +494,14 @@ class TTSBackend(ABC):
     max_ref_seconds: Optional[float] = None
     ref_strategy: Optional[str] = None
 
-    #: Curated model keys that DO accept a reference clip, for an adapter
-    #: whose ``supports_cloning`` is model-dependent (a property rather than
-    #: a plain bool). Empty when cloning is a fixed fact about the engine.
-    #: Lets the cloning gate name the one-setting fix — pick this model —
-    #: instead of telling the user their engine can't clone at all (#2201).
+    #: Curated model-picker keys that accept reference audio for adapters whose
+    #: cloning capability depends on the selected model.
     cloning_model_keys: tuple[str, ...] = ()
 
     @classmethod
     def cloning_model_labels(cls) -> tuple[str, ...]:
-        """:attr:`cloning_model_keys` as the model picker labels them."""
-        return cls.cloning_model_keys
+        """Expose the declared keys using their default picker text."""
+        return tuple(cls.cloning_model_keys)
 
     #: GPU/accelerator targets the engine can run on. Surfaced via the
     #: Engine Compatibility Matrix (Plan 02-04 / ENGINE-06) so users can
@@ -451,14 +536,17 @@ class TTSBackend(ABC):
         installed executable determines both the available runtimes and the
         device actually selected.
         """
-        from services.engine_routing import resolve_routing
+        from services.engine_routing import resolve_routing, uses_parent_torch
 
         gpu_compat = tuple(getattr(cls, "gpu_compat", ("cpu",)))
         min_vram_gb = float(getattr(cls, "min_vram_gb", 0.0) or 0.0)
         return {
             "gpu_compat": gpu_compat,
             "min_vram_gb": min_vram_gb,
-            **resolve_routing(gpu_compat, caps, min_vram_gb),
+            **resolve_routing(
+                gpu_compat, caps, min_vram_gb,
+                parent_torch=uses_parent_torch(cls),
+            ),
             "runtime_backend": None,
             "runtime_device_index": None,
             "runtime_device_name": None,
@@ -508,6 +596,7 @@ class TTSBackend(ABC):
         Engines that don't support this will ignore the parameter.
         """
 
+    @_lease_render
     def generate_batch(
         self,
         texts: list[str],
@@ -627,6 +716,11 @@ class TTSBackend(ABC):
 _PROMPT_CACHE_MAX = 8
 _prompt_cache: "OrderedDict[tuple, object]" = OrderedDict()
 _prompt_cache_lock = threading.Lock()
+# Recognizer chain a transcript-free prompt was built under, by its cache key.
+# The key itself has no recognizer in it, so without this a recognizer the user
+# installs or selects later would never get to transcribe a reference that an
+# earlier chain could not. Guarded by _prompt_cache_lock.
+_unresolved_prompt_recognizers: dict = {}
 
 # Disk layer under the in-memory LRU (upstream k2-fsa VoiceClonePrompt.save/
 # load format). The in-memory cache dies with the process, so the first
@@ -697,6 +791,7 @@ def _prompt_cache_evict(key: tuple) -> None:
     """
     with _prompt_cache_lock:
         _prompt_cache.pop(key, None)
+        _unresolved_prompt_recognizers.pop(key, None)
     cache_dir = _prompt_disk_dir()
     if cache_dir is None:
         return
@@ -775,10 +870,40 @@ def _reference_duration_cached(path: str, _mtime_ns: int, _size: int) -> Optiona
     except Exception:  # noqa: BLE001 — fall through to ffmpeg
         pass
     try:
+        from core.url_safety import is_manifest_file
         from pydub import AudioSegment
 
+        # pydub's ffmpeg call cannot take input options, so a playlist named
+        # like audio is refused here rather than given to ffmpeg to follow.
+        if is_manifest_file(path):
+            return None
         return float(AudioSegment.from_file(path).duration_seconds)
     except Exception:  # noqa: BLE001 — unknown length: callers keep old behavior
+        return None
+
+
+def required_reference_transcript(ref_audio, ref_text):
+    """``ref_text``, or the reference clip's transcript when it has none.
+
+    For engines that cannot clone without a transcript (MLX-Audio CSM,
+    CosyVoice GGUF). /generate and /convert transcribe a transcript-less clip
+    before calling the engine, but streaming, audiobook and dub pass a profile's
+    stored transcript straight through, and that is missing for a voice saved
+    without one or whose cut legacy take transcript is ignored (#3062).
+    Transcribing here covers every route with the same recognizer
+    (``transcribe_reference``, cached by audio content). Best-effort: ``None``
+    when recognition fails, and the engine reports its own error.
+    """
+    if ref_text and str(ref_text).strip():
+        return ref_text
+    if not isinstance(ref_audio, str) or not ref_audio:
+        return None
+    try:
+        from services.asr_backend import transcribe_reference
+
+        return transcribe_reference(ref_audio) or None
+    except Exception as exc:  # noqa: BLE001 - the engine names the missing transcript
+        logger.warning("reference transcript for a cloning engine failed: %s", exc)
         return None
 
 
@@ -795,7 +920,11 @@ def omnivoice_ref_text(ref_audio, ref_text):
     fallback when that recognizer finds no words. A transcript typed on a ``/generate`` request is
     rejected there with ``[clone_ref_too_long]`` before reaching this point.
     """
-    if not ref_text or not ref_text.strip():
+    from services.reference_transcript import strip_script_markup
+
+    # Script markup in a transcript is read out at every chunk start (#3062).
+    ref_text = strip_script_markup(ref_text)
+    if not ref_text:
         # "" and whitespace are no transcript: the model checks
         # ``ref_text is not None``, so pass None and let it pick the passage.
         return None
@@ -1037,8 +1166,11 @@ def _read_reference_mono(path: str):
     if audio is None:
         try:
             import numpy as np
+            from core.url_safety import is_manifest_file
             from pydub import AudioSegment
 
+            if is_manifest_file(path):  # never hand a playlist to ffmpeg
+                return None
             segment = AudioSegment.from_file(path)
             sr = int(segment.frame_rate)
             samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
@@ -1182,14 +1314,145 @@ def _reuse_or_rank_passage(ref_audio: str) -> Optional[tuple[str, str]]:
     return _omnivoice_installed_passage(ref_audio)
 
 
+def prepare_reference_passage(ref_audio) -> bool:
+    """Rank a long reference's best 15 s window NOW, off the generate clock.
+
+    Picking the window runs the installed recognizer over up to five 15 s
+    windows. On a CPU that is minutes, and when it ran inside the engine call
+    it was charged to the generate budget: the job was then abandoned with
+    "TTS generate exceeded 300s" before a single sample was synthesized
+    (#2764's log shows a CPU Whisper large-v3 transcribing the voice just
+    before). The choice is remembered per recognizer and file version
+    (``_recall_passage``), so the engine call that follows recalls it for free.
+
+    Returns True when a passage was chosen or remembered. Never raises, and a
+    clip that needs no window (<= the transcript limit) is a no-op.
+    """
+    if not isinstance(ref_audio, str):
+        return False
+    try:
+        from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
+
+        duration = reference_duration_s(ref_audio)
+        if duration is None or duration <= CLONE_REF_TEXT_MAX_SECONDS:
+            return False
+        selected = _reuse_or_rank_passage(ref_audio)
+    except Exception:  # noqa: BLE001 — the engine ranks inline as before
+        logger.debug("reference passage pre-ranking failed", exc_info=True)
+        return False
+    if selected is None:
+        return False
+    try:
+        os.remove(selected[0])
+    except OSError:
+        logger.debug("failed to remove reference window")
+    return True
+
+
+def omnivoice_inline_reference(ref_audio, ref_text):
+    """``(ref_audio, ref_text, owned_path)`` for a direct ``model.generate()``.
+
+    Paths that bypass the prompt cache — the sidecar request and the inline
+    retry after a failed precompute — must condition on the same installed-
+    recognizer passage as the cache. Passing the whole long clip with no
+    transcript instead reached OmniVoice's bundled Whisper and failed with
+    "needs an installed speech-to-text model" although one was installed
+    (#2579). ``owned_path`` is a temporary window the caller deletes.
+    """
+    if isinstance(ref_audio, str):
+        from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
+
+        duration = reference_duration_s(ref_audio)
+        if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
+            selected = _reuse_or_rank_passage(ref_audio)
+            if selected is not None:
+                return selected[0], selected[1], selected[0]
+    return ref_audio, omnivoice_ref_text(ref_audio, ref_text), None
+
+
 def _speech_score(text: str) -> int:
     """Spoken-character count, matching OmniVoice's window ranking."""
     return len(re.sub(r"[^\w]+", "", text or "", flags=re.UNICODE))
 
 
+def _trim_selected_passage(path: str, text: str) -> tuple[str, str, Optional[str]]:
+    """Pull a backend-selected long-reference window's edges into pauses.
+
+    The model trims and re-reads a passage only when it picks one itself
+    (``ref_text is None``). A window chosen here arrives with its transcript, so
+    without this a window cut mid-word would carry that fragment into the
+    generated speech. Returns ``(path, text, owned_path)``: the trimmed copy and
+    its re-read transcript (``owned_path`` is the temp file the caller deletes),
+    or the original window and transcript when nothing needed trimming, the
+    trimmed copy has no words, or any step fails.
+    """
+    out = None
+    try:
+        import soundfile as sf
+        import tempfile
+        import torch
+        from omnivoice.utils.audio import trim_passage_to_pauses
+        from services.asr_backend import transcribe_reference
+
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.T.copy())
+        trimmed = trim_passage_to_pauses(wav, sr)
+        if trimmed.size(-1) == wav.size(-1):
+            return path, text, None
+        fd, out = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sf.write(out, trimmed.T.numpy(), sr)
+        new_text = (transcribe_reference(out) or "").strip()
+        if _speech_score(new_text) > 0:
+            return out, new_text, out
+    except Exception:  # noqa: BLE001 — the untrimmed window is still valid
+        logger.debug("selected-window trim failed; keeping the untrimmed window")
+    if out is not None:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    return path, text, None
+
+
+def _unresolved_prompt_is_current(key: tuple) -> bool:
+    """True when the cached transcript-free prompt under ``key`` was built under
+    the recognizer chain that is selected now.
+
+    Installing or selecting another recognizer changes the chain, so the prompt
+    is no longer trusted and the new recognizer gets its turn. An unnamed chain
+    (identity "") is never trusted, for the same reason the passage cache
+    refuses it.
+    """
+    identity = _reference_asr_identity()
+    if not identity:
+        return False
+    with _prompt_cache_lock:
+        return _unresolved_prompt_recognizers.get(key) == identity
+
+
+def has_unresolved_clone_prompt(ref_audio: str, preprocess_prompt: bool = True) -> bool:
+    """True when a still-valid transcript-free prompt for ``ref_audio`` is cached.
+
+    That only happens after an earlier request found no installed-recognizer
+    words and let the model transcribe it, so a serialized sidecar can skip
+    loading the recognizer again for the same reference, until the selected
+    recognizers change.
+    """
+    try:
+        key = _clone_prompt_key(ref_audio, None, preprocess_prompt)
+    except Exception:  # noqa: BLE001 — an unreadable reference is simply "not cached"
+        return False
+    with _prompt_cache_lock:
+        if key not in _prompt_cache:
+            return False
+    return _unresolved_prompt_is_current(key)
+
+
 def _get_clone_prompt(
     model, ref_audio: str, ref_text, preprocess_prompt: bool = True, *,
     store: bool = True,
+    reference_asr: Optional[str] = None,
 ):
     """Return a cached/precomputed ``VoiceClonePrompt`` for
     (ref_audio, ref_text, preprocess_prompt), or ``None`` to fall back to the
@@ -1206,6 +1469,11 @@ def _get_clone_prompt(
     LRU of 8 evicts the per-speaker and locked-profile prompts that ARE reused.
     Every short segment falling back to its speaker ref then re-encodes it
     (~0.4 s each, measured). Scan-resistance, not a second cache policy.
+
+    ``reference_asr`` reports a reference transcription the caller already ran
+    in this pass: ``"empty"`` (it completed and found no words) or ``"failed"``
+    (it raised). Either way it is not repeated here; only ``"empty"`` lets the
+    resulting prompt be trusted for the current recognizers on later requests.
     """
     # Resolve transcript-free references through an already-installed ASR
     # before deriving the cache key. This protects every native OmniVoice
@@ -1214,10 +1482,14 @@ def _get_clone_prompt(
     # persist the transcript. Incomplete reference conditioning can destabilize
     # the reference/target boundary and introduce words in the generated prefix.
     unresolved_key = None
+    # True only when recognition ran to completion and found no words. A raised
+    # error is not that: the same recognizers may well succeed on the next try.
+    recognition_found_nothing = False
     from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
 
     duration = reference_duration_s(ref_audio)
     passage_file = None
+    trimmed_file = None
     passage_context = None
     recalled_index = None
     cacheable = True
@@ -1249,12 +1521,31 @@ def _get_clone_prompt(
                 )
             except Exception:
                 pass
-            try:
-                from services.asr_backend import transcribe_reference
+            if (
+                unresolved_key is not None
+                and cacheable
+                and _unresolved_prompt_is_current(unresolved_key)
+            ):
+                # An earlier request found no installed-recognizer words and
+                # cached the model-transcribed prompt under this key: reuse it
+                # instead of loading the same recognizers again to fail again.
+                with _prompt_cache_lock:
+                    hit = _prompt_cache.get(unresolved_key)
+                    if hit is not None:
+                        _prompt_cache.move_to_end(unresolved_key)
+                        return hit
+            if reference_asr is not None:
+                # Already tried in this pass: running the same recognizers on
+                # the same audio again cannot help and costs a full ASR load.
+                recognition_found_nothing = reference_asr == "empty"
+            else:
+                try:
+                    from services.asr_backend import transcribe_reference
 
-                ref_text = transcribe_reference(ref_audio)
-            except Exception as e:  # noqa: BLE001 — model fallback remains available
-                logger.warning("reference transcript resolution failed: %s", e)
+                    ref_text = transcribe_reference(ref_audio)
+                    recognition_found_nothing = not ref_text
+                except Exception as e:  # noqa: BLE001 — model fallback remains available
+                    logger.warning("reference transcript resolution failed: %s", e)
             if ref_text and unresolved_key is not None:
                 _prompt_cache_evict(unresolved_key)
 
@@ -1265,10 +1556,18 @@ def _get_clone_prompt(
         except Exception:
             return None
         if cacheable:
+            # Retried under the current recognizers and still no transcript:
+            # the cached prompt stands, and is now trusted for this chain.
+            retried_with = (
+                _reference_asr_identity()
+                if key == unresolved_key and recognition_found_nothing else ""
+            )
             with _prompt_cache_lock:
                 hit = _prompt_cache.get(key)
                 if hit is not None:
                     _prompt_cache.move_to_end(key)
+                    if retried_with:
+                        _unresolved_prompt_recognizers[key] = retried_with
                     return hit
         # A recalled passage is materialized only when neither cache hits.
         prompt = _prompt_disk_load(key) if cacheable else None
@@ -1278,7 +1577,22 @@ def _get_clone_prompt(
         encode_text = ref_text
         if passage_file is not None:
             encode_audio = passage_file
+            if prompt is None:
+                # Only when a prompt is actually built (a cache hit needs none).
+                encode_audio, encode_text, trimmed_file = _trim_selected_passage(
+                    passage_file, ref_text
+                )
         if prompt is None:
+            # Passage selection and trimming are done: unload the installed
+            # recognizers now, because the model's own fallback may load another
+            # Whisper and two speech models must not be resident together on a
+            # memory-tight host. No-op outside a serialized sidecar pass.
+            try:
+                from services.asr_backend import release_reference_asr_now
+
+                release_reference_asr_now()
+            except Exception:  # noqa: BLE001 — best-effort memory hygiene
+                logger.debug("early reference-ASR release failed", exc_info=True)
             try:
                 # Encode outside the lock (slow). Mirrors exactly what generate()
                 # would do inline for this ref (omnivoice.py:964-978), so output is
@@ -1304,16 +1618,24 @@ def _get_clone_prompt(
                 # layer turns a device OOM into the actionable GPU_OOM message
                 # ("close other GPU-heavy apps or unload models…"), which is a far
                 # better answer than walking into a native fault.
-                from core.failure import is_gpu_oom
+                from core.failure import is_gpu_oom, is_host_oom
 
+                if not is_gpu_oom(e) and is_host_oom(e):
+                    # #3340: the same rule for system RAM. The inline path
+                    # repeats this encode on the same CPU, and a CPU-only
+                    # Windows host that ran out there died with an access
+                    # violation inside the DAC encoder rather than raising.
+                    # There are no allocator caches to drop on the host, so
+                    # surface the HOST_MEMORY_EXHAUSTED remedy now.
+                    raise
                 if is_gpu_oom(e):
                     logger.warning(
                         "voice-clone prompt precompute hit a device OOM (%s) — "
                         "releasing allocator caches and retrying once", e,
                     )
                     try:
-                        from services.model_manager import free_vram
-                        free_vram()
+                        from services.model_manager import release_after_oom
+                        release_after_oom(e)
                     except Exception:  # noqa: BLE001 — reclaim is best-effort
                         logger.debug("VRAM reclaim before OOM retry failed", exc_info=True)
                     prompt = model.create_voice_clone_prompt(
@@ -1328,13 +1650,27 @@ def _get_clone_prompt(
                 _prompt_disk_save(key, prompt)
         if not store or not cacheable:
             return prompt
+        # Remember which recognizers could not transcribe this reference, so a
+        # later request only skips them while the selection is unchanged.
+        built_with = (
+            _reference_asr_identity()
+            if key == unresolved_key and recognition_found_nothing else ""
+        )
         with _prompt_cache_lock:
             _prompt_cache[key] = prompt
             _prompt_cache.move_to_end(key)
+            if built_with:
+                _unresolved_prompt_recognizers[key] = built_with
             while len(_prompt_cache) > _PROMPT_CACHE_MAX:
-                _prompt_cache.popitem(last=False)
+                evicted, _ = _prompt_cache.popitem(last=False)
+                _unresolved_prompt_recognizers.pop(evicted, None)
         return prompt
     finally:
+        if trimmed_file is not None:
+            try:
+                os.remove(trimmed_file)
+            except OSError:
+                logger.debug("failed to remove trimmed reference window")
         if passage_file is not None:
             try:
                 os.remove(passage_file)
@@ -1369,22 +1705,52 @@ def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
     # look the cache up, but never insert — see _get_clone_prompt(store=). MUST
     # be popped: the model's generate() has an explicit signature and would
     # TypeError on an unknown kwarg.
-    cache_ref = bool(gen_kw.pop("cache_ref", True))
-    # Stays in gen_kw too: the model needs it on the inline branch, and it is inert
-    # on the prompt branch (that prompt is already encoded).
-    preprocess_prompt = bool(gen_kw.get("preprocess_prompt", True))
-    prompt = (
-        _get_clone_prompt(model, ref_audio, ref_text, preprocess_prompt, store=cache_ref)
-        if ref_audio else None
-    )
-    if prompt is not None:
+    from services.model_manager import tts_inference
+
+    # tts_inference: no device move of the shared model while this runs, and
+    # it is restored first if an offload left it in RAM (#2618).
+    with engine_in_use(OmniVoiceBackend(model=model)), tts_inference():
+        cache_ref = bool(gen_kw.pop("cache_ref", True))
+        # Serialized sidecars only: unload the reference recognizer as soon as
+        # the prompt (or inline passage) exists, before the synthesis model
+        # runs. Popped for the same reason as cache_ref.
+        release_asr = bool(gen_kw.pop("release_reference_asr", False))
+        # Outcome of a reference transcription the caller already ran ("empty"
+        # or "failed"), so it is not repeated. Popped for the same reason.
+        reference_asr = gen_kw.pop("reference_asr", None)
+        if release_asr:
+            from services.asr_backend import release_reference_asr_after
+
+            def release_scope():
+                return release_reference_asr_after()
+        else:
+            release_scope = contextlib.nullcontext
+        # Stays in gen_kw too: the model needs it on the inline branch, and it is inert
+        # on the prompt branch (that prompt is already encoded).
+        preprocess_prompt = bool(gen_kw.get("preprocess_prompt", True))
+        with release_scope():
+            prompt = (
+                _get_clone_prompt(
+                    model, ref_audio, ref_text, preprocess_prompt,
+                    store=cache_ref, reference_asr=reference_asr,
+                )
+                if ref_audio else None
+            )
+        if prompt is not None:
+            try:
+                return model.generate(voice_clone_prompt=prompt, **gen_kw)
+            except Exception as e:  # noqa: BLE001 — fall back to the inline ref
+                logger.warning("voice_clone_prompt generate failed; retrying inline ref: %s", e)
+        with release_scope():
+            inline_audio, inline_text, passage = omnivoice_inline_reference(ref_audio, ref_text)
         try:
-            return model.generate(voice_clone_prompt=prompt, **gen_kw)
-        except Exception as e:  # noqa: BLE001 — fall back to the inline ref
-            logger.warning("voice_clone_prompt generate failed; retrying inline ref: %s", e)
-    return model.generate(
-        ref_audio=ref_audio, ref_text=omnivoice_ref_text(ref_audio, ref_text), **gen_kw
-    )
+            return model.generate(ref_audio=inline_audio, ref_text=inline_text, **gen_kw)
+        finally:
+            if passage is not None:
+                try:
+                    os.remove(passage)
+                except OSError:
+                    logger.debug("failed to remove reference window")
 
 
 def clear_clone_prompt_cache() -> None:
@@ -1393,6 +1759,7 @@ def clear_clone_prompt_cache() -> None:
     with _prompt_cache_lock:
         _prompt_cache.clear()
         _passage_choices.clear()
+        _unresolved_prompt_recognizers.clear()
 
 
 # NB: model_manager.release_tts_side_caches() calls clear_clone_prompt_cache()
@@ -1412,6 +1779,9 @@ class OmniVoiceBackend(TTSBackend):
 
     id = "omnivoice"
     display_name = "VoiceStudio (k2-fsa/OmniVoice, 600+ languages)"
+    instruct_vocabulary = "tags"
+    inline_tags = OMNIVOICE_INLINE_TAGS
+    supports_voice_design = True
     gpu_compat = ("cuda", "rocm", "mps", "cpu")
     # Derived from the pool's own per-job budget (_GPU_VRAM_PER_JOB_GB = 5.0 in
     # model_manager, itself measured from the ~1.6 GB forward + autoregressive
@@ -1461,10 +1831,12 @@ class OmniVoiceBackend(TTSBackend):
         except Exception as e:
             return False, f"omnivoice package missing: {e}"
 
+    _DEFAULT_SAMPLE_RATE = 24000
+
     @property
     def sample_rate(self) -> int:
         if self._model is None:
-            return 24000  # canonical OmniVoice rate
+            return self._DEFAULT_SAMPLE_RATE  # canonical OmniVoice rate
         return getattr(self._model, "sampling_rate", 24000)
 
     @property
@@ -1474,6 +1846,13 @@ class OmniVoiceBackend(TTSBackend):
 
     def _ensure_loaded(self):
         if self._model is not None:
+            # The cached instance skips get_model(), and with it the placement
+            # heal: put the shared model back on its device if the opt-in
+            # post-generation offload (#2618) or an unbalanced ASR offload
+            # (#1191) left it in RAM. One parameter probe when it is in place.
+            from services.model_manager import ensure_tts_on_device
+
+            ensure_tts_on_device()
             return
         # Reuse model_manager's cached instance so we don't double-load.
         from services.model_manager import get_model
@@ -1534,7 +1913,14 @@ class OmniVoiceBackend(TTSBackend):
         self._ensure_loaded()
         if not texts:
             return []
+        from services.model_manager import tts_inference
 
+        # Holds the shared model in place for prompt encoding + the batch
+        # generate (an offload can't move it mid-batch; #2618).
+        with tts_inference():
+            return self._generate_batch_on_model(texts, **kw)
+
+    def _generate_batch_on_model(self, texts: list[str], **kw) -> list[torch.Tensor]:
         def _items(value):
             if isinstance(value, list):
                 return value
@@ -1601,7 +1987,7 @@ class OmniVoiceBackend(TTSBackend):
         Delegates to ``model_manager.unload_shared_model`` rather than clearing
         the singleton here: this path used to free the device caches *before*
         dropping the shared reference, which frees nothing, and it is the path
-        the idle sweep on a headless worker node runs (#1495)."""
+        used by the idle engine sweep (#1495)."""
         self._model = None
         clear_clone_prompt_cache()  # #427: drop cached prompts so VRAM is freed
         try:
@@ -1803,10 +2189,12 @@ class VoxCPM2Backend(TTSBackend):
     id = "voxcpm2"
     display_name = "VoxCPM2 (30 langs, studio 48 kHz, voice design)"
     supports_voice_design = True
+    # Controllable cloning: instruct becomes the "(control)text" prefix.
+    instruct_directs_delivery = True
     # _prepare_voxcpm_ref keeps the first _VOXCPM_REF_MAX_S after silence trim.
     max_ref_seconds = _VOXCPM_REF_MAX_S
     ref_strategy = "head"
-    applies_own_mastering = True  # native 48 kHz studio output — skip apply_mastering()
+    applies_own_mastering = True  # Native studio-grade 48 kHz needs no apply_mastering().
     gpu_compat = ("cuda", "mps", "cpu")
 
     def __init__(self):
@@ -1831,9 +2219,11 @@ class VoxCPM2Backend(TTSBackend):
             return True, f"ready — {hint}"
         return True, "ready"
 
+    _DEFAULT_SAMPLE_RATE = 48000
+
     @property
     def sample_rate(self) -> int:
-        return 48000
+        return self._DEFAULT_SAMPLE_RATE
 
     @property
     def supported_languages(self) -> list[str]:
@@ -1858,8 +2248,15 @@ class VoxCPM2Backend(TTSBackend):
         logger.info("Loading VoxCPM2 from %s", checkpoint)
         # #1224: this first-use download is multi-GB. Unretried, a truncated
         # body at 90% aborted the load outright.
+        # #3567: voxcpm's default optimize=True wraps the model in
+        # torch.compile(mode="reduce-overhead"). Its CUDA graph trees are
+        # thread-local, and generation runs on a different worker thread than
+        # the load, so every CUDA generation asserted in cudagraph_trees. The
+        # isolated sidecar (engines/voxcpm2_subprocess) already loads this way.
         self._model = _retry_once_with_fresh_hf_client(
-            lambda: VoxCPM.from_pretrained(checkpoint, load_denoiser=False),
+            lambda: VoxCPM.from_pretrained(
+                checkpoint, load_denoiser=False, optimize=False
+            ),
             "VoxCPM2",
         )
 
@@ -1940,6 +2337,7 @@ class MossTTSNanoBackend(TTSBackend):
 
     id = "moss-tts-nano"
     display_name = "MOSS-TTS-Nano (20 langs, CPU realtime, 48 kHz)"
+    supports_voice_design = False  # strictly reference-cloning
     gpu_compat = ("cuda", "cpu")
 
     def __init__(self):
@@ -1980,9 +2378,11 @@ class MossTTSNanoBackend(TTSBackend):
             )
         return True, "ready"
 
+    _DEFAULT_SAMPLE_RATE = 48000
+
     @property
     def sample_rate(self) -> int:
-        return 48000  # native stereo 48 kHz
+        return self._DEFAULT_SAMPLE_RATE  # native stereo 48 kHz
 
     @property
     def supported_languages(self) -> list[str]:
@@ -2061,6 +2461,9 @@ class KittenTTSBackend(TTSBackend):
     # KittenTTS ships as an ONNX CPU graph; no CUDA/MPS path today.
     gpu_compat = ("cpu",)
     supports_cloning = False  # fixed preset voices only; ref_audio is ignored
+    # instruct is ignored too, so a Voice Design take would always be the same
+    # preset voice whatever the details or seed (#3413).
+    supports_voice_design = False
 
     PRESET_VOICES = [
         "expr-voice-2-m", "expr-voice-2-f",
@@ -2081,10 +2484,12 @@ class KittenTTSBackend(TTSBackend):
         except ImportError as e:
             return False, f"kittentts not installed: {e}"
 
+    _DEFAULT_SAMPLE_RATE = 24000
+
     @property
     def sample_rate(self) -> int:
         # KittenTTS emits 24 kHz mono per its ONNX model config.
-        return 24000
+        return self._DEFAULT_SAMPLE_RATE
 
     @property
     def supported_languages(self) -> list[str]:
@@ -2094,6 +2499,11 @@ class KittenTTSBackend(TTSBackend):
         if self._model is not None:
             return
         from kittentts import KittenTTS
+        from utils.espeak_data import ensure_espeak_data_path
+        # #3367: espeak-ng exit(1)s the process when it cannot open its data
+        # directory; resolve a path it accepts (or raise) before phonemizer
+        # initializes it inside the constructor below.
+        ensure_espeak_data_path()
         checkpoint = os.environ.get(
             "OMNIVOICE_KITTENTTS_MODEL", "KittenML/kitten-tts-mini-0.8"
         )
@@ -2287,7 +2697,15 @@ def resolve_kokoro_lang_code(language: str) -> str:
     """
     from mlx_audio.tts.models.kokoro.pipeline import ALIASES, LANG_CODES
 
-    key = language.strip().lower()
+    from core.language_variants import base_language, split_target
+
+    # Regional variants (#3143): "Portuguese (Portugal)" resolves like its base
+    # name, and a region tag Kokoro's own table lacks ("pt-pt") falls back to
+    # the base code. Text normalization has already applied the dialect.
+    key = str(base_language(language)).strip().lower()
+    base, region = split_target(key)
+    if region and key not in ALIASES and key not in LANG_CODES:
+        key = str(base)
     iso = _KOKORO_ISO_BY_FULL_NAME.get(key, key)
     code = ALIASES.get(iso, iso)
     if code not in LANG_CODES:
@@ -2304,6 +2722,177 @@ def resolve_kokoro_lang_code(language: str) -> str:
             f"multilingual engine (e.g. OmniVoice) for other languages."
         )
     return code
+
+
+def _harden_mlx_audio_eos_ids() -> None:
+    """Accept a single end-of-speech id from transformers 5 tokenizers.
+
+    mlx-audio's ``_eos_ids`` calls ``set(tokenizer.eos_token_ids)``; with
+    transformers 5 that attribute is one int, so OuteTTS (and any model using a
+    plain Hugging Face tokenizer) fails with "'int' object is not iterable".
+    """
+    try:
+        from mlx_audio.lm import generate as lm_generate
+    except ImportError:
+        return
+    original = getattr(lm_generate, "_eos_ids", None)
+    if original is None or getattr(original, "_accepts_int", False):
+        return
+
+    def _eos_ids(tokenizer):
+        value = getattr(tokenizer, "eos_token_ids", None)
+        if isinstance(value, int):
+            return {value}
+        return original(tokenizer)
+
+    _eos_ids._accepts_int = True
+    lm_generate._eos_ids = _eos_ids
+
+
+#: NLTK data MeloTTS English's g2p_en front end looks up on every call.
+_MELOTTS_NLTK_RESOURCES = (
+    ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+    ("taggers/averaged_perceptron_tagger.zip", "averaged_perceptron_tagger"),
+    ("corpora/cmudict.zip", "cmudict"),
+)
+
+
+def _ensure_melotts_text_frontend() -> None:
+    """Validate optional text resources locally, before importing g2p_en.
+
+    g2p_en downloads its legacy NLTK tagger and dictionary at import time.
+    Check those plus the modern English tagger first; generation must never
+    acquire resources behind the user's back.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    if importlib.util.find_spec("g2p_en") is None:
+        raise RuntimeError(
+            "MeloTTS English needs the optional 'g2p_en' text package. "
+            "Pick another MLX-Audio model or install it explicitly into "
+            "VoiceStudio's Python environment (uv pip install g2p_en)."
+        )
+    import nltk
+    from core.config import DATA_DIR
+
+    target = Path(DATA_DIR) / "nltk_data"
+    if str(target) not in nltk.data.path:
+        nltk.data.path.insert(0, str(target))
+    for lookup, package in _MELOTTS_NLTK_RESOURCES:
+        try:
+            nltk.data.find(lookup)
+        except LookupError as exc:
+            raise RuntimeError(
+                f"MeloTTS needs the local NLTK '{package}' data. "
+                "Install its resources explicitly in VoiceStudio's Python "
+                "environment: python -m nltk.downloader "
+                "averaged_perceptron_tagger averaged_perceptron_tagger_eng cmudict. "
+                "Generation does not download these resources."
+            ) from exc
+
+
+def _dia_tagged(text: str) -> str:
+    """Prefix a single-speaker ``[S1]`` tag unless the text already names speakers."""
+    stripped = text.strip()
+    return stripped if re.match(r"\[S[12]\]", stripped) else f"[S1] {stripped}"
+
+
+_OUTETTS_CODEC_SAMPLE_RATE = 24000  # mlx-audio's DAC speech codec
+
+
+def _outetts_reference_array(path: str):
+    """Mono float32 ``mx.array`` at the OuteTTS codec rate, as its in-memory branch expects."""
+    import mlx.core as mx
+    import numpy as np
+    from services.audio_io import load_audio
+    from mlx_audio.utils import resample_audio
+
+    audio, sample_rate = load_audio(path)
+    mono = audio.mean(dim=0).detach().cpu().numpy()
+    if sample_rate != _OUTETTS_CODEC_SAMPLE_RATE:
+        mono = resample_audio(mono, sample_rate, _OUTETTS_CODEC_SAMPLE_RATE, axis=0)
+    return mx.array(np.asarray(mono, dtype=np.float32))
+
+
+#: The Whisper checkpoint mlx-audio's OuteTTS transcribes a reference with.
+_OUTETTS_WHISPER_REPO = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+
+
+def _outetts_whisper_dir() -> str:
+    """Local snapshot of OuteTTS's speaker-building Whisper, never downloaded here.
+
+    mlx-audio resolves it with ``snapshot_download`` from inside the GPU-pool
+    worker, where the download deadlocked for the full 300 s watchdog (#2700).
+    Generation must not fetch models anyway, so a missing checkpoint fails
+    fast and names the catalogue entry that installs it.
+    """
+    from huggingface_hub import snapshot_download
+    from services.hf_revisions import revision_for
+
+    try:
+        return snapshot_download(
+            _OUTETTS_WHISPER_REPO,
+            revision=revision_for(_OUTETTS_WHISPER_REPO),
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "OuteTTS voice cloning needs its Whisper model to read the reference "
+            f"clip. Install \"{_OUTETTS_WHISPER_REPO}\" from the Model Catalogue, "
+            "then generate again."
+        ) from exc
+
+
+def _outetts_speaker_dir() -> str:
+    from core.config import DATA_DIR
+
+    return os.path.join(DATA_DIR, "outetts_speakers")
+
+
+_outetts_speaker_lock = threading.Lock()
+
+
+def _outetts_speaker_file(ref_audio: str) -> str:
+    """Path to an OuteTTS speaker profile for ``ref_audio``, built at most once.
+
+    The profile is keyed by the clip's path, size and mtime, so later
+    generations skip reloading Whisper and re-encoding the clip, and mlx-audio
+    no longer writes a fresh ``outetts_<uuid>.json`` on every call.
+    """
+    import hashlib
+
+    try:
+        st = os.stat(ref_audio)
+    except OSError as e:
+        raise TTSInputError("The reference audio file is missing or unreadable.") from e
+    digest = hashlib.sha256(
+        f"{os.path.abspath(ref_audio)}|{st.st_size}|{st.st_mtime_ns}".encode()
+    ).hexdigest()[:32]
+    path = os.path.join(_outetts_speaker_dir(), f"{digest}.json")
+    if os.path.isfile(path):
+        return path
+    # One build per clip at a time (parallel GPU workers can ask for the same
+    # clip), each writing its own temporary file so a replace never races.
+    with _outetts_speaker_lock:
+        if os.path.isfile(path):
+            return path
+        whisper_dir = _outetts_whisper_dir()
+        from mlx_audio.tts.models.outetts.audio_processor import AudioProcessor
+
+        processor = AudioProcessor()
+        speaker = processor.create_speaker_from_whisper(
+            _outetts_reference_array(ref_audio), whisper_model=whisper_dir,
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            processor.save_speaker(speaker, tmp)
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+    return path
 
 
 class MLXAudioBackend(TTSBackend):
@@ -2325,6 +2914,14 @@ class MLXAudioBackend(TTSBackend):
     # mlx is Apple-Silicon-only; CPU is the practical fallback when the
     # mlx framework is installed but the user lacks an Apple GPU.
     gpu_compat = ("mps", "cpu")
+    # generate() seeds mlx's RNG from the request's seed.
+    supports_generation_seed = True
+    cloning_model_keys = ("csm",)
+
+    @classmethod
+    def cloning_model_labels(cls) -> tuple[str, ...]:
+        labels = _MLX_AUDIO_MODEL_LABELS
+        return tuple(labels.get(model_key, model_key) for model_key in cls.cloning_model_keys)
 
     # A curated subset surfaced by default — the full mlx-audio roster is
     # larger but these cover the useful tiers: small multilingual (Kokoro),
@@ -2338,8 +2935,43 @@ class MLXAudioBackend(TTSBackend):
         "chatterbox":  "mlx-community/Chatterbox-TTS-4bit",
         "melotts":     "mlx-community/MeloTTS-English-v3-MLX",
         "outetts":     "mlx-community/Llama-OuteTTS-1.0-1B-4bit",
+        "voxcpm2":     "mlx-community/VoxCPM2-8bit",
     }
     DEFAULT_MODEL_KEY = "kokoro"
+
+    # Languages each curated model is documented to speak, as ISO 639-1 codes.
+    # Drives both the language picker and the synthesis guard, so neither can
+    # offer a language the model cannot say. Custom repos stay open-ended.
+    # Sources (model cards, checked 2026-09-29):
+    #   kokoro      huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
+    #   csm         huggingface.co/sesame/csm-1b ("some capacity for non-English
+    #               ... likely won't do well")
+    #   qwen3-tts   huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign (10 languages)
+    #   dia         huggingface.co/nari-labs/Dia-1.6B ("only supports English")
+    #   chatterbox  huggingface.co/ResembleAI/chatterbox (base model; Multilingual
+    #               is a separate checkpoint)
+    #   melotts     huggingface.co/mlx-community/MeloTTS-English-v3-MLX
+    #   outetts     huggingface.co/OuteAI/Llama-OuteTTS-1.0-1B (high + moderate
+    #               training-data tiers)
+    #   voxcpm2     huggingface.co/mlx-community/VoxCPM2-8bit (30 languages,
+    #               the same set as VoxCPM2Backend)
+    CURATED_MODEL_LANGUAGES: dict[str, tuple[str, ...]] = {
+        "kokoro": ("en", "es", "fr", "hi", "it", "pt", "ja", "zh"),
+        "csm": ("en",),
+        "qwen3-tts": ("zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"),
+        "dia": ("en",),
+        "chatterbox": ("en",),
+        "melotts": ("en",),
+        "outetts": (
+            "en", "ar", "zh", "nl", "fr", "de", "it", "ja", "ko", "lt", "ru", "es",
+            "pt", "be", "bn", "ka", "hu", "lv", "fa", "pl", "sw", "ta", "uk",
+        ),
+        "voxcpm2": (
+            "ar", "my", "zh", "da", "nl", "en", "fi", "fr", "de", "el",
+            "he", "hi", "id", "it", "ja", "km", "ko", "lo", "ms", "no",
+            "pl", "pt", "ru", "es", "sw", "sv", "tl", "th", "tr", "vi",
+        ),
+    }
 
     def __init__(self):
         self._model = None
@@ -2348,15 +2980,22 @@ class MLXAudioBackend(TTSBackend):
         # model picker) > default. Mirrors active_backend_id()'s resolution
         # order exactly so power-users can still pin a model without the UI
         # silently undoing it.
+        self._model_id = self.configured_identity()
+
+    @classmethod
+    def configured_identity(cls) -> str:
         from core import prefs
         key = prefs.resolve(
             "mlx_audio_model_id",
             env="OMNIVOICE_MLX_AUDIO_MODEL",
-            default=self.DEFAULT_MODEL_KEY,
+            default=cls.DEFAULT_MODEL_KEY,
         )
         # Accept either a curated key ("kokoro") or a full HF repo id
         # ("mlx-community/Kokoro-82M-bf16") — flexibility for power users.
-        self._model_id = self.CURATED_MODELS.get(key, key)
+        return cls.CURATED_MODELS.get(key, key)
+
+    def built_identity(self) -> Optional[str]:
+        return self._model_id
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
@@ -2387,45 +3026,48 @@ class MLXAudioBackend(TTSBackend):
     def model_identity(self) -> Optional[str]:
         return self._model_id
 
+    def _curated_key(self) -> Optional[str]:
+        return next(
+            (key for key, repo in self.CURATED_MODELS.items() if repo == self._model_id), None
+        )
+
+    def _check_language(self, language: object) -> Optional[str]:
+        # Kokoro's installed tables are authoritative and accept labels such
+        # as "British English" that the generic ISO check would reject.
+        if self._curated_key() == "kokoro":
+            if isinstance(language, str) and language.strip() and language.strip().lower() != "auto":
+                resolve_kokoro_lang_code(language)
+            return None
+        return super()._check_language(language)
+
     @property
     def supported_languages(self) -> list[str]:
-        # Per-model; Kokoro supports 8, Qwen3 ~4, Kugel 24. Return "multi"
-        # so the language picker doesn't gate by engine — each engine
-        # silently ignores languages it doesn't know.
-        return ["multi"]
+        # Per curated model; an arbitrary HF repo has no declared set.
+        declared = self.CURATED_MODEL_LANGUAGES.get(self._curated_key() or "")
+        return list(declared) if declared else ["multi"]
 
     @property
     def supports_cloning(self) -> bool:
         """Model-dependent — this adapter multiplexes 7+ curated models and
-        only some take a reference-audio speaker prompt. `generate()` passes
-        `ref_audio` through when present (~kwargs below) but silently retries
-        without it on a TypeError, so an engine picked for cloning that's
-        actually running Kokoro/Qwen3-TTS/etc. would clone nothing. Of the
+        only some take a reference-audio speaker prompt. Other models may
+        ignore reference audio even when their signatures accept it. Of the
         curated set, only CSM (`mlx-community/csm-1b-8bit`) is confirmed to
         accept a reference prompt — default False for every other model,
         curated or user-supplied, until positively confirmed."""
-        return self._model_id in {
-            self.CURATED_MODELS.get(key) for key in self.cloning_model_keys
-        }
-
-    #: The curated picks that take a reference prompt. Kept beside
-    #: ``supports_cloning`` above so the two cannot drift — the property reads
-    #: this list, and ``test_cloning_model_keys_match_supports_cloning``
-    #: instantiates the engine on each key to prove the claim.
-    cloning_model_keys = ("csm",)
-
-    @classmethod
-    def cloning_model_labels(cls) -> tuple[str, ...]:
-        # The picker calls it "CSM (voice cloning)"; quote it verbatim so the
-        # error names what the user is actually looking at.
-        return tuple(
-            _MLX_AUDIO_MODEL_LABELS.get(key, key) for key in cls.cloning_model_keys
-        )
+        return self._curated_key() in self.cloning_model_keys
 
     def _ensure_loaded(self):
         if self._model is not None:
             return
+        if self._curated_key() == "melotts":
+            _ensure_melotts_text_frontend()
+        elif self._curated_key() == "kokoro":
+            # #3367: Kokoro's misaki G2P falls back to espeak-ng, which
+            # exit(1)s on an unreadable data path.
+            from utils.espeak_data import ensure_espeak_data_path
+            ensure_espeak_data_path()
         from mlx_audio.tts.utils import load_model
+        _harden_mlx_audio_eos_ids()
         logger.info("Loading mlx-audio model %s", self._model_id)
         self._model = load_model(self._model_id)
 
@@ -2455,11 +3097,27 @@ class MLXAudioBackend(TTSBackend):
 
         # mlx-audio's generate(...) returns an iterator of result objects,
         # each with a .audio attribute. Different engines accept different
-        # kwargs (voice for Kokoro, ref_audio for CSM, instruct for Qwen3)
-        # — we pass them all and let the engine ignore what it doesn't use.
+        # kwargs (voice for Kokoro, ref_audio for CSM, instruct for Qwen3).
         kwargs = {"text": text, "speed": speed}
         if voice:     kwargs["voice"] = voice
         if ref_audio: kwargs["ref_audio"] = ref_audio
+        if self._curated_key() == "melotts":
+            _ensure_melotts_text_frontend()
+        if self._curated_key() == "dia":
+            # Dia is trained on speaker-tagged dialogue (huggingface.co/nari-labs/
+            # Dia-1.6B). Untagged text runs to the full audio length instead of
+            # stopping, which blew through the generation time limit.
+            kwargs["text"] = text = _dia_tagged(text)
+            if ref_text:
+                ref_text = _dia_tagged(ref_text)
+        if ref_audio and isinstance(ref_audio, str) and self._curated_key() == "outetts":
+            # mlx-audio's OuteTTS only defines its Whisper input on the
+            # in-memory branch, so a file path fails with UnboundLocalError
+            # ('resampled_audio'). It would also download Whisper inside the
+            # GPU worker and hang there (#2700). Build the speaker ourselves
+            # from the local checkpoint and hand mlx-audio the saved profile.
+            kwargs.pop("ref_audio")
+            kwargs["voice"] = _outetts_speaker_file(ref_audio)
         # The comment above claimed instruct was passed "for Qwen3"; it never
         # was. The curated `qwen3-tts` model IS the VoiceDesign variant, which
         # mlx-audio refuses to run without one — so the engine was unusable no
@@ -2480,8 +3138,10 @@ class MLXAudioBackend(TTSBackend):
         # stays empty and indexing into it raises an opaque
         # "IndexError: list index out of range" deep inside mlx-audio,
         # instead of ever attempting the clone. Community-diagnosed (#1012).
+        if ref_audio:
+            ref_text = required_reference_transcript(ref_audio, ref_text)
         if ref_audio and ref_text: kwargs["ref_text"] = ref_text
-        if language and language != "Auto":
+        if language and language.strip() and language.strip().lower() != "auto":
             if self._model_id == self.CURATED_MODELS.get("kokoro"):
                 # Kokoro's vendored pipeline hard-asserts `lang_code` against
                 # its own single-letter table — a bogus code crashes with an
@@ -2497,9 +3157,49 @@ class MLXAudioBackend(TTSBackend):
                 # entirely (Qwen3-TTS's own docstring: "lang_code: Language
                 # code (auto, chinese, english, etc.)" — a full name, not a
                 # 2-letter code). Kokoro's strict validation doesn't apply to
-                # them, so don't reject a language that's valid for whatever
-                # model is actually active.
-                kwargs["lang_code"] = language[:2].lower()
+                # them. Curated models are checked against their documented
+                # set instead of silently speaking a language they don't know.
+                self._check_language(language)
+                code = self._normalize_language_code(language)
+                if self._curated_key() == "qwen3-tts":
+                    # mlx-audio Qwen's codec_language_id uses full names.
+                    qwen_languages = {
+                        "zh": "chinese", "en": "english", "ja": "japanese",
+                        "ko": "korean", "de": "german", "fr": "french",
+                        "ru": "russian", "pt": "portuguese", "es": "spanish",
+                        "it": "italian",
+                    }
+                    mapped_language = qwen_languages.get(code)
+                    if mapped_language is not None:
+                        kwargs["lang_code"] = mapped_language
+                elif code is not None:
+                    kwargs["lang_code"] = code
+
+        # mlx samples from its own RNG, which torch.manual_seed never touches,
+        # so a new seed would otherwise give the same take (#3413).
+        seed = kw.get("seed")
+        if seed is not None:
+            import mlx.core as mx
+
+            mx.random.seed(int(seed))
+
+        # Filter only keywords the signature proves unsupported. A TypeError
+        # from generation (including iterator consumption) is a model failure,
+        # not a reason to rerun synthesis without the requested voice context.
+        generate = self._model.generate
+        try:
+            params = inspect.signature(generate).parameters
+        except (TypeError, ValueError):
+            pass  # Unknown signature: invoke unchanged and let errors propagate.
+        else:
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                kwargs = {
+                    key: value for key, value in kwargs.items()
+                    if key in params and params[key].kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                }
 
         def collect(results):
             groups = []
@@ -2530,11 +3230,7 @@ class MLXAudioBackend(TTSBackend):
             flush()
             return groups
 
-        try:
-            pieces = collect(self._model.generate(**kwargs))
-        except TypeError:
-            # Retry engines that accept only the universal arguments.
-            pieces = collect(self._model.generate(text=text, speed=speed))
+        pieces = collect(generate(**kwargs))
 
         if not pieces:
             raise RuntimeError(f"mlx-audio ({self._model_id}) produced no audio")
@@ -2570,6 +3266,9 @@ class CosyVoiceBackend(TTSBackend):
 
     id = "cosyvoice"
     display_name = "CosyVoice 3 (9 langs, zero-shot, instruct, Apache-2.0)"
+    # instruct + reference → inference_instruct2 (emotion, dialect, pace).
+    instruct_directs_delivery = True
+    inline_tags = COSYVOICE_INLINE_TAGS
     # CosyVoice's official inference path expects CUDA; CPU works but slow.
     # MPS support not verified upstream — flagged for Phase 6 confirmation.
     gpu_compat = ("cuda", "cpu")
@@ -2582,8 +3281,18 @@ class CosyVoiceBackend(TTSBackend):
         "ru": "<|ru|>",
     }
 
+    _ENDOFPROMPT = "<|endofprompt|>"
+    _SYSTEM_PROMPT = "You are a helpful assistant."
+
     def __init__(self):
         self._model = None
+
+    @classmethod
+    def _v3_prompt(cls, text: str) -> str:
+        """v3 wants the system prompt ahead of the prompt transcript or text."""
+        if cls._ENDOFPROMPT in text:
+            return text
+        return f"{cls._SYSTEM_PROMPT}{cls._ENDOFPROMPT}{text}"
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
@@ -2645,17 +3354,27 @@ class CosyVoiceBackend(TTSBackend):
         # 2. ref_audio + ref_text → inference_zero_shot (voice cloning)
         # 3. ref_audio only → inference_cross_lingual (with lang tag)
         # 4. nothing → inference_sft (built-in speakers, v1/SFT model only)
+        # CosyVoice 3 wants its system prompt ahead of every prompt, the
+        # same construction as the sidecar (engines/cosyvoice_subprocess).
+        v3 = type(self._model).__name__ == "CosyVoice3"
         pieces = []
         if instruct and ref_audio:
             # Instruct mode: "用四川话说<|endofprompt|>"
-            if not instruct.endswith("<|endofprompt|>"):
-                instruct = f"{instruct}<|endofprompt|>"
+            if not instruct.endswith(self._ENDOFPROMPT):
+                instruct = f"{instruct}{self._ENDOFPROMPT}"
+            if v3 and not instruct.startswith(self._SYSTEM_PROMPT):
+                instruct = f"{self._SYSTEM_PROMPT} {instruct}"
             results = self._model.inference_instruct2(
                 text, instruct, ref_audio, stream=False,
             )
         elif ref_audio and ref_text:
+            prompt_text = self._v3_prompt(ref_text) if v3 else ref_text
             results = self._model.inference_zero_shot(
-                text, ref_text, ref_audio, stream=False,
+                text, prompt_text, ref_audio, stream=False,
+            )
+        elif ref_audio and v3:
+            results = self._model.inference_cross_lingual(
+                self._v3_prompt(text), ref_audio, stream=False,
             )
         elif ref_audio:
             # Cross-lingual: prefix text with language tag if available.
@@ -2744,6 +3463,7 @@ class GPTSoVITSBackend(TTSBackend):
 
     id = "gpt-sovits"
     display_name = "GPT-SoVITS (5 langs, zero-shot, RTF 0.014, MIT)"
+    supports_voice_design = False  # api_v2 needs a reference clip for every request
     # Server-side; whichever device GPT-SoVITS itself uses (CUDA preferred).
     gpu_compat = ("cuda", "cpu")
 
@@ -2777,9 +3497,12 @@ class GPTSoVITSBackend(TTSBackend):
                     "python api_v2.py -a 127.0.0.1 -p 9880 -c "
                     "GPT_SoVITS/configs/tts_infer.yaml"
                 )
+            # The server answered, so it is up; it just refused the probe.
             return False, (
-                f"GPT-SoVITS server at {url} returned HTTP {exc.status}. "
-                "Check the server logs and access configuration."
+                f"GPT-SoVITS server at {url} answered the availability check "
+                f"with HTTP {exc.status}. Check the server logs and its access "
+                "configuration (a proxy or auth layer in front of it can block "
+                "this request)."
             )
         except Exception:
             # Connection refused / DNS failure / unsafe endpoint / etc.
@@ -2812,41 +3535,38 @@ class GPTSoVITSBackend(TTSBackend):
         }
         text_lang = lang_map.get(language.lower() if language else "en", "en")
 
-        # api_v2 takes a JSON body to /tts (api.py v1 took a query string
-        # at the root URL with different field names). The two protocols do
-        # not share a schema, so sending v1-shaped params to an api_v2
-        # server produces a 404 and a silent failure.
-        body: dict[str, object] = {
+        # api_v2 wants a reference clip on every call. A request-supplied clip
+        # (profile or upload) wins; plain TTS falls back to the environment.
+        from_request = bool(ref_audio)
+        if from_request:
+            clip = ref_audio
+            transcript = ref_text or ""
+            prompt_lang = "auto"  # a profile stores the output language, not the clip's
+        else:
+            clip = os.environ.get("OMNIVOICE_GPTSOVITS_REF_AUDIO") or None
+            transcript = (os.environ.get("OMNIVOICE_GPTSOVITS_REF_TEXT") or "") if clip else ""
+            env_lang = (os.environ.get("OMNIVOICE_GPTSOVITS_REF_LANG") or "").strip().lower()
+            prompt_lang = lang_map.get(env_lang, "auto")
+        if not clip:
+            raise TTSInputError(
+                "GPT-SoVITS api_v2 needs a reference clip for every request. "
+                "Pick a voice profile that has one, or set "
+                "OMNIVOICE_GPTSOVITS_REF_AUDIO (a path the GPT-SoVITS server "
+                "can read) together with OMNIVOICE_GPTSOVITS_REF_TEXT (what "
+                "the clip says) to give plain TTS a default voice."
+            )
+        body = {
             "text": text,
             "text_lang": text_lang,
+            "ref_audio_path": clip,
+            "prompt_text": transcript or "",
+            "prompt_lang": prompt_lang,
+            # VoiceStudio already chunks long text; ask the server not to
+            # re-split it into short fragments.
             "text_split_method": "cut0",
             "media_type": "wav",
             "streaming_mode": False,
         }
-        # api_v2 has no server-side default reference (api.py's -dr/-dt/-dl
-        # flags are v1 only) and answers 400 without one, so a plain TTS
-        # request — no voice profile — needs the clip from the environment.
-        # Profiles store the desired output language, not the reference's
-        # spoken language. Let api_v2 detect the reference transcript language
-        # independently, including mixed-language clips, instead of forcing
-        # it through the target language's phonemizer.
-        prompt_lang = "auto"
-        if not ref_audio:
-            ref_audio = os.environ.get("OMNIVOICE_GPTSOVITS_REF_AUDIO") or None
-            ref_text = os.environ.get("OMNIVOICE_GPTSOVITS_REF_TEXT", "") if ref_audio else ""
-            prompt_lang = lang_map.get(
-                os.environ.get("OMNIVOICE_GPTSOVITS_REF_LANG", "").lower(), "auto"
-            )
-        if not ref_audio:
-            raise TTSInputError(
-                "GPT-SoVITS (api_v2) needs a reference clip for every request: "
-                "pick a voice profile, or set OMNIVOICE_GPTSOVITS_REF_AUDIO (path "
-                "readable by the server) and OMNIVOICE_GPTSOVITS_REF_TEXT (its "
-                "transcript) as the default voice."
-            )
-        body["ref_audio_path"] = ref_audio
-        body["prompt_text"] = ref_text or ""
-        body["prompt_lang"] = prompt_lang
 
         speed = kw.get("speed", 1.0)
         if speed != 1.0:
@@ -2871,7 +3591,8 @@ class GPTSoVITSBackend(TTSBackend):
         # Parse the WAV response
         import io
         import torchaudio
-        wav, sr = torchaudio.load(io.BytesIO(audio_bytes))
+        from services.audio_io import load_audio
+        wav, sr = load_audio(io.BytesIO(audio_bytes))
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
         if wav.ndim == 1:
@@ -2882,6 +3603,45 @@ class GPTSoVITSBackend(TTSBackend):
 
 
 # ── Sherpa-ONNX adapter (universal ONNX runtime, WASM-ready) ───────────────
+
+
+def _sherpa_model_file(model_dir: str) -> Optional[str]:
+    """Locate the ONNX graph inside a sherpa-onnx voice directory.
+
+    ``model.onnx`` wins when present. Otherwise a directory holding exactly
+    one ``*.onnx`` file (how Piper voices are packaged, named after the voice)
+    uses that file. Nothing found, or several candidates, gives ``None``
+    rather than a guess.
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return None
+    preferred = os.path.join(model_dir, "model.onnx")
+    if os.path.isfile(preferred):
+        return preferred
+    candidates = [
+        os.path.join(model_dir, name)
+        for name in sorted(os.listdir(model_dir))
+        if name.lower().endswith(".onnx") and os.path.isfile(os.path.join(model_dir, name))
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _sherpa_vits_extras(model_dir: str) -> dict[str, str]:
+    """Optional phonemizer resources found next to a VITS/Piper model.
+
+    Keys match sherpa-onnx's VITS config fields: ``data_dir`` for an
+    ``espeak-ng-data`` folder and ``lexicon`` for a ``lexicon.txt`` file.
+    """
+    extras: dict[str, str] = {}
+    if not model_dir:
+        return extras
+    espeak_data = os.path.join(model_dir, "espeak-ng-data")
+    if os.path.isdir(espeak_data):
+        extras["data_dir"] = espeak_data
+    lexicon = os.path.join(model_dir, "lexicon.txt")
+    if os.path.isfile(lexicon):
+        extras["lexicon"] = lexicon
+    return extras
 
 
 class SherpaOnnxBackend(TTSBackend):
@@ -2908,6 +3668,7 @@ class SherpaOnnxBackend(TTSBackend):
     # baseline; CUDA provider is available on Linux/Windows installs.
     gpu_compat = ("cuda", "cpu")
     supports_cloning = False  # VITS speaker-id only; no ref_audio support
+    supports_voice_design = False  # speaker ids only; instruct is never read (#3413)
 
     def __init__(self):
         self._tts = None
@@ -2941,12 +3702,13 @@ class SherpaOnnxBackend(TTSBackend):
                 "restart VoiceStudio. Download models from "
                 "https://github.com/k2-fsa/sherpa-onnx/releases"
             )
-        if not os.path.isfile(os.path.join(model_dir, "model.onnx")):
+        if _sherpa_model_file(model_dir) is None:
             return False, (
-                f"No model.onnx in OMNIVOICE_SHERPA_MODEL ({model_dir}). Point "
-                "it at a sherpa-onnx TTS model directory containing model.onnx "
-                "+ tokens.txt. Download models from "
-                "https://github.com/k2-fsa/sherpa-onnx/releases"
+                f"OMNIVOICE_SHERPA_MODEL points to {model_dir!r}, but that directory "
+                "does not contain model.onnx or exactly one voice-named .onnx file. "
+                "Choose a sherpa-onnx TTS model directory containing that model and "
+                "tokens.txt (Piper archives use a per-voice filename). Download models "
+                "from https://github.com/k2-fsa/sherpa-onnx/releases"
             )
         return True, "ready"
 
@@ -2963,9 +3725,11 @@ class SherpaOnnxBackend(TTSBackend):
     def _ensure_loaded(self):
         if self._tts is not None:
             return
+
         ok, msg = self.is_available()
         if not ok:
             raise RuntimeError(f"Sherpa-ONNX unavailable: {msg}")
+
         import sherpa_onnx
 
         if not self._model_dir:
@@ -2974,26 +3738,25 @@ class SherpaOnnxBackend(TTSBackend):
                 "TTS model directory (containing model.onnx + tokens.txt)."
             )
 
-        # Auto-detect model type from directory contents
-        model_onnx = os.path.join(self._model_dir, "model.onnx")
-        tokens = os.path.join(self._model_dir, "tokens.txt")
-
-        if not os.path.isfile(model_onnx):
+        model_file = _sherpa_model_file(self._model_dir)
+        tokens_file = os.path.join(self._model_dir, "tokens.txt")
+        if model_file is None:
             raise RuntimeError(
                 f"No model.onnx found in {self._model_dir}. "
                 "Download a model from https://github.com/k2-fsa/sherpa-onnx/releases"
             )
 
         logger.info("Loading sherpa-onnx TTS from %s", self._model_dir)
-        tts_config = sherpa_onnx.OfflineTtsConfig(
+        config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=model_onnx,
-                    tokens=tokens,
-                ),
-            ),
+                    model=model_file,
+                    tokens=tokens_file,
+                    **_sherpa_vits_extras(self._model_dir),
+                )
+            )
         )
-        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._tts = sherpa_onnx.OfflineTts(config)
 
     def generate(self, text: str, **kw) -> torch.Tensor:
         import numpy as np
@@ -3063,6 +3826,11 @@ _LAZY_REGISTRY: dict[str, tuple[str, str]] = {
     # same import-cycle reason as the entries above (engines.audiocpp
     # imports services.tts_backend for TTSBackend).
     "audiocpp": ("engines.audiocpp", "AudioCPPBackend"),
+    # dots.tts SOAR on the same managed audio.cpp runtime (#2665): native on
+    # Windows too, unlike the venv `dots-tts` engine. Gated like `audiocpp`.
+    "audiocpp-dots": ("engines.audiocpp", "AudioCPPDotsBackend"),
+    # Community CosyVoice.cpp GGUF server, explicitly installed and isolated.
+    "cosyvoice-gguf": ("engines.cosyvoice_gguf", "CosyVoiceGGUFBackend"),
 }
 
 
@@ -3161,13 +3929,15 @@ _INSTALL_HINTS: dict[str, str] = {
     "indextts2":     "git clone --branch indextts-2.5 https://github.com/index-tts/index-tts.git && cd index-tts && uv venv .venv && uv pip install --python .venv/bin/python -e .  (Windows: .venv\\Scripts\\python.exe; NOT uv sync --all-extras)",
     "gpt-sovits":    "External API server — start api_v2.py on port 9880",
     "sherpa-onnx":   "pip install sherpa-onnx  (universal ONNX runtime, WASM-ready)",
-    "omnivoice-gguf":"Bundled — runs the C++ omnivoice-tts binary in bin/. Quants download lazily from Serveurperso/OmniVoice-GGUF on first generate.",
+    "omnivoice-gguf":"Bundled — runs the C++ omnivoice-tts binary in bin/. An installed quant pair is reused; a missing one downloads from Serveurperso/OmniVoice-GGUF (pinned revision) on first generate. Offline hosts: see docs/engines/omnivoice-gguf.md.",
     "supertonic3":   "uv sync --extra supertonic  (CPU-only ONNX, 31 langs, ~400 MB model on first use; OpenRAIL-M model license)",
     "pockettts":     "uv sync --extra pockettts  (Kyutai, CPU-only, ~100 MB model on first use; MIT code + CC-BY-4.0 weights; HF-gated, review terms and set HF_TOKEN)",
     "moss-tts-v15":  "git clone OpenMOSS/MOSS-TTS + set OMNIVOICE_MOSS_TTS_V15_DIR  (own venv, transformers==5.0; 8B, ~16 GB weights; CUDA/ROCm/XPU/NPU/CPU, no MPS; Apache-2.0)",
-    "dots-tts":      "git clone rednote-hilab/dots.tts + set OMNIVOICE_DOTS_TTS_DIR  (own venv, transformers==4.57; 2B, ~9 GB weights; CUDA/CPU, Linux/macOS only — no Windows; Apache-2.0)",
+    "dots-tts":      "git clone rednote-hilab/dots.tts + set OMNIVOICE_DOTS_TTS_DIR  (own venv, transformers==4.57; 2B, ~9 GB weights; CUDA/CPU, Linux/macOS only — on Windows use the audio.cpp dots.tts engine; Apache-2.0)",
     "confucius4-tts":"git clone netease-youdao/Confucius4-TTS + set OMNIVOICE_CONFUCIUS4_TTS_DIR  (own Python 3.10 venv; 14-lang cross-lingual zero-shot clone; ~5 GB weights auto-download; CUDA/ROCm/XPU/NPU/CPU, no MPS; Apache-2.0)",
     "audiocpp":     "download the matching audio.cpp v0.7.4 prebuilt + set OMNIVOICE_AUDIOCPP_BIN, then explicitly install Breeze-TTS-2 in Model Catalogue → Models  (native CPU/Vulkan/CUDA/Metal GGUF server, no Python; en+zh clone+design; ~4.73 GiB; weights research/non-commercial only)",
+    "audiocpp-dots": "download the matching audio.cpp v0.7.4 prebuilt (Model Catalogue installs it) + explicitly install dots.tts SOAR in Model Catalogue → Models  (native CPU/Vulkan/CUDA/Metal GGUF on Windows, macOS and Linux; multilingual voice cloning; ~3 GB; Apache-2.0)",
+    "cosyvoice-gguf": "Build Lourdle/cosyvoice.cpp at the documented pinned revision with Vulkan enabled; set OMNIVOICE_COSYVOICE_GGUF_DIR and install its GGUF/ONNX model assets from Model Catalogue (native Vulkan/CPU; no automatic runtime download).",
 }
 
 
@@ -3215,6 +3985,8 @@ _ENGINE_DOCS: dict[str, str] = {
     "supertonic3":          "docs/engines/supertonic3.md",
     "pockettts":            "docs/engines/pockettts.md",
     "audiocpp":             "docs/engines/audio-cpp.md",
+    "audiocpp-dots":        "docs/engines/audio-cpp.md",
+    "cosyvoice-gguf":       "docs/engines/cosyvoice-gguf.md",
 }
 
 
@@ -3245,6 +4017,7 @@ _MLX_AUDIO_MODEL_LABELS: dict[str, str] = {
     "chatterbox": "Chatterbox",
     "melotts":    "MeloTTS (lightweight)",
     "outetts":    "OuteTTS",
+    "voxcpm2":    "VoxCPM2 8-bit (30 languages, 48 kHz)",
 }
 
 
@@ -3268,15 +4041,27 @@ def _sidecar_installable_ids() -> frozenset[str]:
         return frozenset()
 
 
-def list_backends(*, include_hidden: bool = False) -> list[dict]:
-    """Enumerate the engine catalogue with each backend's availability state.
+def voice_design_support(cls) -> Optional[bool]:
+    """``supports_voice_design`` as reported to clients: a declared bool, or
+    None when the engine never declared it (or it depends on the model)."""
+    value = getattr(cls, "supports_voice_design", None)
+    return value if isinstance(value, bool) else None
 
-    On MPS, the canonical ``omnivoice`` id already resolves to the killable
-    OmniVoice sidecar. The explicit ``omnivoice-subprocess`` compatibility id
-    is therefore omitted from the normal catalogue so the picker does not
-    advertise two choices with the same runtime behavior. Internal callers
-    that must validate or preserve a stored compatibility id can pass
-    ``include_hidden=True``.
+
+def preset_voices_of(cls) -> list[str]:
+    """Built-in voice ids an engine class exposes for selection (empty if none)."""
+    voices = getattr(cls, "PRESET_VOICES", None)
+    if not isinstance(voices, (list, tuple)):
+        return []
+    return [v for v in voices if isinstance(v, str)]
+
+
+def list_backends(*, include_hidden: bool = False) -> list[dict]:
+    """Enumerate every registered backend with its availability state.
+
+    On MPS, the explicit ``omnivoice-subprocess`` compatibility entry is
+    omitted unless ``include_hidden`` is true. Internal callers validating or
+    retaining that stored id must opt in to hidden entries.
 
     Per-entry shape (ENGINE-05 + ENGINE-06):
 
@@ -3297,6 +4082,14 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
           "gpu_compat":     list[str],              # subset of {cuda, rocm, mps, vulkan, xpu, npu, cpu}
           "supports_cloning": Optional[bool],       # True/False from the class attr; None when
                                                     #   model-dependent (property, e.g. mlx-audio)
+          "instruct_vocabulary": "tags" | "freeform",  # how ``instruct`` is read: closed OmniVoice
+                                                    #   attribute list vs text used as written
+          "expression_caps": {"emotion": "graded" | "direction" | "none",
+                              "tags": list[str]},   # inline reaction tags it renders (#3422)
+          "supports_voice_design": Optional[bool],  # False = needs a reference clip;
+                                                    #   None = undeclared (design allowed)
+          "preset_voices":  list[str],              # built-in voice ids a request may pick (``voice``); [] = none
+          "default_voice":  Optional[str],          # preset used when none is picked
           "max_ref_seconds": Optional[float],       # seconds of a clone clip the engine uses
           "ref_strategy": Optional[str],            # "best_window" | "head" | "full"; None = unverified
           "effective_device": str,                  # device this engine uses on THIS host
@@ -3331,11 +4124,7 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
 
     out: list[dict] = []
     for bid, cls in _REGISTRY.items():
-        if (
-            not include_hidden
-            and caps.family == "mps"
-            and bid == "omnivoice-subprocess"
-        ):
+        if not include_hidden and caps.family == "mps" and bid == "omnivoice-subprocess":
             continue
         cls = _effective_backend_class(bid, cls, caps.family)
         try:
@@ -3357,7 +4146,7 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             isolation = "subprocess"
         else:
             isolation = "in-process"
-        from services.engine_routing import resolve_routing, runtime_compute_profile
+        from services.engine_routing import resolve_routing, runtime_compute_profile, uses_parent_torch
         try:
             profile = runtime_compute_profile(cls, caps)
         except Exception:
@@ -3369,7 +4158,10 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             profile = {
                 "gpu_compat": compat,
                 "min_vram_gb": floor,
-                **resolve_routing(compat, caps, floor),
+                **resolve_routing(
+                    compat, caps, floor,
+                    parent_torch=uses_parent_torch(cls),
+                ),
                 "runtime_backend": None,
                 "runtime_device_index": None,
                 "runtime_device_name": None,
@@ -3417,12 +4209,21 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             # upgrade hint). None unless ok and the message carries advice.
             "hint": _available_hint(msg) if ok else None,
             "supports_cloning": _clone if isinstance(_clone, bool) else None,
+            # Speech-to-speech conversion (#3421): Convert's "Keep my delivery".
+            "supports_voice_conversion": bool(getattr(cls, "supports_voice_conversion", False)),
             # Graded-emotion capability (#1208) — drives the Audiobook emotion
             # panel's engine gate. Class attr, defaults False.
             "supports_emotion": bool(getattr(cls, "supports_emotion", False)),
+            "instruct_vocabulary": getattr(cls, "instruct_vocabulary", "freeform"),
+            # Emotion mechanism + inline reaction tags the engine renders (#3422).
+            "expression_caps": expression_caps(cls),
+            # Voice Design gate: False hides Design for reference-only engines.
+            "supports_voice_design": voice_design_support(cls),
             # Reference-length truth (#2281): how much of a clone clip the
             # engine really uses and how it picks it. None = not verified.
             "max_ref_seconds": getattr(cls, "max_ref_seconds", None),
+            "preset_voices": preset_voices_of(cls),
+            "default_voice": getattr(cls, "DEFAULT_VOICE", None) if preset_voices_of(cls) else None,
             "ref_strategy": getattr(cls, "ref_strategy", None),
             "install_hint": _INSTALL_HINTS.get(bid),
             # Exact `export VAR=...` line for path-gated opt-in engines, or None.
@@ -3513,6 +4314,18 @@ def get_backend_class(backend_id: str) -> type[TTSBackend]:
     return _effective_backend_class(backend_id, _REGISTRY[backend_id])
 
 
+def output_sample_rate(backend_id: str) -> Optional[int]:
+    """Read a live rate or an adapter's declared default without loading a model."""
+    try:
+        if _active_instance is not None and _active_instance_id == backend_id:
+            rate = _active_instance.sample_rate
+        else:
+            rate = getattr(get_backend_class(backend_id), "_DEFAULT_SAMPLE_RATE", None)
+        return rate if isinstance(rate, int) and not isinstance(rate, bool) and rate > 0 else None
+    except Exception:
+        return None  # Model-specific or unavailable metadata remains unknown.
+
+
 def language_options(backend_id: str) -> Optional[list[str]]:
     """Picker names for a finite engine; None leaves unknown/model-specific sets open.
 
@@ -3520,16 +4333,24 @@ def language_options(backend_id: str) -> Optional[list[str]]:
     get_active_tts_backend here: discovery must not switch or unload an engine.
     """
     from omnivoice.utils.lang_map import LANG_NAME_TO_ID
+    from core.language_variants import with_variant_names
 
     backend = None
     try:
+        # The native OmniVoice adapters use this exact vocabulary at inference.
+        if backend_id in {"omnivoice", "omnivoice-subprocess", "omnivoice-gguf"}:
+            return with_variant_names(sorted(LANG_NAME_TO_ID))
         backend = get_backend_class(backend_id)()
+        if backend_id == "mlx-audio" and backend.model_identity() == backend.CURATED_MODELS.get("kokoro"):
+            return with_variant_names(_installed_kokoro_language_options())
         declared = backend.supported_languages
         if not declared or "multi" in declared:
             return None
         codes = {backend._normalize_language_code(code) for code in declared}
-        return sorted(name for name in LANG_NAME_TO_ID
-                      if backend._normalize_language_code(name) in codes)
+        candidates = set(LANG_NAME_TO_ID) | {"mandarin", "arabic", "tagalog"}
+        candidates.update(name.lower() for name in backend.language_display_names.values())
+        return with_variant_names(sorted(name for name in candidates
+                                         if backend._normalize_language_code(name) in codes))
     except Exception:  # Optional metadata must not take down discovery.
         logger.debug("Could not resolve language options for %s", backend_id, exc_info=True)
         return None
@@ -3547,46 +4368,112 @@ def language_options(backend_id: str) -> Optional[list[str]]:
                 atexit.unregister(shutdown)
 
 
+def rendered_dialects(backend_id: str) -> list[str]:
+    """Dialects the engine renders with their own accent (#3143).
+
+    Kokoro's only Portuguese voice set is Brazilian (``p`` = ``pt-br`` in its
+    own table), so it declares pt-BR; a pt-PT pick there still sounds
+    Brazilian and the UI says so. Never loads weights.
+    """
+    try:
+        cls = get_backend_class(backend_id)
+        if backend_id == "mlx-audio":
+            backend = cls()
+            if backend.model_identity() == backend.CURATED_MODELS.get("kokoro"):
+                return ["pt-BR"]
+        return list(getattr(cls, "rendered_dialects", ()) or ())
+    except Exception:  # Optional metadata must not take down discovery.
+        logger.debug("Could not resolve dialects for %s", backend_id, exc_info=True)
+        return []
+
+
+# The language tables shipped by the mlx-audio release this app is tested with
+# (mlx_audio/tts/models/kokoro/pipeline.py, 0.3–0.5). Used only when the
+# installed tables cannot be read, so Kokoro never falls back to "every
+# language" in the picker — synthesis would reject most of them (#977).
+_KOKORO_FALLBACK_TABLES = (
+    {"en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr-fr": "f", "fr": "f",
+     "hi": "h", "it": "i", "pt-br": "p", "pt": "p", "ja": "j", "zh": "z"},
+    {"a": "American English", "b": "British English", "e": "es", "f": "fr-fr",
+     "h": "hi", "i": "it", "p": "pt-br", "j": "Japanese", "z": "Mandarin Chinese"},
+)
+
+
+def _literal_table(node):
+    """Evaluate ``{...}`` or ``dict(key=value, ...)`` without executing code.
+
+    mlx-audio declares ``LANG_CODES = dict(a=..., ...)``; ``literal_eval``
+    alone rejects that call, which silently hid Kokoro's real language set.
+    """
+    import ast
+
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict"
+            and all(keyword.arg for keyword in node.keywords)):
+        table = {}
+        for argument in node.args:
+            table.update(ast.literal_eval(argument))
+        table.update({keyword.arg: ast.literal_eval(keyword.value) for keyword in node.keywords})
+        return table
+    return ast.literal_eval(node)
+
+
+def _installed_kokoro_language_options() -> list[str]:
+    """Read the installed model's literal tables without importing MLX or weights.
+
+    An unreadable or new package layout falls back to the tested release's
+    declared tables instead of leaving the picker open to every language.
+    """
+    import ast
+    from importlib import metadata
+    from omnivoice.utils.lang_map import LANG_NAME_TO_ID
+
+    try:
+        distribution = metadata.distribution("mlx-audio")
+        path = distribution.locate_file("mlx_audio/tts/models/kokoro/pipeline.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tables = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in {"ALIASES", "LANG_CODES"}:
+                        tables[target.id] = _literal_table(node.value)
+        aliases, languages = tables["ALIASES"], tables["LANG_CODES"]
+    except Exception:
+        logger.warning("Kokoro language tables unreadable; using the declared set", exc_info=True)
+        aliases, languages = _KOKORO_FALLBACK_TABLES
+    return sorted(name for name, code in LANG_NAME_TO_ID.items()
+                  if aliases.get(_KOKORO_ISO_BY_FULL_NAME.get(name, code), code) in languages)
+
+
 
 def cloning_unavailable_detail(engine_id: str, backend, cloning_purpose: str) -> str:
-    """Why the active engine can't clone, and the smallest change that fixes it.
+    """Explain a cloning refusal, including a model change when applicable."""
+    adapter_type = backend.__class__
+    class_capability = getattr(adapter_type, "supports_cloning", True)
+    picker_names: tuple[str, ...]
+    try:
+        label_method = getattr(adapter_type, "cloning_model_labels")
+        picker_names = tuple(filter(None, map(str, label_method())))
+    except Exception:
+        picker_names = ()
 
-    ``supports_cloning`` is an engine-level flag for every backend except the
-    adapters that multiplex models, where it is a property computed from the
-    *model* currently selected. For those, "this engine doesn't support voice
-    cloning" is simply untrue — the engine clones fine, just not with the pick
-    it is running. #2201 told an mlx-audio user to abandon the engine for one
-    of thirteen others while their own model picker was offering
-    "CSM (voice cloning)" one setting away.
-
-    So: name the model in the way, name the model that works, and keep the
-    engine list as the fallback it should always have been.
-    """
-    cls = type(backend)
-    declared = getattr(cls, "supports_cloning", True)
-    labels = tuple(cls.cloning_model_labels()) if hasattr(cls, "cloning_model_labels") else ()
     alternatives = ", ".join(cloning_capable_engine_ids())
-    # A plain bool is a fact about the engine; a property is a fact about the
-    # model, and only the second case has a model to switch to.
-    if not isinstance(declared, bool) and labels:
-        current = ""
+    if picker_names and not isinstance(class_capability, bool):
         try:
-            current = backend.model_identity() or ""
-        except Exception:  # noqa: BLE001 — naming the model is best-effort
-            current = ""
-        running = f" ({current})" if current else ""
+            current_model = str(backend.model_identity() or "").strip()
+        except Exception:
+            current_model = ""
+        model_suffix = f" (currently {current_model})" if current_model else ""
         return (
-            f"The '{engine_id}' engine can clone voices, but not with the model "
-            f"it is running{running}, so {cloning_purpose} can't preserve speaker "
-            f"voices. Set this engine's model to {' or '.join(labels)} in Model "
-            f"Catalogue — nothing else has to change — or switch engine to one "
-            f"of: {alternatives}."
+            f"'{engine_id}' supports reference voices, but its selected model{model_suffix} does not. "
+            f"That prevents {cloning_purpose} from retaining each speaker. Choose "
+            f"{' or '.join(picker_names)} for this engine in Model Catalogue; the remaining settings "
+            f"can stay as they are. You can instead choose one of these engines: {alternatives}."
         )
     return (
         f"The active TTS engine '{engine_id}' doesn't support voice cloning, "
         f"so {cloning_purpose} can't preserve speaker voices. Switch to one "
-        f"of: {alternatives} in "
-        "Model Catalogue, or use OmniVoice for this job."
+        f"of: {alternatives} in Model Catalogue, or use OmniVoice for this job."
     )
 
 
@@ -3624,8 +4511,6 @@ def active_routing() -> dict | None:
     """
     try:
         active = active_backend_id()
-        # The MPS picker intentionally hides the redundant compatibility id,
-        # but routing must still describe a saved or environment-pinned id.
         for b in list_backends(include_hidden=True):
             if b.get("id") == active:
                 return {
@@ -3706,6 +4591,38 @@ def reset_active_backend() -> None:
                            type(inst).__name__, exc)
 
 
+def ensure_engine_licence(cls) -> None:
+    """Refuse a TTS engine whose gated model licences the user has not accepted.
+
+    Checked on every resolution, not only at construction, so revoking
+    acceptance also stops an already-cached instance. Raises
+    ``ModelLicenceNotAccepted`` before any weights load or sidecar starts.
+    """
+    from services.model_acceptance import ensure_engine_accepted
+
+    engine_id = getattr(cls, "id", None)
+    if not engine_id:
+        return
+    try:
+        identity = cls.configured_identity()
+    except Exception:  # noqa: BLE001 — unknown model: gate every model the engine ships
+        identity = None
+    ensure_engine_accepted(engine_id, identity)
+
+
+def ensure_active_engine_licence() -> None:
+    """:func:`ensure_engine_licence` for the configured engine, before any routing.
+
+    For job entry points that may render remotely and so never reach the local
+    instance cache. An unknown engine id is left to the caller's own error.
+    """
+    try:
+        cls = get_backend_class(active_backend_id())
+    except ValueError:
+        return
+    ensure_engine_licence(cls)
+
+
 def get_active_tts_backend(*, model=None) -> TTSBackend:
     """Return the configured backend, reusing a cached instance and releasing
     the previous engine on a switch (MM2-01).
@@ -3723,6 +4640,9 @@ def get_active_tts_backend(*, model=None) -> TTSBackend:
     """
     global _active_instance, _active_instance_id, _active_mlx_model_key
     bid = active_backend_id()
+    cls = get_backend_class(bid)
+    # Before the switch below: a refused engine must not unload the working one.
+    ensure_engine_licence(cls)
 
     mlx_model_key = None
     if bid == "mlx-audio":
@@ -3742,7 +4662,7 @@ def get_active_tts_backend(*, model=None) -> TTSBackend:
     )
     if switching:
         try:
-            _active_instance.unload()
+            _retire_engine(_active_instance)
         except Exception as exc:  # noqa: BLE001
             logger.warning("engine switch: %s.unload() raised: %s",
                            type(_active_instance).__name__, exc)
@@ -3750,7 +4670,6 @@ def get_active_tts_backend(*, model=None) -> TTSBackend:
         _active_instance_id = None
         _active_mlx_model_key = None
 
-    cls = get_backend_class(bid)
     if cls is OmniVoiceBackend and model is not None:
         # Per-call view over the already-loaded shared singleton; don't cache it
         # (the model lifecycle is owned by model_manager), but the switch above
@@ -3790,6 +4709,18 @@ _ENGINE_LAST_USED: dict[type, float] = {}
 # exactly like an abandoned model — and the sweep would unload it out from
 # under the thread rendering it.
 _ENGINE_IN_USE: dict[type, int] = {}
+_RETIRED_ENGINES: dict[type, list[object]] = {}
+
+
+def _retire_engine(instance) -> None:
+    """Unload a replaced model once every request holding its class has finished."""
+    with _ENGINE_CACHE_LOCK:
+        if _ENGINE_IN_USE.get(type(instance)):
+            retired = _RETIRED_ENGINES.setdefault(type(instance), [])
+            if not any(old is instance for old in retired):
+                retired.append(instance)
+            return
+        instance.unload()
 
 def _idle_seconds_from_env(name: str, default: float, *, floor: float) -> float:
     """Read a tunable idle duration, ignoring anything unusable.
@@ -3835,13 +4766,20 @@ def engine_in_use(instance, *, now: Optional[float] = None):
     try:
         yield instance
     finally:
+        retired = []
         with _ENGINE_CACHE_LOCK:
             remaining = _ENGINE_IN_USE.get(cls, 1) - 1
             if remaining > 0:
                 _ENGINE_IN_USE[cls] = remaining
             else:
                 _ENGINE_IN_USE.pop(cls, None)
+                retired = _RETIRED_ENGINES.pop(cls, [])
             _ENGINE_LAST_USED[cls] = time.monotonic() if now is None else float(now)
+        for old in retired:
+            try:
+                old.unload()
+            except Exception:
+                logger.warning("retired engine unload failed", exc_info=True)
 
 
 def get_engine_instance(cls, *, now: Optional[float] = None):
@@ -3852,23 +4790,41 @@ def get_engine_instance(cls, *, now: Optional[float] = None):
     an extra sidecar process the first time the lock is acquired. One instance
     per process is the right move.
     """
+    ensure_engine_licence(cls)
+    stale = None
     with _ENGINE_CACHE_LOCK:
         inst = _ENGINE_INSTANCES.get(cls)
+        if inst is not None and _built_for_other_model(cls, inst):
+            # A model picked in Settings after this instance was built (mlx-audio's
+            # curated models) must take effect; otherwise the old model keeps
+            # speaking under the new name. A job still holding it keeps its copy.
+            stale = inst
+            inst = None
         if inst is None:
             inst = cls()
             _ENGINE_INSTANCES[cls] = inst
         _ENGINE_LAST_USED[cls] = time.monotonic() if now is None else float(now)
-        return inst
+    if stale is not None:
+        try:
+            _retire_engine(stale)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("model switch: %s.unload() raised: %s", type(stale).__name__, exc)
+    return inst
+
+
+def _built_for_other_model(cls, inst) -> bool:
+    try:
+        wanted = cls.configured_identity()
+    except Exception:  # noqa: BLE001 — a preference read must never block synthesis
+        return False
+    return wanted is not None and wanted != inst.built_identity()
 
 
 def get_engine_instance_for(engine_id: str, *, now: Optional[float] = None):
     """Cached instance of the TTS engine registered under ``engine_id``.
 
-    Deliberately NOT :func:`get_active_tts_backend`: that resolves
-    ``active_backend_id()``, i.e. *this machine's* Settings preference. On a
-    remote worker that would run whatever the worker's owner happens to prefer
-    while the control plane's slots, breaker history and result metadata are
-    keyed to the engine it believes ran — wrong audio, silently.
+    Deliberately NOT :func:`get_active_tts_backend`: callers provide the exact
+    engine identity instead of resolving the current Settings preference.
     """
     return get_engine_instance(get_backend_class(engine_id), now=now)
 
@@ -3958,6 +4914,7 @@ async def resolve_generation_backend(
             "Check Model Catalogue or the OMNIVOICE_TTS_BACKEND env var."
         ) from e
 
+    ensure_engine_licence(backend_cls)
     try:
         ok, msg = backend_cls.is_available()
     except Exception as exc:  # noqa: BLE001 — surface as an actionable ValueError
@@ -3987,6 +4944,21 @@ async def resolve_generation_backend(
         raise ValueError(cloning_unavailable_detail(engine_id, backend, cloning_purpose))
 
     return backend
+
+
+def voice_conversion_engine_ids() -> list[str]:
+    """Registered engines whose effective class converts speech to speech."""
+    return [
+        bid for bid, cls in _REGISTRY.items()
+        if getattr(_effective_backend_class(bid, cls), "supports_voice_conversion", False) is True
+    ]
+
+
+VOICE_CONVERSION_MISSING = (
+    "Keep my delivery needs an engine that converts a recording directly. "
+    "Install CosyVoice 3 from Model Catalogue → Engines, or turn off Keep my "
+    "delivery to re-speak the text instead."
+)
 
 
 # ── PEP 562 lazy attribute re-export ───────────────────────────────────────

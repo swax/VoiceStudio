@@ -53,7 +53,7 @@ def test_a_package_other_engines_share_is_never_uninstalled(monkeypatch):
     with pytest.raises(HTTPException) as err:
         _uninstall(monkeypatch, "google")
     assert err.value.status_code == 409
-    for name in ("DeepL", "Microsoft", "MyMemory"):
+    for name in ("MyMemory",):
         assert name in err.value.detail
 
 

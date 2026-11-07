@@ -4,7 +4,7 @@ Engine availability depends on installed models, hardware, and configured provid
 
 ## Features
 
-- **Voice Cloning**
+- **Voice Cloning** - [Audio quality, export precision, and local checks](audio-quality.md)
 - **Voice Design**
 - **Video Dubbing**
 - **Dictation Widget**
@@ -37,6 +37,8 @@ Engine availability depends on installed models, hardware, and configured provid
 - **Confucius4-TTS** — [Guide](engines/confucius4-tts.md)
 - pockettts
 - audiocpp — [Guide](engines/audio-cpp.md)
+- audiocpp-dots — [Guide](engines/audio-cpp.md)
+- CosyVoice 3 GGUF — [Vulkan setup](engines/cosyvoice-gguf.md)
 
 ## Transcription
 

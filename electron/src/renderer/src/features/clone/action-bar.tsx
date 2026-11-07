@@ -1,6 +1,11 @@
 import { PipelineFailure } from '@/components/pipeline-failure';
-import { openTake } from '@/lib/store/takes';
-import { setWorkspace } from '@/lib/store/workspace';
+import {
+  EngineSetupButton,
+  EngineSetupStatus,
+  useEngineSetup,
+  type EngineSetup,
+} from '@/components/engine-notice';
+import { AddTranscriptButton } from './add-transcript-button';
 import { Progress as ProgressPrimitive } from '@base-ui/react/progress';
 import {
   AudioLinesIcon,
@@ -21,26 +26,31 @@ import {
   XIcon,
   type LucideIcon,
 } from 'lucide-react';
-import { useId } from 'react';
-import { Link } from '@tanstack/react-router';
+import { useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/popover';
 import { Input } from '@/components/ui/input';
-import { Kbd } from '@/components/ui/kbd';
+import { Kbd, KbdGroup } from '@/components/ui/kbd';
+import { isMac } from '@/components/bridge';
 import { Label } from '@/components/ui/label';
 import { ProgressIndicator, ProgressTrack } from '@/components/ui/progress';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { useGenerateClone } from '@/hooks/use-generate';
 import {
-  resetOverrides,
+  resetVoiceControls,
   setCloneSetting,
   useCloneSettings,
   type CloneSettings,
 } from '@/lib/store/clone-settings';
 import { cn } from '@/lib/utils';
 import { EngineLanguagePicker } from './engine-language-picker';
+import { PresetVoicePicker } from './preset-voice-picker';
+import { CloneReadinessNotice } from './clone-readiness-notice';
+import { QualityControls } from './quality-controls';
+import { EmotionControls } from './emotion-controls';
+import { ExpressionTip } from './expression-tip';
 import { CloneDemoAction } from './clone-demo';
 import { useCloneDemo } from '@/hooks/use-clone-demo';
 
@@ -67,7 +77,7 @@ const SLIDERS: SliderSpec[] = [
   },
   {
     key: 'cfg',
-    labelKey: 'clone.cfg',
+    labelKey: 'voiceControls.guidance',
     icon: FocusIcon,
     min: 1,
     max: 4,
@@ -84,7 +94,7 @@ const SLIDERS: SliderSpec[] = [
   },
   {
     key: 'tShift',
-    labelKey: 'clone.tshift',
+    labelKey: 'voiceControls.timing',
     icon: TimerIcon,
     min: 0,
     max: 1,
@@ -92,7 +102,7 @@ const SLIDERS: SliderSpec[] = [
   },
   {
     key: 'posTemp',
-    labelKey: 'clone.pos_temp',
+    labelKey: 'voiceControls.order',
     icon: ThermometerIcon,
     min: 0,
     max: 10,
@@ -100,7 +110,7 @@ const SLIDERS: SliderSpec[] = [
   },
   {
     key: 'classTemp',
-    labelKey: 'clone.class_temp',
+    labelKey: 'voiceControls.variation',
     icon: ShuffleIcon,
     min: 0,
     max: 2,
@@ -108,7 +118,7 @@ const SLIDERS: SliderSpec[] = [
   },
   {
     key: 'layerPenalty',
-    labelKey: 'clone.layer_pen',
+    labelKey: 'voiceControls.balance',
     icon: LayersIcon,
     min: 0,
     max: 10,
@@ -132,23 +142,19 @@ function SliderRow({ spec, value }: SliderRowProps) {
   const labelId = useId();
   const Icon = spec.icon;
   return (
-    <div className="flex min-w-0 flex-col gap-2 rounded-lg bg-muted/40 p-3">
+    <div className="flex min-w-0 flex-col gap-2 px-1 py-2">
       <div className="flex items-center justify-between gap-2">
-        {/* Base UI names the thumb's <input> from the root's aria-labelledby. */}
-        <span
-          id={labelId}
-          className="inline-flex items-center gap-1.5 text-[length:var(--text-label)] font-medium"
-        >
+        <span id={labelId} className="inline-flex items-center gap-1.5 text-xs font-medium">
           <Icon className="size-3.5 text-muted-foreground" aria-hidden="true" />
           {t(spec.labelKey)}
         </span>
-        <output className="text-[length:var(--text-label)] text-primary tabular-nums">
+        <output className="text-xs text-primary tabular-nums">
           {value.toFixed(decimals(spec.step))}
           {spec.suffix ?? ''}
         </output>
       </div>
       <Slider
-        aria-labelledby={labelId}
+        thumbProps={{ 'aria-labelledby': labelId }}
         min={spec.min}
         max={spec.max}
         step={spec.step}
@@ -173,8 +179,8 @@ function SwitchRow({ settingKey, labelKey, icon: Icon, checked }: SwitchRowProps
   const { t } = useTranslation();
   const id = useId();
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg bg-muted/40 px-3 py-2.5">
-      <Label htmlFor={id} className="gap-1.5 text-[length:var(--text-label)]">
+    <div className="flex items-center justify-between gap-3 px-1 py-1.5">
+      <Label htmlFor={id} className="gap-1.5 text-xs font-medium">
         <Icon className="size-3.5 text-muted-foreground" aria-hidden="true" />
         {t(labelKey)}
       </Label>
@@ -195,62 +201,133 @@ function Overrides({ settings }: OverridesProps) {
   const { t } = useTranslation();
   const durationId = useId();
   return (
-    <div className="flex flex-col gap-3 pt-3">
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,200px),1fr))] gap-2">
-        {SLIDERS.map((spec) => (
-          <SliderRow key={spec.key} spec={spec} value={settings[spec.key]} />
-        ))}
-        <div className="flex min-w-0 flex-col gap-2 rounded-lg bg-muted/40 p-3">
-          <Label htmlFor={durationId} className="gap-1.5 text-[length:var(--text-label)]">
-            <ClockIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            {t('clone.duration')}
-          </Label>
-          <Input
-            id={durationId}
-            inputMode="decimal"
-            value={settings.duration}
-            onChange={(event) => setCloneSetting('duration', event.target.value)}
-            placeholder={t('clone.auto')}
-            className="h-7 text-[length:var(--text-label)] tabular-nums"
-          />
+    <div className="flex flex-col">
+      <div className="space-y-1 pb-3">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,150px),1fr))] gap-x-4">
+          {SLIDERS.filter((spec) => spec.key === 'speed').map((spec) => (
+            <SliderRow key={spec.key} spec={spec} value={settings[spec.key]} />
+          ))}
+          <div className="flex min-w-0 flex-col gap-2 px-1 py-2">
+            <Label htmlFor={durationId} className="gap-1.5 text-xs font-medium">
+              <ClockIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+              {t('clone.duration')}
+            </Label>
+            <Input
+              id={durationId}
+              inputMode="decimal"
+              value={settings.duration}
+              onChange={(event) => setCloneSetting('duration', event.target.value)}
+              placeholder={t('clone.auto')}
+              className="h-7 text-xs tabular-nums"
+            />
+          </div>
         </div>
+        <p className="px-1 text-[11px] text-muted-foreground">{t('voiceControls.basics')}</p>
       </div>
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,200px),1fr))] gap-2">
+      <div className="border-t border-border/50 py-1.5">
         <SwitchRow
           settingKey="denoise"
-          labelKey="clone.denoise"
+          labelKey="voiceControls.denoise"
           icon={AudioLinesIcon}
           checked={settings.denoise}
         />
         <SwitchRow
           settingKey="postprocess"
-          labelKey="clone.postprocess"
+          labelKey="voiceControls.polish"
           icon={SparklesIcon}
           checked={settings.postprocess}
         />
       </div>
-      <div className="flex justify-end">
-        <Button variant="ghost" size="xs" onClick={() => resetOverrides()}>
-          <RotateCcwIcon data-icon="inline-start" />
-          {t('clone.reset_overrides')}
-        </Button>
-      </div>
+      <details className="group border-t border-border/50 pt-2.5">
+        <summary className="flex cursor-pointer list-none items-center justify-between rounded px-1 text-xs text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          {t('voiceControls.advanced')}
+          <ChevronDownIcon
+            className="size-3.5 transition-transform group-open:rotate-180"
+            aria-hidden="true"
+          />
+        </summary>
+        <p className="mt-2 px-1 text-[11px] text-muted-foreground">{t('voiceControls.hint')}</p>
+        <div className="mt-1 grid gap-x-4 sm:grid-cols-2">
+          {SLIDERS.filter((spec) => spec.key !== 'speed' && spec.key !== 'steps').map((spec) => (
+            <SliderRow key={spec.key} spec={spec} value={settings[spec.key]} />
+          ))}
+        </div>
+      </details>
     </div>
+  );
+}
+
+function ResetVoiceControls() {
+  const { t } = useTranslation();
+  return (
+    <Button
+      variant="ghost"
+      size="icon-xs"
+      aria-label={t('clone.reset_overrides')}
+      title={t('clone.reset_overrides')}
+      onClick={resetVoiceControls}
+    >
+      <RotateCcwIcon aria-hidden="true" />
+    </Button>
   );
 }
 
 export function ProductionSettings() {
   const settings = useCloneSettings();
-  return <Overrides settings={settings} />;
+  return (
+    <div className="pt-3">
+      <Overrides settings={settings} />
+      <div className="flex justify-end pt-2">
+        <ResetVoiceControls />
+      </div>
+    </div>
+  );
 }
 
-export function ActionBar({
-  onOpenSettings,
-  settingsOpen = false,
-}: { onOpenSettings?: () => void; settingsOpen?: boolean } = {}) {
+/** Composer button that opens voice controls in the same popover style as audio quality. */
+export function VoiceControls({ size = 'icon-lg' }: { size?: 'icon-sm' | 'icon-lg' }) {
   const { t } = useTranslation();
   const settings = useCloneSettings();
+  const id = useId();
+  // Local, not persisted: a remembered open state would pop the panel over other pages.
+  const [open, setOpen] = useState(false);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        aria-label={t('clone.production_overrides')}
+        className={cn(
+          buttonVariants({ variant: 'ghost', size }),
+          'text-muted-foreground hover:text-foreground data-popup-open:bg-secondary data-popup-open:text-foreground',
+        )}
+      >
+        <Settings2Icon />
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="start"
+        sideOffset={10}
+        aria-labelledby={id}
+        className="flex max-h-[min(640px,var(--available-height))] w-[min(420px,calc(100vw-32px))] flex-col p-0"
+      >
+        <header className="flex shrink-0 items-center justify-between gap-3 px-4 pt-3 pb-1">
+          <h3 id={id} className="text-sm font-semibold">
+            {t('clone.production_overrides')}
+          </h3>
+          <ResetVoiceControls />
+        </header>
+        <div className="min-h-0 overflow-y-auto overscroll-contain px-3 pb-3">
+          <Overrides settings={settings} />
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** Render the Voice Cloning composer including engine-aware emotion controls. */
+export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+  const { t } = useTranslation();
   const demo = useCloneDemo();
+  const mac = isMac();
   const readinessId = useId();
   const {
     generate,
@@ -262,6 +339,7 @@ export function ActionBar({
     modelStage,
     modelProgress,
     error,
+    errorTopic,
     clearError,
     cloneBlocker: blocker,
   } = useGenerateClone();
@@ -278,172 +356,115 @@ export function ActionBar({
               : 'clone.generating_status',
       )
     : t('clone.synthesize');
+  // Not ready: the primary action is the setup that fixes it, not a dead Synthesize.
+  // The page passes its own setup so a download outlives the notice above.
+  const own = useEngineSetup('clone');
+  const setup = shared ?? own;
+  const needsSetup = blocker === 'engine' && !demo && !isGenerating;
 
   return (
     <section className="@container/composer">
-      {blocker && !isGenerating && (
-        <div
-          id={readinessId}
-          className="mb-3 flex flex-wrap items-center justify-between gap-2 px-1 text-sm text-muted-foreground"
-        >
-          <span role="status">
-            {t(
-              blocker === 'engine'
-                ? demo
-                  ? 'demo.prerendered_chip'
-                  : 'engines.none_ready_title'
-                : blocker === 'reference'
-                  ? 'tts_errors.upload_or_select'
-                  : blocker === 'text'
-                    ? 'tts_errors.enter_text'
-                    : 'preferences.loading',
-            )}
-          </span>
-          {blocker === 'reference' && (
-            <div className="flex gap-1">
-              <Button
-                variant="ghost"
-                size="xs"
-                onClick={() => {
-                  openTake(null);
-                  setWorkspace({ panel: 'voice' });
-                }}
-              >
-                {t('clone.reference_audio')}
-              </Button>
-              <Button
-                variant="ghost"
-                size="xs"
-                onClick={() => setWorkspace({ libraryOpen: true, libraryTab: 'voices' })}
-              >
-                {t('clone.saved_profiles')}
-              </Button>
-            </div>
-          )}
-          {blocker === 'engine' && !demo && (
-            <Link
-              to="/settings/models/$family"
-              params={{ family: 'tts' }}
-              className={buttonVariants({ variant: 'ghost', size: 'xs' })}
-            >
-              {t('engineSidebar.tts')}
-            </Link>
-          )}
-        </div>
+      {needsSetup ? (
+        <EngineSetupStatus setup={setup} id={readinessId} />
+      ) : (
+        blocker &&
+        !isGenerating && <CloneReadinessNotice id={readinessId} blocker={blocker} demo={demo} />
       )}
-      {error && <PipelineFailure className="mb-3" fallback={error} onDismiss={clearError} />}
+      {error && (
+        <PipelineFailure
+          className="mb-3"
+          fallback={error}
+          topic={errorTopic}
+          action={errorTopic === 'REFERENCE_STT_MISSING' ? <AddTranscriptButton /> : undefined}
+          onDismiss={clearError}
+        />
+      )}
+      {!demo && !isGenerating && <ExpressionTip />}
       <div className="flex flex-wrap items-center gap-3">
-        {onOpenSettings ? (
-          <div className="flex items-center gap-1 rounded-lg bg-background/50 p-1 ring-1 ring-border/50">
-            <EngineLanguagePicker />
-            <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
-            <Button
-              variant={settingsOpen ? 'secondary' : 'ghost'}
-              size="icon-lg"
-              aria-label={t('clone.production_overrides')}
-              aria-expanded={settingsOpen}
-              onClick={onOpenSettings}
-            >
-              <Settings2Icon />
-            </Button>
-          </div>
-        ) : (
-          <Popover
-            open={settings.showOverrides}
-            onOpenChange={(open) => setCloneSetting('showOverrides', open)}
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="min-w-0">
-                <EngineLanguagePicker />
-              </div>
-              <PopoverTrigger
-                className={cn(
-                  'inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-[length:var(--text-label)] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50',
-                  settings.showOverrides && 'bg-muted text-foreground',
-                )}
-              >
-                <Settings2Icon className="size-3.5" aria-hidden="true" />
-                {t('clone.production_overrides')}
-                <ChevronDownIcon
-                  className={cn(
-                    'size-3.5 transition-transform',
-                    settings.showOverrides && 'rotate-180',
-                  )}
-                  aria-hidden="true"
-                />
-              </PopoverTrigger>
-            </div>
-            <PopoverContent
-              side="top"
-              align="end"
-              className="max-h-[65vh] w-[min(560px,calc(100vw-48px))] overflow-y-auto p-4"
-            >
-              <Overrides settings={settings} />
-            </PopoverContent>
-          </Popover>
-        )}
+        <div className="flex items-center gap-1 rounded-lg bg-background/50 p-1 ring-1 ring-border/50">
+          <EngineLanguagePicker />
+          <PresetVoicePicker disabled={isGenerating} />
+          <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
+          <QualityControls disabled={isGenerating} />
+          <VoiceControls />
+          <EmotionControls disabled={isGenerating} />
+        </div>
 
-        <div className="ml-auto flex items-center gap-4">
-          <div className="relative flex w-64 shrink-0 flex-col gap-1">
-            <div className="flex gap-2">
-              {demo ? (
-                <CloneDemoAction />
+        <div className="relative ml-auto flex shrink-0 gap-2">
+          {demo ? (
+            <CloneDemoAction />
+          ) : needsSetup ? (
+            <EngineSetupButton
+              setup={setup}
+              primary
+              className="h-10 w-60 max-w-full shrink-0 rounded-lg px-4 shadow-sm"
+            />
+          ) : (
+            <Button
+              size="lg"
+              className="h-10 w-60 max-w-full shrink-0 justify-between overflow-hidden rounded-lg ps-4 pe-2.5 shadow-sm transition-colors"
+              onClick={() => void generate()}
+              disabled={isGenerating || blocker !== null}
+              aria-describedby={blocker ? readinessId : undefined}
+              aria-busy={isGenerating}
+              aria-label={generationLabel}
+              aria-keyshortcuts="Control+Enter Meta+Enter"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                {isGenerating ? (
+                  <LoaderCircleIcon className="shrink-0 animate-spin motion-reduce:animate-none" />
+                ) : (
+                  <PlayIcon className="shrink-0" />
+                )}
+                <span className="min-w-0 truncate" role={isGenerating ? 'status' : undefined}>
+                  {generationLabel}
+                </span>
+              </span>
+              {isGenerating ? (
+                <span className="shrink-0 text-xs font-normal tabular-nums opacity-80">
+                  {`${modelProgress != null && stage === 'loading' ? `${Math.round(modelProgress)}% · ` : ''}${elapsedSeconds.toFixed(1)}s`}
+                </span>
               ) : (
-                <Button
-                  size="lg"
-                  className="h-10 w-52 shrink-0 overflow-hidden rounded-lg px-4 shadow-sm transition-colors"
-                  onClick={() => void generate()}
-                  disabled={isGenerating || blocker !== null}
-                  aria-describedby={blocker ? readinessId : undefined}
-                  aria-busy={isGenerating}
-                  aria-label={generationLabel}
-                >
-                  {isGenerating ? (
-                    <LoaderCircleIcon className="animate-spin motion-reduce:animate-none" />
-                  ) : (
-                    <PlayIcon data-icon="inline-start" />
+                <KbdGroup aria-hidden="true" className="shrink-0">
+                  {[mac ? '⌘' : 'Ctrl', '↵'].map((key) => (
+                    <Kbd
+                      key={key}
+                      className="h-5 min-w-5 rounded-[5px] bg-primary-foreground/15 px-1 text-[11px] text-primary-foreground/85 shadow-[inset_0_-1px_0_rgb(0_0_0/18%)]"
+                    >
+                      {key}
+                    </Kbd>
+                  ))}
+                </KbdGroup>
+              )}
+            </Button>
+          )}
+          {isGenerating && !demo ? (
+            <Button
+              size="icon-lg"
+              className="size-10 shrink-0"
+              variant="outline"
+              onClick={() => cancel()}
+              aria-label={t('clone.cancel_generation')}
+            >
+              <XIcon data-icon="inline-start" />
+            </Button>
+          ) : null}
+          {isGenerating ? (
+            <ProgressPrimitive.Root
+              value={stage === 'loading' ? modelProgress : progress}
+              aria-label={t('clone.generating_status')}
+              className="absolute inset-x-1 -bottom-2"
+            >
+              <ProgressTrack>
+                <ProgressIndicator
+                  className={cn(
+                    (stage === 'loading' ? modelProgress : progress) == null &&
+                      'w-full animate-pulse motion-reduce:animate-none',
                   )}
-                  <span className="min-w-0 truncate" role={isGenerating ? 'status' : undefined}>
-                    {generationLabel}
-                  </span>
-                </Button>
-              )}
-              {isGenerating && !demo ? (
-                <Button
-                  size="icon-lg"
-                  className="size-10 shrink-0"
-                  variant="outline"
-                  onClick={() => cancel()}
-                  aria-label={t('clone.cancel_generation')}
-                >
-                  <XIcon data-icon="inline-start" />
-                </Button>
-              ) : null}
-            </div>
-            <div className="h-5 w-52 text-right text-xs text-muted-foreground tabular-nums">
-              {demo ? null : isGenerating ? (
-                `${modelProgress != null && stage === 'loading' ? `${Math.round(modelProgress)}% · ` : ''}${elapsedSeconds.toFixed(1)}s`
-              ) : (
-                <Kbd className="bg-transparent shadow-none ring-0">{t('clone.shortcut_hint')}</Kbd>
-              )}
-            </div>
-            {isGenerating ? (
-              <ProgressPrimitive.Root
-                value={stage === 'loading' ? modelProgress : progress}
-                aria-label={t('clone.generating_status')}
-                className="absolute inset-x-0 bottom-0"
-              >
-                <ProgressTrack>
-                  <ProgressIndicator
-                    className={cn(
-                      (stage === 'loading' ? modelProgress : progress) == null &&
-                        'w-full animate-pulse motion-reduce:animate-none',
-                    )}
-                  />
-                </ProgressTrack>
-              </ProgressPrimitive.Root>
-            ) : null}
-          </div>
+                />
+              </ProgressTrack>
+            </ProgressPrimitive.Root>
+          ) : null}
         </div>
       </div>
     </section>

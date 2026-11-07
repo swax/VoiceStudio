@@ -1,14 +1,16 @@
-import { getBridge, isMac } from '@/components/bridge';
+import { HomeFeatureIcon } from './home-feature-icon';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { getBridge } from '@/components/bridge';
+import { runRendererTask } from '@/lib/global-error-recovery';
+import { HomeContributors } from './home-contributors';
+import './home-page.css';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { ProfileAvatar } from '@/components/profile-avatar';
 import { Button } from '@/components/ui/button';
-import { useHistory } from '@/hooks/use-history';
 import { useProfiles } from '@/hooks/use-profiles';
-import { brandArtwork, brandIcon } from '@/lib/brand';
+import { brandArtwork } from '@/lib/brand';
 import { patchCloneSettings } from '@/lib/store/clone-settings';
-import { setWorkspace, useWorkspace } from '@/lib/store/workspace';
 import { selectCloneProfile } from '@/lib/store/reference';
-import { openTake } from '@/lib/store/takes';
 import { blankLongformDraft, editLongform } from '@/features/longform/longform-session';
 import { projectLibrary, type LongformProject } from '@/features/longform/project-library';
 import { openDubProject } from '@/features/dub/dub-session';
@@ -16,31 +18,25 @@ import type { DubProject } from '@/features/projects/project-format';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { apiJson } from '@/lib/api/client';
-import { readDraft, restoreDesignProfile, writeDraft } from '@/features/design/design-draft';
+import {
+  readDraft,
+  replaceRecipe,
+  restoreDesignProfile,
+  writeDraft,
+} from '@/features/design/design-draft';
 import {
   ArrowRightIcon,
   AudioLinesIcon,
   BookOpenIcon,
   FilmIcon,
-  FingerprintIcon,
   FolderOpenIcon,
-  LibraryIcon,
-  MicIcon,
-  PanelLeftOpenIcon,
-  WandSparklesIcon,
-  WrenchIcon,
-  WorkflowIcon,
-  type LucideIcon,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { runRendererTask } from '@/lib/global-error-recovery';
 
 interface Destination {
   to: string;
   label: string;
   description: string;
-  Icon: LucideIcon;
-  count?: number;
 }
 
 interface ExportRecord {
@@ -50,19 +46,31 @@ interface ExportRecord {
   mode?: string;
 }
 
+const iconTones: Record<string, string> = {
+  '/clone':
+    'bg-sky-100 text-sky-700 ring-sky-300/60 dark:bg-sky-400/15 dark:text-sky-300 dark:ring-sky-300/30',
+  '/design':
+    'bg-violet-100 text-violet-700 ring-violet-300/60 dark:bg-violet-400/15 dark:text-violet-300 dark:ring-violet-300/30',
+  '/dub':
+    'bg-teal-100 text-teal-700 ring-teal-300/60 dark:bg-teal-400/15 dark:text-teal-300 dark:ring-teal-300/30',
+  '/stories':
+    'bg-rose-100 text-rose-700 ring-rose-300/60 dark:bg-rose-400/15 dark:text-rose-300 dark:ring-rose-300/30',
+  '/audiobook':
+    'bg-amber-100 text-amber-800 ring-amber-300/60 dark:bg-amber-400/15 dark:text-amber-200 dark:ring-amber-300/30',
+  '/gallery':
+    'bg-fuchsia-100 text-fuchsia-700 ring-fuchsia-300/60 dark:bg-fuchsia-400/15 dark:text-fuchsia-300 dark:ring-fuchsia-300/30',
+  '/transcriptions':
+    'bg-cyan-100 text-cyan-700 ring-cyan-300/60 dark:bg-cyan-400/15 dark:text-cyan-200 dark:ring-cyan-300/30',
+  '/workflows':
+    'bg-indigo-100 text-indigo-700 ring-indigo-300/60 dark:bg-indigo-400/15 dark:text-indigo-300 dark:ring-indigo-300/30',
+  '/tools':
+    'bg-slate-100 text-slate-700 ring-slate-300/60 dark:bg-slate-300/15 dark:text-slate-200 dark:ring-slate-300/30',
+};
+
 export function HomePage() {
   const { t } = useTranslation();
-  const { libraryOpen } = useWorkspace();
   const navigate = useNavigate();
-  const openSite = () => {
-    const bridge = getBridge();
-    const url =
-      'https://voicestudio.sh/?utm_source=voicestudio&utm_medium=desktop&utm_campaign=home_banner';
-    if (bridge) void bridge.files.openExternal(url);
-    else window.open(url, '_blank', 'noopener,noreferrer');
-  };
   const { data: profiles = [] } = useProfiles();
-  const { data: history = [] } = useHistory();
   const { data: exports = [] } = useQuery({
     queryKey: ['export-history'],
     queryFn: ({ signal }) => apiJson<ExportRecord[]>('/export/history', { signal }),
@@ -76,64 +84,51 @@ export function HomePage() {
     queryKey: ['longform-projects'],
     queryFn: projectLibrary.list,
   });
-  const cloned = profiles.filter((profile) => profile.kind !== 'design');
-  const designed = profiles.filter((profile) => profile.kind === 'design');
   const destinations: Destination[] = [
     {
       to: '/clone',
       label: t('nav.clone'),
       description: t('clone.reference_hint'),
-      Icon: FingerprintIcon,
-      count: cloned.length,
     },
     {
       to: '/design',
       label: t('designWorkspace.title'),
-      description: t('clone.describe_hint'),
-      Icon: WandSparklesIcon,
-      count: designed.length,
+      description: t('homeUi.design'),
     },
     {
       to: '/dub',
       label: t('dubWorkspace.title'),
-      description: t('dub.supported_formats'),
-      Icon: FilmIcon,
+      description: t('homeUi.dub'),
     },
     {
       to: '/stories',
       label: t('nav.stories'),
-      description: t('stories.subtitle'),
-      Icon: AudioLinesIcon,
+      description: t('homeUi.stories'),
     },
     {
       to: '/audiobook',
       label: t('audiobook.title'),
-      description: t('audiobook.subtitle'),
-      Icon: BookOpenIcon,
+      description: t('homeUi.audiobook'),
     },
     {
       to: '/gallery',
       label: t('nav.gallery'),
       description: t('gallery.subtitle'),
-      Icon: LibraryIcon,
     },
     {
       to: '/transcriptions',
       label: t('nav.transcribe'),
-      description: t('demo.dictation_lede'),
-      Icon: MicIcon,
+      description: t('homeUi.transcribe'),
     },
     {
-      to: '/calls',
+      to: '/workflows',
       label: t('workflows.title'),
       description: t('workflows.description'),
-      Icon: WorkflowIcon,
     },
     {
       to: '/tools',
       label: t('tools.title'),
       description: t('tools.desc'),
-      Icon: WrenchIcon,
     },
   ];
   const recentProjects = [
@@ -170,16 +165,21 @@ export function HomePage() {
       to: item.project.mode === 'stories' ? '/stories' : '/audiobook',
     });
   };
+  /** Open a saved voice in its original creation workflow and restore settings. */
   const useProfile = async (profile: (typeof profiles)[number]) => {
     if (profile.kind === 'design') {
       const current = readDraft();
       const restored = restoreDesignProfile(profile, current.seed);
-      writeDraft({
-        ...current,
-        attrs: restored.attrs,
-        seed: restored.seed,
-        profileId: restored.profileId,
-      });
+      writeDraft(
+        replaceRecipe(current, {
+          attrs: restored.attrs,
+          seed: restored.seed,
+          profileId: restored.profileId,
+          description: restored.description,
+          picks: restored.picks,
+          mapped: restored.mapped,
+        }),
+      );
       patchCloneSettings({ language: restored.language });
       await navigate({ to: '/design' });
       return;
@@ -190,20 +190,7 @@ export function HomePage() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <WorkspaceHeader>
-        {isMac() &&
-          (libraryOpen ? (
-            <img src={brandIcon} alt="" className="size-4" />
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={t('clone.toggle_sidebar')}
-              onClick={() => setWorkspace({ libraryOpen: true })}
-            >
-              <PanelLeftOpenIcon />
-            </Button>
-          ))}
-        <h1 className="text-sm font-medium">{t('app.name')}</h1>
+        <h1 className="text-sm font-medium">{t('nav.home')}</h1>
         <Link
           to="/projects"
           className="ml-auto inline-flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground"
@@ -213,57 +200,104 @@ export function HomePage() {
         </Link>
       </WorkspaceHeader>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-6xl px-6 py-7">
-          <section className="relative isolate overflow-hidden rounded-3xl border border-border/50 bg-card/30 px-7 py-8">
-            <img
-              src={brandArtwork}
-              alt=""
-              aria-hidden="true"
-              className="pointer-events-none absolute inset-y-0 right-0 -z-10 h-full w-2/3 object-cover object-right opacity-35 [mask-image:linear-gradient(90deg,transparent,black)]"
-            />
-            <div className="max-w-xl">
-              <div className="mb-4 flex size-11 items-center justify-center rounded-2xl bg-primary/10">
-                <img src={brandIcon} alt="" className="size-7" />
-              </div>
-              <h2 className="text-3xl font-semibold tracking-[-0.035em]">{t('app.name')}</h2>
-              <p className="mt-3 max-w-lg text-sm leading-6 text-muted-foreground">
-                {t('app.tagline')}
-                <button
-                  type="button"
-                  onClick={openSite}
-                  className="ml-1 text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary"
-                >
-                  voicestudio.sh
-                </button>
-              </p>
-            </div>
-          </section>
-
-          <section className="mt-6 grid grid-cols-[repeat(auto-fit,minmax(min(100%,240px),1fr))] gap-3">
-            {destinations.map(({ to, label, description, Icon, count }) => (
-              <Link
-                key={to}
-                to={to}
-                className="group flex min-h-36 flex-col rounded-2xl border border-border/50 bg-card/25 p-4 outline-none transition-colors hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                    <Icon className="size-4" />
-                  </div>
-                  {count !== undefined && (
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs tabular-nums text-muted-foreground">
-                      {count}
-                    </span>
-                  )}
+        <div className="home-content mx-auto w-full max-w-6xl">
+          <section aria-labelledby="home-new-projects">
+            <div className="home-heading relative isolate overflow-hidden">
+              <img
+                src={brandArtwork}
+                alt=""
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-y-0 right-0 -z-10 h-full w-1/2 object-cover object-right opacity-25 [mask-image:linear-gradient(90deg,transparent,black)]"
+              />
+              <div className="home-heading-row">
+                <div className="home-heading-copy">
+                  <h2
+                    id="home-new-projects"
+                    className="flex flex-wrap items-center gap-x-3 gap-y-2 text-3xl font-semibold tracking-[-0.035em]"
+                  >
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <a
+                            href="https://voicestudio.sh"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="rounded-md transition-colors hover:text-primary focus-visible:outline-2 focus-visible:outline-ring"
+                            onClick={(event) => {
+                              const browser = getBridge()?.browser;
+                              if (!browser) return;
+                              event.preventDefault();
+                              event.currentTarget.focus();
+                              runRendererTask('Preview official website', () =>
+                                browser.open('https://voicestudio.sh'),
+                              );
+                            }}
+                          />
+                        }
+                      >
+                        {t('homeUi.title')}
+                      </TooltipTrigger>
+                      <TooltipContent surface="theme" side="bottom">
+                        {t('siteBrowser.preview')}
+                      </TooltipContent>
+                    </Tooltip>
+                  </h2>
+                  <p className="mt-3 max-w-[80ch] text-sm leading-relaxed text-foreground/65">
+                    {t('homeUi.subtitle')}
+                  </p>
                 </div>
-                <h3 className="mt-4 flex items-center gap-2 text-sm font-semibold">
-                  {label}
-                  <ArrowRightIcon className="size-3.5 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
-                </h3>
-                <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
-                  {description}
-                </p>
-              </Link>
+                <HomeContributors />
+              </div>
+            </div>
+            {[destinations.slice(0, 3), destinations.slice(3)].map((group, groupIndex) => (
+              <div
+                key={groupIndex}
+                className={`home-destinations grid grid-cols-1 gap-3 @xl:grid-cols-2 @3xl:grid-cols-3 @xl:[&>:last-child:nth-child(odd)]:col-span-2 @3xl:[&>:last-child:nth-child(odd)]:col-span-1 ${groupIndex === 0 ? 'home-destinations--primary' : 'home-destinations--secondary'}`}
+              >
+                {group.map(({ to, label, description }) => (
+                  <Link
+                    key={to}
+                    to={to}
+                    data-destination={to}
+                    className={`home-destination group ${groupIndex === 0 ? 'home-destination--primary' : 'home-destination--secondary'}`}
+                  >
+                    <div
+                      className={`home-destination-icon flex size-10 items-center justify-center rounded-xl ring-1 ring-inset shadow-[inset_0_1px_0_rgb(255_255_255/10%)] ${iconTones[to]}`}
+                    >
+                      <HomeFeatureIcon destination={to} />
+                    </div>
+                    {groupIndex === 0 && (
+                      <svg
+                        className="home-card-art"
+                        viewBox="0 0 160 72"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        {to === '/clone' ? (
+                          <path d="M8 36h12m8-10v20m10-32v44m10-24v4m10-30v56m10-42v28m10-36v44m10-22h12m8-10v20m10-32v44m10-24v4m10-16v28m10-18h6" />
+                        ) : to === '/design' ? (
+                          <>
+                            <path d="M8 48c24 0 24-24 48-24s24 24 48 24 24-24 48-24" />
+                            <path d="M8 32c24 0 24-12 48-12s24 40 48 40 24-40 48-40" />
+                            <path d="M8 58c24 0 24-42 48-42s24 22 48 22 24-22 48-22" />
+                          </>
+                        ) : (
+                          <>
+                            <rect x="15" y="12" width="88" height="31" rx="8" />
+                            <rect x="57" y="31" width="88" height="31" rx="8" />
+                            <path d="M29 27h12m6 0h28m-4 19h23m6 0h29" />
+                          </>
+                        )}
+                      </svg>
+                    )}
+                    <div className="home-destination-copy">
+                      <h3>{label}</h3>
+                      <p>{description}</p>
+                    </div>
+                    <ArrowRightIcon className="home-destination-arrow" aria-hidden="true" />
+                  </Link>
+                ))}
+              </div>
             ))}
           </section>
 
@@ -358,8 +392,8 @@ export function HomePage() {
             </section>
           )}
 
-          {(profiles.length > 0 || history.length > 0) && (
-            <section className="mt-8 grid gap-6 lg:grid-cols-2">
+          {profiles.length > 0 && (
+            <section className="mt-8">
               {profiles.length > 0 && (
                 <div>
                   <div className="mb-2 flex items-center justify-between px-1">
@@ -371,7 +405,7 @@ export function HomePage() {
                       {t('projects.all')}
                     </Link>
                   </div>
-                  <div className="rounded-2xl border border-border/50 bg-card/20 p-2">
+                  <div className="grid gap-1 rounded-2xl border border-border/70 bg-card/30 p-2 @3xl:grid-cols-2">
                     {profiles.slice(0, 4).map((profile) => (
                       <div
                         key={profile.id}
@@ -385,38 +419,6 @@ export function HomePage() {
                           {t('clone.select_profile')}
                         </Button>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {history.length > 0 && (
-                <div>
-                  <div className="mb-2 flex items-center justify-between px-1">
-                    <h2 className="text-sm font-medium">{t('clone.history_title')}</h2>
-                    <Link
-                      to="/projects"
-                      className="text-xs text-muted-foreground hover:text-foreground"
-                    >
-                      {t('projects.all')}
-                    </Link>
-                  </div>
-                  <div className="rounded-2xl border border-border/50 bg-card/20 p-2">
-                    {history.slice(0, 4).map((take) => (
-                      <button
-                        key={take.id}
-                        type="button"
-                        className="flex w-full min-w-0 items-center gap-3 rounded-xl px-2.5 py-2 text-left hover:bg-accent/50"
-                        onClick={() => {
-                          openTake(take);
-                          runRendererTask('Open recent voice take', () =>
-                            navigate({ to: '/clone' }),
-                          );
-                        }}
-                      >
-                        <AudioLinesIcon className="size-4 shrink-0 text-muted-foreground" />
-                        <span className="min-w-0 flex-1 truncate text-sm">{take.text}</span>
-                        <ArrowRightIcon className="size-3.5 text-muted-foreground" />
-                      </button>
                     ))}
                   </div>
                 </div>

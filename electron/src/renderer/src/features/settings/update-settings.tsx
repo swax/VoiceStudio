@@ -1,3 +1,4 @@
+import { splitRoundedMinutes } from '@shared/utils/timeFormat';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -15,18 +16,17 @@ import {
 import { toast } from 'sonner';
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
-import { MarkdownLite } from '@/components/markdown-lite';
+import { InlineMarkdown, MarkdownLite } from '@/components/markdown-lite';
 import { appVersion, getBridge } from '@/components/bridge';
 import { dubSession, flushDubDraft, useDubSession } from '@/features/dub/dub-session';
 import { hasActiveAppWork, useAppActivityCount } from '@/lib/app-activity';
 import { apiJson, describeError } from '@/lib/api/client';
-import { SettingsRow, SettingsSection } from './settings-layout';
+import { SettingsSection } from './settings-layout';
 import type { UpdateChannel, UpdateReleaseInfo, UpdateState } from '../../../../preload/index.d';
 
 const initial: UpdateState = {
   status: 'unsupported',
   currentVersion: appVersion(),
-  channel: 'stable',
   progress: 0,
 };
 
@@ -58,6 +58,16 @@ const serverWorkActive = (models?: ModelInstallJobs, batches?: unknown[]) =>
     ) || batches?.length,
   );
 
+// No reason means no desktop bridge: the browser UI, which never self-updates.
+const unsupportedMessageKey = (reason: UpdateState['unsupportedReason']) =>
+  reason === 'development'
+    ? 'settings.updater_development'
+    : reason === 'package-manager'
+      ? 'settings.updater_package_manager'
+      : reason === 'store'
+        ? 'settings.updater_store'
+        : 'settings.updater_desktop';
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
   if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)} MB`;
@@ -66,17 +76,12 @@ function formatBytes(bytes: number): string {
 }
 
 function formatEta(seconds: number): string {
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.max(0, Math.round(seconds % 60));
+  const { minutes, seconds: remainder } = splitRoundedMinutes(seconds);
   return `${minutes}:${String(remainder).padStart(2, '0')}`;
 }
 
 export function UpdateSettings() {
   const { t } = useTranslation();
-  const channelLabels = {
-    stable: t('about.channel_stable'),
-    preview: t('about.channel_preview'),
-  } as const;
   const updates = getBridge()?.updates;
   const canListReleases = typeof updates?.listReleases === 'function';
   const dub = useDubSession();
@@ -111,13 +116,14 @@ export function UpdateSettings() {
     staleTime: 300_000,
   });
   const releaseHistory = useQuery({
-    queryKey: ['desktop-release-history', state.channel],
-    queryFn: () => updates!.listReleases(state.channel),
+    queryKey: ['desktop-release-history'],
+    queryFn: () => updates!.listReleases(),
     enabled: canListReleases,
     staleTime: 15 * 60_000,
   });
   const releaseRows = (releaseHistory.data || [])
-    .filter((release) => state.channel === 'preview' || !release.prerelease)
+    // Betas are tagged prereleases; only beta users are offered them.
+    .filter((release) => state.channel === 'beta' || !release.prerelease)
     .slice()
     .sort((left, right) => right.date.localeCompare(left.date))
     .map((release) => ({
@@ -156,9 +162,12 @@ export function UpdateSettings() {
       setAction(false);
     }
   };
-  const setChannel = (channel: UpdateChannel) => {
-    if (updates && channel !== state.channel) void run(() => updates.setChannel(channel));
-  };
+  const switchChannel = (channel: UpdateChannel) =>
+    updates &&
+    void run(async () => {
+      const next = await updates.setChannel(channel);
+      return next.channel === channel ? updates.check() : next;
+    });
   const restart = async () => {
     setAction(true);
     try {
@@ -220,7 +229,7 @@ export function UpdateSettings() {
                     ? t('update.ready', { version: state.availableVersion || '' })
                     : t('update.available', { version: state.availableVersion || '' })
                   : state.status === 'unsupported'
-                    ? t('settings.updater_desktop')
+                    ? t(unsupportedMessageKey(state.unsupportedReason))
                     : state.status === 'checking'
                       ? t('update.checking')
                       : state.status === 'downloading'
@@ -317,36 +326,40 @@ export function UpdateSettings() {
             )}
           </div>
         </div>
+        {state.channel && (
+          <div className="flex flex-col gap-2 px-4 py-3 @2xl:flex-row @2xl:items-center">
+            <div className="min-w-0 flex-1">
+              <p id="update-channel-label" className="text-sm font-medium">
+                {t('update.channel')}
+              </p>
+              {state.channel === 'beta' && (
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {t('update.channel_beta_hint')}
+                </p>
+              )}
+            </div>
+            <div role="group" aria-labelledby="update-channel-label" className="flex gap-1">
+              {(['stable', 'beta'] as const).map((channel) => (
+                <Button
+                  key={channel}
+                  size="sm"
+                  variant={state.channel === channel ? 'secondary' : 'outline'}
+                  aria-pressed={state.channel === channel}
+                  disabled={
+                    action || ['checking', 'downloading', 'downloaded'].includes(state.status)
+                  }
+                  onClick={() => switchChannel(channel)}
+                >
+                  {t(`update.channel_${channel}`)}
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="flex items-center gap-2 px-4 py-2.5 text-[11px] text-muted-foreground">
           <ShieldCheckIcon className="size-3.5 text-success" aria-hidden="true" />
           {t('update.safety')}
         </div>
-      </SettingsSection>
-
-      <SettingsSection icon={ShieldCheckIcon} title={t('about.update_channel')}>
-        <SettingsRow
-          id="update-channel"
-          title={t('about.update_channel')}
-          description={state.channel === 'preview' ? t('about.channel_preview_hint') : undefined}
-        >
-          {(['stable', 'preview'] as const).map((channel) => (
-            <Button
-              key={channel}
-              size="sm"
-              variant={state.channel === channel ? 'secondary' : 'ghost'}
-              aria-pressed={state.channel === channel}
-              disabled={
-                !updates ||
-                action ||
-                state.status === 'downloading' ||
-                state.status === 'downloaded'
-              }
-              onClick={() => setChannel(channel)}
-            >
-              {channelLabels[channel]}
-            </Button>
-          ))}
-        </SettingsRow>
       </SettingsSection>
 
       {state.notes && (
@@ -399,11 +412,7 @@ export function UpdateSettings() {
                     )}
                   </summary>
                   <div className="mt-3 space-y-4 pl-6 text-xs leading-5 text-muted-foreground">
-                    {release.intro && (
-                      <p className="font-medium text-foreground">
-                        {release.intro.replaceAll('**', '')}
-                      </p>
-                    )}
+                    {release.intro && <MarkdownLite text={release.intro} />}
                     {release.sections?.map((section, sectionIndex) => (
                       <section key={`${section.title || 'notes'}-${sectionIndex}`}>
                         {section.title && (
@@ -411,7 +420,9 @@ export function UpdateSettings() {
                         )}
                         <ul className="list-disc space-y-1.5 pl-4">
                           {section.bullets.map((bullet, bulletIndex) => (
-                            <li key={bulletIndex}>{bullet}</li>
+                            <li key={bulletIndex}>
+                              <InlineMarkdown text={bullet} />
+                            </li>
                           ))}
                         </ul>
                       </section>
@@ -448,11 +459,6 @@ export function UpdateSettings() {
                     {release.current && (
                       <span className="rounded-full bg-primary/12 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                         {t('updates.current')}
-                      </span>
-                    )}
-                    {release.prerelease && (
-                      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-                        {t('updates.prerelease')}
                       </span>
                     )}
                     <time className="ml-auto text-xs text-muted-foreground">

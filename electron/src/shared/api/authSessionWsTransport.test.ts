@@ -13,14 +13,14 @@ const response = () =>
   });
 
 const storeSession = (apiBase: string) => {
-  sessionStorage.setItem(
+  localStorage.setItem(
     ADMIN_SESSION_STORAGE_KEY,
     JSON.stringify({ token: SESSION, expiresAt: NOW_SECONDS + 3600, apiBase }),
   );
 };
 
 describe('ticketed WebSocket transport', () => {
-  beforeEach(() => sessionStorage.clear());
+  beforeEach(() => localStorage.clear());
 
   it('mints a path-bound /ws/tts ticket for the live dub preview (#1769)', async () => {
     const apiBase = 'https://gpu.test:3900';

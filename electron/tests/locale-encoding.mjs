@@ -26,6 +26,9 @@ function inspect(value, path, source) {
     ) {
       failures.push(path);
     }
+    if (path.endsWith('.repairAgent.placeholder') && /\p{L}\?\p{L}/u.test(value)) {
+      failures.push(path);
+    }
     if (typeof source === 'string' && !source.includes('?') && value.includes('?')) {
       const trimmed = value.trim();
       const loneSentenceQuestion =

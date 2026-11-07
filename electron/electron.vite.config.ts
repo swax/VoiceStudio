@@ -3,29 +3,39 @@ import { resolve } from 'node:path';
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import {
+  DEFAULT_BACKEND_PORT,
+  DEFAULT_ELECTRON_DEV_PORT,
+  DEFAULT_ELECTRON_PROXY_PORT,
+  PRODUCT_NAME,
+} from '../config/app-config.mjs';
+import { DISTRIBUTION_TARGET } from '../config/distributions.mjs';
+import { buildCommit } from '../config/build-commit.mjs';
 
 // The app version is single-sourced from the root package.json (CLAUDE.md,
 // Versioning). Nothing in electron/ mirrors it: the renderer reads it through
 // __APP_VERSION__ and the installer through electron-builder.config.mjs.
-const frontendPkg = JSON.parse(
-  readFileSync(resolve(__dirname, '../package.json'), 'utf-8'),
-) as { version: string };
+const frontendPkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf-8')) as {
+  version: string;
+};
 
 const define = {
   __APP_VERSION__: JSON.stringify(frontendPkg.version),
+  __BUILD_COMMIT__: JSON.stringify(buildCommit()),
+  __DISTRIBUTION_TARGET__: JSON.stringify(DISTRIBUTION_TARGET),
   __WEB_DEPLOYMENT__: false,
-  __PRO_STORE_ID__: JSON.stringify(process.env.VOICESTUDIO_PRO_STORE_ID ?? ''),
-  __PRO_PRODUCT_ID__: JSON.stringify(process.env.VOICESTUDIO_PRO_PRODUCT_ID ?? ''),
-  __PRO_YEARLY_VARIANT_ID__: JSON.stringify(process.env.VOICESTUDIO_PRO_YEARLY_VARIANT_ID ?? ''),
-  __PRO_LIFETIME_VARIANT_ID__: JSON.stringify(
-    process.env.VOICESTUDIO_PRO_LIFETIME_VARIANT_ID ?? '',
-  ),
   // Keep the renderer and its managed Python backend on one analytics project.
   __POSTHOG_PROJECT_TOKEN__: JSON.stringify(
     process.env.VITE_POSTHOG_KEY ?? process.env.POSTHOG_PROJECT_TOKEN ?? '',
   ),
   __POSTHOG_HOST__: JSON.stringify(process.env.VITE_POSTHOG_HOST ?? process.env.POSTHOG_HOST ?? ''),
 };
+
+// OMNIVOICE_UI_PORT is canonical (the backend reads it for its origin
+// allow-list); VOICESTUDIO_UI_PORT is the accepted legacy alias.
+const rendererPort =
+  Number(process.env.OMNIVOICE_UI_PORT || process.env.VOICESTUDIO_UI_PORT) ||
+  DEFAULT_ELECTRON_DEV_PORT;
 
 export default defineConfig({
   main: {
@@ -53,6 +63,12 @@ export default defineConfig({
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'app-identity',
+        transformIndexHtml(html) {
+          return html.replaceAll('__APP_PRODUCT_NAME__', PRODUCT_NAME);
+        },
+      },
       {
         name: 'renderer-boot-script',
         configureServer(server) {
@@ -90,18 +106,18 @@ export default defineConfig({
       exclude: ['@scalar/api-reference-react'],
     },
     server: {
-      port: Number(process.env.VOICESTUDIO_UI_PORT) || 3902,
+      port: rendererPort,
       strictPort: true,
       // Dev counterpart of main's app:// proxy (CONTRACT.md, same-origin API rule).
       proxy: {
         '/api/ws': {
-          target: 'http://127.0.0.1:' + (process.env.OMNIVOICE_PORT || 3900),
+          target: 'http://127.0.0.1:' + (process.env.OMNIVOICE_PORT || DEFAULT_BACKEND_PORT),
           changeOrigin: true,
           rewrite: (p) => p.replace(/^\/api/, ''),
           ws: true,
           configure(proxy) {
             proxy.on('proxyReqWs', (outgoing, incoming) => {
-              const port = Number(process.env.VOICESTUDIO_UI_PORT) || 3902;
+              const port = rendererPort;
               const origin = incoming.headers.origin;
               if (origin === `http://localhost:${port}` || origin === `http://127.0.0.1:${port}`) {
                 outgoing.removeHeader('origin');
@@ -111,7 +127,9 @@ export default defineConfig({
           },
         },
         '/api': {
-          target: 'http://127.0.0.1:' + (process.env.VOICESTUDIO_ELECTRON_PROXY_PORT || 3903),
+          target:
+            'http://127.0.0.1:' +
+            (process.env.VOICESTUDIO_ELECTRON_PROXY_PORT || DEFAULT_ELECTRON_PROXY_PORT),
           changeOrigin: true,
           rewrite: (p) => p.replace(/^\/api/, ''),
           configure(proxy) {

@@ -2,6 +2,8 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  agentChildEnv,
+  agentProviderFailure,
   agentCommandMatchesPlatform,
   dubTranslationPrompt,
   guardAgentProcessStreams,
@@ -21,6 +23,22 @@ const request = {
 };
 
 describe('packaged app repair sessions', () => {
+  it('classifies provider account failures without forwarding their output', () => {
+    expect(
+      agentProviderFailure(
+        '{"type":"assistant","is_api_error_message":true,"error":"account_on_hold"}',
+      )?.name,
+    ).toBe('AgentAuthenticationError');
+    expect(
+      agentProviderFailure(
+        '{"type":"error","error":{"data":{"statusCode":403,"message":"private"}}}',
+      )?.name,
+    ).toBe('AgentAuthenticationError');
+    expect(agentProviderFailure('{"type":"error","error":{"data":{"statusCode":429}}}')?.name).toBe(
+      'AgentRateLimitError',
+    );
+    expect(agentProviderFailure('{"translations":[{"id":"reply","text":"ok"}]}')).toBeNull();
+  });
   it('contains prompt pipe closures instead of raising uncaught process errors', () => {
     const stdin = new EventEmitter();
     const stdout = new EventEmitter();
@@ -127,7 +145,9 @@ describe('packaged app repair sessions', () => {
     const prompt = requestPrompt(request, 'live diagnostics', false);
 
     expect(prompt).toContain('No source checkout is attached');
-    expect(prompt).toContain('Complete only the explicit ACTION_REQUEST');
+    expect(prompt).toContain(
+      "Complete the user's current request through VoiceStudio's app API bridge",
+    );
     expect(prompt).toContain('VOICESTUDIO_REPAIR_CONTEXT_FILE');
     expect(prompt).toContain('Do not ask the user to repeat actions the API can perform');
     expect(prompt).toContain('required model downloads and engine selection');
@@ -226,4 +246,21 @@ describe('packaged app repair sessions', () => {
     expect(translationLaunchArgs('claude')).toContain('--no-session-persistence');
     expect(translationLaunchArgs('opencode')).not.toContain('--auto');
   });
+});
+
+it('repair agent env strips account bridge vars and other backend-only capabilities', () => {
+  const keys = [
+    'VOICESTUDIO_ACCOUNT_BRIDGE_URL',
+    'VOICESTUDIO_ACCOUNT_BRIDGE_TOKEN',
+    'VOICESTUDIO_LLM_AGENT_URL',
+    'VOICESTUDIO_LLM_AGENT_TOKEN',
+  ];
+  for (const key of keys) vi.stubEnv(key, 'capability');
+  try {
+    const env = agentChildEnv({ NO_COLOR: '1' });
+    for (const key of keys) expect(env[key]).toBeUndefined();
+    expect(env.NO_COLOR).toBe('1');
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

@@ -19,6 +19,7 @@ pipeline stage that runs the ASR pass lives in the dub router.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 
@@ -30,6 +31,7 @@ from dataclasses import dataclass
 # dot U+30FB, the ideographic full stop U+3002, the Thai fongman U+0E4F) is
 # stripped like any other, and their digits stay word tokens.
 _NO_SPACE_SCRIPT = (
+    "\u3005-\u3007\u303b"  # ideographic iteration and closing marks, number zero
     "\u3041-\u3096\u3099-\u309f"  # hiragana, its sound and iteration marks
     "\u30a1-\u30fa\u30fc-\u30ff"  # katakana, prolonged sound, iteration marks
     "\u3400-\u4dbf"  # CJK ideographs, extension A
@@ -48,8 +50,19 @@ _TOKEN_RE = re.compile(rf"[{_NO_SPACE_SCRIPT}]|[^\W{_NO_SPACE_SCRIPT}]+")
 def _tokens(text: str) -> list[str]:
     """Lowercase word tokens, punctuation stripped — the unit drift is scored
     in. Script-agnostic: for no-space scripts each codepoint is a token, which
-    still gives a sensible edit-distance ratio."""
-    text = (text or "").lower().strip()
+    still gives a sensible edit-distance ratio.
+
+    Canonical-equivalent Unicode spellings (composed vs. decomposed accents)
+    must not score as drift, because the underlying words are identical. We
+    normalize to NFC before tokenizing: NFC collapses canonical equivalence
+    while preserving genuine accent/word differences (e.g. ``naïve`` ≠
+    ``naive``, Korean pre-composed vs. conjoining jamo spellings of the same
+    syllable) and leaves compatibility characters (ligatures, full-width
+    ASCII) for downstream comparison.
+    """
+    text = (text or "")
+    if text:
+        text = unicodedata.normalize("NFC", text).lower().strip()
     if not text:
         return []
     words = _TOKEN_RE.findall(text)

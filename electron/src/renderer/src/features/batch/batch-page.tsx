@@ -1,3 +1,4 @@
+import { splitRoundedMinutes } from '@shared/utils/timeFormat';
 import {
   ActivityIcon,
   AlertCircleIcon,
@@ -19,26 +20,29 @@ import { SecondarySidebar } from '@/components/workspace-sidebar';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { PipelineFailure } from '@/components/pipeline-failure';
 import { EngineNotice } from '@/components/engine-notice';
+import { DisabledReason, firstReason } from '@/components/disabled-reason';
 import { WatchFolder } from './watch-folder';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { UploadIcon, XIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { LanguagePicker } from '@/features/clone/language-picker';
+import { EngineLanguagePicker } from '@/features/clone/engine-language-picker';
 import { Switch } from '@/components/ui/switch';
 import { useProfiles } from '@/hooks/use-profiles';
 import { useTtsReadiness } from '@/hooks/use-tts-readiness';
 import { getBridge } from '@/components/bridge';
 import { apiJson, apiPath, describeError } from '@/lib/api/client';
 import { saveExport } from '@/lib/export-history';
-import { LANG_CODES } from '@shared/utils/languages';
+import { TRANSLATION_TARGET_LABELS, translationTargetCode } from '@/lib/translation-targets';
 import { PRESETS } from '@shared/utils/constants';
+import { announceModelLicenceRequired } from '@/features/settings/model-license-contract';
 import type { BatchJob } from '@shared/api/batch-types';
-import { generationFailureMessage } from '@shared/utils/generationFailureMessage';
+import { BatchJobFailure } from './batch-job-failure';
 import { enqueueVideos } from './enqueue';
+import { cachedTtsLanguagesSupported } from '@/lib/language-options';
 import { useTranslationEngines } from '@/features/settings/translation-settings';
-const languageOptions = LANG_CODES.map((item) => item.label);
+const languageOptions = TRANSLATION_TARGET_LABELS;
 export function BatchPage() {
   const { t } = useTranslation();
   const client = useQueryClient();
@@ -79,8 +83,24 @@ export function BatchPage() {
       ),
     refetchInterval: tab === 'done' ? false : 3000,
   });
+  // A job parked on an unaccepted licence opens the dialog once; the user
+  // then retries it like any failed job.
+  const announcedLicence = useRef(new Set<string>());
+  useEffect(() => {
+    for (const job of jobs.data ?? []) {
+      const setup = job.setup_required;
+      if (setup?.kind !== 'model_licence_required' || announcedLicence.current.has(job.id))
+        continue;
+      announcedLicence.current.add(job.id);
+      announceModelLicenceRequired(setup);
+    }
+  }, [jobs.data]);
   const submit = async () => {
     if (uploading.current || ttsBlocker !== null || !files.length || !langs.length) return;
+    if (!cachedTtsLanguagesSupported(client, 'batch', langs)) {
+      setError(t('languagePicker.chooseSupported'));
+      return;
+    }
     uploading.current = true;
     setBusy(true);
     setError(null);
@@ -88,7 +108,7 @@ export function BatchPage() {
     try {
       const failed = await enqueueVideos(
         files,
-        langs.map((label) => LANG_CODES.find((item) => item.label === label)!.code),
+        langs.map((label) => translationTargetCode(label)!),
         voice,
         preserve,
         (file, cause) => {
@@ -246,7 +266,8 @@ export function BatchPage() {
               <LanguagesIcon className="size-4" />
               {t('batch.target_languages')}
             </h2>
-            <LanguagePicker
+            <EngineLanguagePicker
+              operation="batch"
               options={languageOptions}
               value={langs.at(-1) || 'Spanish'}
               disabled={busy}
@@ -341,25 +362,44 @@ export function BatchPage() {
               />
             </div>
           </section>
-          <Button
+          <DisabledReason
             className="w-full"
-            disabled={
-              busy ||
-              ttsBlocker !== null ||
-              !files.length ||
-              !langs.length ||
-              Boolean(
-                translationEngines.data &&
-                !(translationEngine?.ready ?? translationEngine?.installed),
-              )
-            }
-            onClick={() => void submit()}
+            reason={firstReason([
+              [ttsBlocker !== null, t('engines.none_ready_title')],
+              [!files.length, t('disabledReason.files_required')],
+              [!langs.length, t('disabledReason.languages_required')],
+              [
+                Boolean(
+                  translationEngines.data &&
+                  !(translationEngine?.ready ?? translationEngine?.installed),
+                ),
+                t('disabledReason.translation_not_ready'),
+              ],
+            ])}
           >
-            {t(busy ? 'common.loading' : 'batch.add_to_queue')}
-          </Button>
+            {(describedBy) => (
+              <Button
+                className="w-full"
+                disabled={
+                  busy ||
+                  ttsBlocker !== null ||
+                  !files.length ||
+                  !langs.length ||
+                  Boolean(
+                    translationEngines.data &&
+                    !(translationEngine?.ready ?? translationEngine?.installed),
+                  )
+                }
+                aria-describedby={describedBy}
+                onClick={() => void submit()}
+              >
+                {t(busy ? 'common.loading' : 'batch.add_to_queue')}
+              </Button>
+            )}
+          </DisabledReason>
           <EngineNotice operation="batch" />
           <WatchFolder
-            langs={langs.map((label) => LANG_CODES.find((item) => item.label === label)!.code)}
+            langs={langs.map((label) => translationTargetCode(label)!)}
             voiceId={voice}
             preserveBg={preserve}
             disabled={ttsBlocker !== null}
@@ -425,7 +465,7 @@ export function BatchPage() {
               </h2>
               {tab === 'active' && (
                 <>
-                  <p className="mt-2 text-sm text-muted-foreground">{t('batch.drop_hint')}</p>
+                  <p className="mt-2 text-sm text-muted-foreground">{t('batch.empty_hint')}</p>
                   <Button className="mt-5" onClick={() => input.current?.click()}>
                     <UploadIcon />
                     {t('batch.add_videos')}
@@ -550,17 +590,7 @@ function BatchJobCard({
           {t('batch.completed_in', { duration: formatDuration(duration) })}
         </p>
       )}
-      {job.error && generationFailureMessage(job, t) && (
-        <p role="alert" className="mt-3 text-xs text-destructive">
-          {generationFailureMessage(job, t)}
-        </p>
-      )}
-      {job.error && (
-        <details className="mt-3 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          <summary>{t('common.more_info')}</summary>
-          <p className="mt-2 break-words">{job.error}</p>
-        </details>
-      )}
+      <BatchJobFailure job={job} />
       <div className="mt-3 flex flex-wrap justify-end gap-2">
         {job.status === 'done' &&
           Object.keys(job.outputs || {}).map((lang) => (
@@ -571,16 +601,16 @@ function BatchJobCard({
           ))}
         {['failed', 'cancelled'].includes(job.status) && (
           <Button
-            variant={job.setup_required ? 'default' : 'ghost'}
+            variant={job.setup_required?.kind === 'argos_packs' ? 'default' : 'ghost'}
             size="sm"
             disabled={Boolean(acting) || job.retry_ready === false}
             onClick={() => void recover(job)}
           >
-            {job.setup_required ? <LanguagesIcon /> : <RefreshCwIcon />}
+            {job.setup_required?.kind === 'argos_packs' ? <LanguagesIcon /> : <RefreshCwIcon />}
             {t(
               job.retry_ready === false
                 ? 'common.loading'
-                : job.setup_required
+                : job.setup_required?.kind === 'argos_packs'
                   ? 'modelMaintenance.install'
                   : 'common.retry',
             )}
@@ -631,9 +661,8 @@ function formatTimestamp(value: number, locale?: string) {
 }
 
 function formatDuration(seconds: number) {
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.round(seconds % 60);
+  if (seconds < 59.95) return `${seconds.toFixed(1)}s`;
+  const { minutes, seconds: remainder } = splitRoundedMinutes(seconds);
   if (minutes < 60) return `${minutes}m ${remainder}s`;
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

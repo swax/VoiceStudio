@@ -21,6 +21,7 @@ import json
 
 
 _GEN_INPUT_FIELDS = ("text", "target_lang", "profile_id", "instruct", "speed", "direction", "effect_preset")
+_OPTIONAL_GEN_INPUT_FIELDS = ("ref_audio", "ref_text", "emo_audio", "emo_alpha", "seed")
 
 # Pydantic fills `effect_preset` with this default when the client omits it,
 # while the client-side recompute (/tools/incremental) sends nothing. Both
@@ -84,6 +85,12 @@ def segment_fingerprint(
     value and per_line stays byte-identical to the pre-toggle behaviour.
     """
     payload = {k: _canon_value(k, seg.get(k)) for k in _GEN_INPUT_FIELDS}
+    # Preserve old fingerprints when these optional controls are absent, but
+    # invalidate a take when its conditioning or deterministic seed changes.
+    for key in _OPTIONAL_GEN_INPUT_FIELDS:
+        value = seg.get(key)
+        if value is not None and value != "":
+            payload[key] = _canon_value(key, value)
     if track_lang:
         payload["track_lang"] = str(track_lang)
     if voice_match and voice_match != "per_line":
@@ -123,6 +130,9 @@ _FIT_PARAM_DEFAULTS = {
 }
 
 
+_MIN_AUDIO_RATE_DEFAULT = 0.85  # mirrors FitParams.min_audio_rate
+
+
 def fit_fingerprint(params: dict) -> str:
     """Deterministic hash of the fit configuration for one dub track.
 
@@ -137,6 +147,11 @@ def fit_fingerprint(params: dict) -> str:
         if v is None or v == "":
             v = _FIT_PARAM_DEFAULTS[k]
         payload[k] = _canon_value(k, v)
+    # Added after tracks were already fingerprinted: hashed only when set to a
+    # non-default value, so existing tracks are not flagged stale by an upgrade.
+    min_rate = params.get("min_audio_rate")
+    if min_rate not in (None, "") and float(min_rate) != _MIN_AUDIO_RATE_DEFAULT:
+        payload["min_audio_rate"] = _canon_value("min_audio_rate", min_rate)
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
 

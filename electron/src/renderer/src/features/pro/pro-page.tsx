@@ -1,24 +1,15 @@
-import { useEffect, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   BriefcaseBusinessIcon,
   CheckIcon,
-  CpuIcon,
-  FolderInputIcon,
   GitCompareArrowsIcon,
-  KeyRoundIcon,
-  Layers3Icon,
   ListChecksIcon,
   PackageCheckIcon,
-  ServerCogIcon,
-  Share2Icon,
   ShieldCheckIcon,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WorkspaceHeader } from '@/components/app-shell/workspace-header';
 import { ExternalLink } from '@/components/external-link';
-import { getBridge } from '@/components/bridge';
-import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
-import type { VoiceStudioBridge } from '../../../../preload/index.d';
 import './pro-page.css';
 
 const planUrl = (plan: string, quantity: number) =>
@@ -32,7 +23,7 @@ const plans = [
   },
   {
     id: 'lifetime',
-    unitPrice: 299,
+    unitPrice: 199,
     period: 'per_user_once',
     detail: 'lifetime_detail',
   },
@@ -43,11 +34,9 @@ const plans = [
   },
 ] as const;
 const planFeatures = [
-  'recipes_title',
   'automation_title',
   'history_title',
   'delivery_title',
-  'remote_workers_title',
   'commercial_title',
 ] as const;
 const lifetimeFeatures = [
@@ -63,9 +52,7 @@ const enterpriseFeatures = [
   'enterprise_private',
   'enterprise_support',
 ] as const;
-const TERMS_URL = 'https://voicestudio.sh/terms';
 const ENTERPRISE_URL = 'https://voicestudio.sh/commercial';
-type Status = Awaited<ReturnType<VoiceStudioBridge['pro']['status']>>;
 const benefits = [
   {
     icon: BriefcaseBusinessIcon,
@@ -73,30 +60,10 @@ const benefits = [
     body: 'commercial_body',
     effect: 'seal',
   },
-  { icon: Layers3Icon, title: 'recipes_title', body: 'recipes_body', effect: 'spotlight' },
-  { icon: FolderInputIcon, title: 'watch_title', body: 'watch_body', effect: 'orbit' },
   { icon: ListChecksIcon, title: 'automation_title', body: 'automation_body', effect: 'lanes' },
   { icon: GitCompareArrowsIcon, title: 'history_title', body: 'history_body', effect: 'wave' },
   { icon: PackageCheckIcon, title: 'delivery_title', body: 'delivery_body', effect: 'pixels' },
   { icon: ShieldCheckIcon, title: 'preflight_title', body: 'preflight_body', effect: 'scan' },
-  {
-    icon: ServerCogIcon,
-    title: 'remote_device_title',
-    body: 'remote_device_body',
-    effect: 'signal',
-  },
-  {
-    icon: CpuIcon,
-    title: 'remote_workers_title',
-    body: 'remote_workers_body',
-    effect: 'nodes',
-  },
-  {
-    icon: Share2Icon,
-    title: 'gpu_share_title',
-    body: 'gpu_share_body',
-    effect: 'beam',
-  },
 ] as const;
 
 function trackFeaturePointer(event: ReactPointerEvent<HTMLElement>) {
@@ -114,57 +81,12 @@ function trackFeaturePointer(event: ReactPointerEvent<HTMLElement>) {
 
 export function ProPage() {
   const { t } = useTranslation();
-  const [status, setStatus] = useState<Status | null>(null);
-  const [key, setKey] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [licenseOpen, setLicenseOpen] = useState(false);
   const [quantities, setQuantities] = useState({ yearly: 1, lifetime: 1 });
   function changeQuantity(plan: 'yearly' | 'lifetime', change: number) {
     setQuantities((current) => ({
       ...current,
       [plan]: Math.min(99, Math.max(1, current[plan] + change)),
     }));
-  }
-  useEffect(() => {
-    let mounted = true;
-    void getBridge()
-      ?.pro.status()
-      .then((value) => {
-        if (mounted) setStatus(value);
-      })
-      .catch(() => {
-        // A renderer hot reload can briefly outlive an older main process that
-        // does not expose Pro IPC yet. Keep the page usable until Electron restarts.
-        if (mounted) setStatus({ active: false, configured: false });
-      });
-    return () => {
-      mounted = false;
-    };
-  }, []);
-  async function activate() {
-    const bridge = getBridge();
-    if (!bridge || busy) return;
-    setBusy(true);
-    try {
-      setStatus(await bridge.pro.activate(key));
-      setKey('');
-    } catch {
-      setStatus({ active: false, configured: true, error: 'offline' });
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function deactivate() {
-    const bridge = getBridge();
-    if (!bridge || busy) return;
-    setBusy(true);
-    try {
-      setStatus(await bridge.pro.deactivate());
-    } catch {
-      setStatus({ active: true, configured: true, error: 'offline' });
-    } finally {
-      setBusy(false);
-    }
   }
   return (
     <div className="pro-page">
@@ -262,9 +184,6 @@ export function ProPage() {
               })}
             </div>
             <p className="pro-billing-note">{t('proPage.billing_note')}</p>
-            <button className="pro-have-license" type="button" onClick={() => setLicenseOpen(true)}>
-              {t('proPage.activate_title')}
-            </button>
           </section>
           <section className="pro-features" aria-labelledby="pro-features-title">
             <div className="pro-section-head">
@@ -289,58 +208,6 @@ export function ProPage() {
             </div>
             <p className="pro-free-promise">{t('proPage.free_promise')}</p>
           </section>
-          <Dialog open={licenseOpen} onOpenChange={setLicenseOpen}>
-            <DialogContent showCloseButton={false} className="pro-license-modal">
-              <button
-                className="pro-license-close"
-                type="button"
-                onClick={() => setLicenseOpen(false)}
-                aria-label={t('common.close')}
-              >
-                ×
-              </button>
-              <DialogTitle id="pro-activation-title">{t('proPage.activate_title')}</DialogTitle>
-              <div className="pro-activation-card">
-                <KeyRoundIcon aria-hidden="true" />
-                <h3>{status?.active ? t('proPage.active_title') : t('proPage.enter_key')}</h3>
-                {status?.active ? (
-                  <>
-                    <p role="status">{t('proPage.active_body')}</p>
-                    <button type="button" disabled={busy} onClick={() => void deactivate()}>
-                      {t('proPage.deactivate')}
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <label htmlFor="pro-license-key">{t('proPage.key_label')}</label>
-                    <input
-                      id="pro-license-key"
-                      autoFocus
-                      autoComplete="off"
-                      value={key}
-                      onChange={(event) => setKey(event.target.value)}
-                      placeholder={t('proPage.key_placeholder')}
-                      disabled={busy || status?.configured === false}
-                    />
-                    <button
-                      type="button"
-                      disabled={busy || !key.trim() || status?.configured === false}
-                      onClick={() => void activate()}
-                    >
-                      {busy ? t('proPage.activating') : t('proPage.activate')}
-                    </button>
-                    {status?.configured === false && (
-                      <p role="status">{t('proPage.not_configured')}</p>
-                    )}
-                  </>
-                )}
-                {status?.error && <p role="alert">{t(`proPage.error_${status.error}`)}</p>}
-              </div>
-              <div className="pro-terms-link">
-                <ExternalLink href={TERMS_URL}>{t('proPage.read_terms')}</ExternalLink>
-              </div>
-            </DialogContent>
-          </Dialog>
         </main>
       </div>
     </div>

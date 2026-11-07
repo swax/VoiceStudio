@@ -28,7 +28,7 @@ describe('RemoteBackendRecovery', () => {
   it('clears the remote URL and API key before reloading locally', async () => {
     localStorage.setItem('ov_backend_url', 'https://gpu-box:3900');
     localStorage.setItem('ov_api_key', 'secret');
-    sessionStorage.setItem('ov_admin_session', 'session');
+    localStorage.setItem('ov_admin_session', 'session');
     const reload = vi.fn();
     render(
       <RemoteBackendRecovery
@@ -42,6 +42,6 @@ describe('RemoteBackendRecovery', () => {
     await waitFor(() => expect(reload).toHaveBeenCalledOnce());
     expect(localStorage.getItem('ov_backend_url')).toBeNull();
     expect(localStorage.getItem('ov_api_key')).toBeNull();
-    expect(sessionStorage.getItem('ov_admin_session')).toBeNull();
+    expect(localStorage.getItem('ov_admin_session')).toBeNull();
   });
 });

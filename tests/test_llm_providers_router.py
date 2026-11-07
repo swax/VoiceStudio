@@ -96,6 +96,181 @@ def test_list_never_leaks_keys(settings_mod):
     assert "gsk-test-123" not in str(body)  # the key never round-trips
 
 
+def test_connect_verifies_provider_before_enabling_engine(settings_mod, monkeypatch):
+    from core import prefs
+    from services import llm_providers
+    prefs.set_("llm_backend", "off")
+    settings_mod.save_llm_provider("ollama", settings_mod._LLMProviderBody(activate_if_unset=False))
+    def probe(pid):
+        assert pid == "ollama"
+        assert prefs.get("llm_backend") == "off"
+        assert llm_providers.stored_active_provider_id() is None
+        return {"ok": True, "model": "llama3.1", "latency_ms": 5}
+    monkeypatch.setattr(settings_mod, "test_llm_provider", probe)
+    assert settings_mod.connect_llm_provider("ollama")["ok"] is True
+    assert prefs.get("llm_backend") == "openai-compat"
+    assert settings_mod.list_llm_providers()["engine_active"] == "openai-compat"
+
+
+def test_failed_connect_does_not_enable_engine(settings_mod, monkeypatch):
+    from core import prefs
+    prefs.set_("llm_backend", "off")
+    monkeypatch.setattr(settings_mod, "test_llm_provider", lambda pid: {"ok": False, "kind": "network"})
+    assert settings_mod.connect_llm_provider("ollama") == {"ok": False, "kind": "network"}
+    assert prefs.get("llm_backend") == "off"
+    assert settings_mod.list_llm_providers()["active"] is None
+
+
+def test_first_editor_save_cannot_auto_enable_cloud_before_verification(settings_mod):
+    from core import prefs
+    from services import llm_backend, llm_skills
+    prefs.delete("llm_backend")
+    settings_mod.save_llm_provider("groq", settings_mod._LLMProviderBody(
+        api_key="gsk-test", activate_if_unset=False))
+    assert llm_backend.active_backend_id() == "off"
+    assert not llm_skills.resolve_skill("dub_translation").ready
+
+
+def test_connect_pin_rejection_never_probes(settings_mod, monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setenv("OMNIVOICE_LLM_BACKEND", "off")
+    monkeypatch.setattr(settings_mod, "test_llm_provider", lambda pid: pytest.fail("blocked connection probed"))
+    with pytest.raises(HTTPException) as err:
+        settings_mod.connect_llm_provider("ollama")
+    assert err.value.status_code == 409
+
+
+def test_connect_does_not_activate_settings_edited_during_verification(settings_mod, monkeypatch):
+    from core import prefs
+    from services import llm_providers
+    prefs.set_("llm_backend", "off")
+    def probe(pid):
+        llm_providers.save_overrides(pid, model="different-model")
+        return {"ok": True, "model": "llama3.1"}
+    monkeypatch.setattr(settings_mod, "test_llm_provider", probe)
+    assert settings_mod.connect_llm_provider("ollama") == {"ok": False, "kind": "config"}
+    assert prefs.get("llm_backend") == "off"
+
+
+def test_explicit_activation_enables_llm_engine(settings_mod):
+    from core import prefs
+    prefs.set_("llm_backend", "off")
+    _configure_groq(settings_mod)
+    from services.llm_backend import active_backend_id
+    assert active_backend_id() == "openai-compat"
+
+
+def test_editor_save_can_preserve_empty_active_slot(settings_mod):
+    settings_mod.save_llm_provider("ollama", settings_mod._LLMProviderBody(activate_if_unset=False))
+    assert settings_mod.list_llm_providers()["active"] is None
+
+
+def test_activation_rejects_incomplete_provider_without_changing_selection(settings_mod):
+    from fastapi import HTTPException
+    _configure_groq(settings_mod)
+    with pytest.raises(HTTPException) as err:
+        settings_mod.save_llm_provider("custom", settings_mod._LLMProviderBody(
+            base_url="http://localhost:1234/v1", make_active=True))
+    assert err.value.status_code == 400
+    assert settings_mod.list_llm_providers()["active"] == "groq"
+
+
+@pytest.mark.parametrize("pin,value", [("LLM_DEFAULT_PROVIDER", "groq"), ("OMNIVOICE_LLM_BACKEND", "off")])
+def test_activation_honors_environment_pins(settings_mod, monkeypatch, pin, value):
+    from fastapi import HTTPException
+    monkeypatch.setenv(pin, value)
+    with pytest.raises(HTTPException) as err:
+        settings_mod.save_llm_provider("ollama", settings_mod._LLMProviderBody(make_active=True))
+    assert err.value.status_code == 409
+
+
+@pytest.mark.parametrize("reply", ["", "   ", "<think>reasoning only</think>"])
+def test_probe_requires_usable_answer(settings_mod, monkeypatch, reply):
+    _configure_groq(settings_mod)
+    _fake_openai(monkeypatch, reply=reply)
+    assert settings_mod.test_llm_provider("groq")["ok"] is False
+
+
+def test_custom_models_can_be_fetched_before_selecting_model(settings_mod, monkeypatch):
+    settings_mod.save_llm_provider("custom", settings_mod._LLMProviderBody(base_url="http://localhost:1234/v1"))
+    clients = _fake_openai(monkeypatch, models=["chat-model"])
+    assert settings_mod.test_llm_provider("custom")["kind"] == "config"
+    assert clients == []
+    assert settings_mod.list_llm_provider_models("custom")["models"] == ["chat-model"]
+
+
+def test_engine_inventory_does_not_probe_lmstudio(settings_mod, monkeypatch):
+    from services import llm_providers, llm_backend
+    from api.routers.engines import _family_payload
+    llm_providers.set_active_provider("lmstudio")
+    monkeypatch.setattr(llm_providers, "discover_model", lambda p: pytest.fail("inventory probed a provider"))
+    assert _family_payload("llm", llm_backend)["active_model"] == ""
+
+
+def test_local_http_provider_setup_to_skill_completion(settings_mod, monkeypatch):
+    """Exercise the real SDK transport across setup, probing and feature use."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from services import llm_backend, llm_skills
+    from core import prefs
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def respond(self, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization"), None))
+            self.respond({"object": "list", "data": [{"id": "local-chat", "object": "model", "created": 0, "owned_by": "local"}]})
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((self.path, self.headers.get("Authorization"), body))
+            self.respond({"id": "test", "object": "chat.completion", "created": 0, "model": "local-chat",
+                          "choices": [{"index": 0, "message": {"role": "assistant", "content": "Bonjour"}, "finish_reason": "stop"}]})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        prefs.set_("llm_backend", "off")
+        settings_mod.save_llm_provider("custom", settings_mod._LLMProviderBody(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="local-test-key",
+            activate_if_unset=False))
+        assert requests == []
+        assert settings_mod.list_llm_provider_models("custom")["models"] == ["local-chat"]
+        settings_mod.save_llm_provider("custom", settings_mod._LLMProviderBody(model="local-chat", activate_if_unset=False))
+        assert settings_mod.connect_llm_provider("custom")["ok"] is True
+        backend = llm_skills.skill_backend("dub_translation")
+        assert backend.id == "openai-compat"
+        assert backend.chat(system="Translate to French", user="Hello") == "Bonjour"
+        handle = llm_skills.resolve_skill_client("cinematic_translation")
+        assert handle is not None and handle.model == "local-chat"
+        result = handle.client.chat.completions.create(model=handle.model, messages=[{"role": "user", "content": "Hello"}])
+        assert result.choices[0].message.content == "Bonjour"
+        handle.client.close()
+        assert llm_backend.active_backend_id() == "openai-compat"
+        assert all(auth == "Bearer local-test-key" for _, auth, _ in requests)
+        assert [path for path, _, _ in requests] == ["/v1/models"] + ["/v1/chat/completions"] * 3
+        assert all(body["model"] == "local-chat" for _, _, body in requests if body)
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
 def test_unknown_provider_404s(settings_mod):
     from fastapi import HTTPException
     with pytest.raises(HTTPException):
@@ -152,6 +327,25 @@ def test_probe_unconfigured_is_kind_config(settings_mod):
     # openai: no key stored, env cleared → config guidance, no network attempt
     body = settings_mod.test_llm_provider("openai")
     assert body["ok"] is False and body["kind"] == "config"
+
+
+@pytest.mark.parametrize("status,kind", [(401, "auth"), (403, "auth"), (429, "rate_limit"), (404, "not_found")])
+def test_cli_bridge_http_failures_keep_their_classification(settings_mod, status, kind):
+    from urllib.error import HTTPError
+    assert settings_mod._classify_llm_error(HTTPError("http://127.0.0.1", status, "failed", {}, None)) == kind
+
+
+@pytest.mark.parametrize("provider,read_timeout", [("ollama", 120), ("groq", 20)])
+def test_probe_allows_local_cold_start_with_bounded_connection(settings_mod, monkeypatch, provider, read_timeout):
+    import openai
+    _configure_groq(settings_mod)
+    def create(**kwargs):
+        assert kwargs["timeout"].read == read_timeout
+        assert kwargs["timeout"].connect == 5
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="ok"))])
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))))
+    assert settings_mod.test_llm_provider(provider)["ok"] is True
 
 
 @pytest.mark.parametrize("exc_name,status,expected_kind", [
@@ -248,3 +442,25 @@ def test_models_disables_sdk_retries(settings_mod, monkeypatch):
     captured = _fake_openai(monkeypatch, models=["a"])
     settings_mod.list_llm_provider_models("groq")
     assert captured and captured[-1].get("max_retries") == 0
+
+
+def test_connect_rejects_account_changed_during_probe(settings_mod, monkeypatch):
+    from core import prefs
+    from services import llm_providers
+    prefs.set_("llm_backend", "off")
+    account = ["verified-project"]
+    monkeypatch.setattr(llm_providers, "resolve_account_id", lambda p: account[0])
+    def probe(pid):
+        account[0] = "unverified-project"
+        return {"ok": True}
+    monkeypatch.setattr(settings_mod, "test_llm_provider", probe)
+    assert settings_mod.connect_llm_provider("ollama") == {"ok": False, "kind": "config"}
+    assert prefs.get("llm_backend") == "off"
+
+
+def test_unknown_provider_is_not_reported_as_environment_pin(settings_mod, monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setenv("LLM_DEFAULT_PROVIDER", "ollama")
+    with pytest.raises(HTTPException) as error:
+        settings_mod.connect_llm_provider("missing-provider")
+    assert error.value.status_code == 404

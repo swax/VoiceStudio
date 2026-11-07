@@ -1,3 +1,6 @@
+import type { CrashContext } from '../shared/utils/crashContext';
+import type { HostSnapshotLike } from '../shared/utils/hostSnapshot';
+import type { InstallFailure } from '../shared/utils/installFailure';
 /**
  * The contextBridge surface exposed to the renderer as `window.voicestudio`.
  *
@@ -12,6 +15,7 @@ export type BackendStage =
   | 'attaching' // an already-running backend on the port answered → we reuse it
   | 'starting' // we spawned it and are polling /system/info
   | 'ready'
+  | 'unresponsive' // alive, but too busy to answer /health — self-recovering, never terminal
   | 'crashed' // the spawned process exited unexpectedly
   | 'port_in_use' // backend exited 78 (EX_CONFIG): another process holds the port
   | 'failed'; // could not start within the budget / spawn error
@@ -23,15 +27,37 @@ export interface NativeCrashRecord {
   signal: string | null;
   uptimeMs: number;
   logTail: string[];
+  /** The backend's last reported activity and free memory. */
+  context?: CrashContext;
   /** Viewing or dismissing a crash marks it seen while retaining evidence for reports. */
   acknowledged: boolean;
 }
 export interface BackendStatus {
   lastCrash?: NativeCrashRecord;
+  /** The CUDA download failed or stuck, and the smaller CPU build could get past it. */
+  cpuSetupAvailable?: boolean;
+  /** Set on the setup screen when Windows Smart App Control may block the engine. */
+  smartAppControlWarning?: boolean;
+  /** OMNIVOICE_ANALYTICS_DISABLED is set: nothing may be sent, whatever was chosen. */
+  analyticsDisabled?: boolean;
+  /** Code and facts for the current install or startup failure. */
+  failure?: InstallFailure;
   stage: BackendStage;
-  setupIssue?: 'space' | 'access';
+  setupIssue?:
+    | 'space'
+    | 'access'
+    | 'unsupported_platform'
+    | 'wrong_architecture'
+    | 'missing_system_library'
+    | 'outdated_system_library'
+    | 'files_locked'
+    | 'install_stuck';
+  /** Free disk (GiB) the failed install needed; the CPU-only install needs less than the CUDA one. */
+  setupRequiredGib?: number;
   /** A prior explicit install stopped after creating its resumable project/cache. */
   runtimeInterrupted?: boolean;
+  /** Automatic repair of a lost Python environment already ran this launch and failed. */
+  runtimeRepairFailed?: boolean;
   setupPhase?: 'checking' | 'downloading_uv' | 'installing_deps' | 'verifying';
   setupProgress?: {
     resolvedPackages?: number;
@@ -47,6 +73,11 @@ export interface BackendStatus {
     activePackage?: string;
     downloadsComplete?: boolean;
     estimatedBytes?: boolean;
+    /** Host serving the active download, from the wheel URLs pinned in uv.lock. */
+    downloadHost?: string;
+    /** Pending downloads received no bytes for `stalledSeconds`. */
+    stalled?: boolean;
+    stalledSeconds?: number;
   };
   /** http://127.0.0.1:<port> — no trailing slash. */
   baseUrl: string;
@@ -57,6 +88,12 @@ export interface BackendStatus {
   remote: boolean;
   /** Human-readable detail for failed/crashed/port_in_use. */
   message?: string;
+  /**
+   * Machine-readable reason behind `message` for the two connectivity states
+   * whose wording the renderer localizes: a remote backend whose health checks
+   * time out, and a backend that keeps answering /health unhealthy.
+   */
+  diagnosis?: 'remote_unreachable' | 'unhealthy' | 'auth_required';
   exitCode?: number | null;
   /** Termination signal for the current backend run, never the persisted crash journal. */
   exitSignal?: string | null;
@@ -67,7 +104,11 @@ export interface BackendStatus {
   /** Managed Python environment root shown during first-run setup. */
   runtimePath?: string;
   runtimeCustom?: boolean;
+  /** Free GiB on the drive that will hold the runtime, while setup is required. */
+  runtimeFreeGib?: number;
   runtimeRegion?: RuntimeRegion;
+  /** Where data, models and temp files go when the location was chosen during setup. */
+  runtimeStorage?: { data: string; models: string; temp: string };
 }
 
 export type RuntimeRegion = 'auto' | 'global' | 'china' | 'russia' | 'restricted';
@@ -84,7 +125,6 @@ export interface BackendConnection {
   authenticated: boolean;
 }
 
-export type UpdateChannel = 'stable' | 'preview';
 export type UpdateStatus =
   | 'unsupported'
   | 'idle'
@@ -93,11 +133,15 @@ export type UpdateStatus =
   | 'downloading'
   | 'downloaded'
   | 'error';
+export type UpdateChannel = 'stable' | 'beta';
 export interface UpdateState {
   status: UpdateStatus;
   currentVersion: string;
+  /** Absent when this build cannot switch channels (Store builds, dev runs). */
+  channel?: UpdateChannel;
+  /** Set only while status is 'unsupported': why this build cannot update itself. */
+  unsupportedReason?: 'development' | 'store' | 'package-manager';
   availableVersion?: string;
-  channel: UpdateChannel;
   notes?: string | null;
   progress: number;
   transferredBytes?: number;
@@ -152,6 +196,9 @@ export interface RepairAgentInfo {
   version: string;
 }
 export interface RepairAgentRunRequest {
+  workspace?: 'app' | 'source';
+  features?: import('../shared/agent-workspace').AgentFeature[];
+  history?: import('../shared/agent-workspace').AgentChatMessage[];
   agent: RepairAgentId;
   mode: 'diagnose' | 'fix';
   report: string;
@@ -189,6 +236,8 @@ export interface RepairAgentState {
   exitCode?: number | null;
   workspaceAvailable: boolean;
   workspacePath?: string;
+  /** Set only on a chooseWorkspace reply whose picked folder was rejected. */
+  workspaceError?: 'installed_app' | 'not_git' | 'not_voicestudio' | 'read_only';
 }
 export type RepairAgentEvent =
   | { sessionId: string; type: 'output'; text: string }
@@ -273,14 +322,86 @@ export interface UninstallTarget {
   shared: boolean;
 }
 
+export interface AccountSignInOptions {
+  /** `signup` opens the dashboard on account creation; `login` (default) on sign-in. */
+  intent: 'login' | 'signup';
+}
+
+export interface AccountPublicState {
+  /** The signed-in account's ID; token presence alone does not count as signed in. */
+  accountId?: string | null;
+  available: boolean;
+  accountEnabled: boolean;
+  syncEnabled: boolean;
+  prompted: boolean;
+  /** False when the OS keyring is unavailable: sign-in lasts until the app quits. */
+  remembered: boolean;
+  signedIn: boolean;
+  signingIn: boolean;
+  notice: 'signed_out_expired' | 'sign_in_failed' | 'offline' | null;
+  profile: {
+    email: string | null;
+    displayName: string | null;
+    avatarUrl: string | null;
+    personalOrganizationId: string | null;
+    organizations: Array<{
+      id: string;
+      slug: string;
+      displayName: string;
+      role: string;
+      kind: string;
+    }>;
+  } | null;
+  /** Why the account details could not be loaded (an HTTP status, or "offline"); null when fine. */
+  profileError: string | null;
+  /** The personal Organization's plan and storage (entitlements); null when signed out. */
+  plan: {
+    planCode: string;
+    planName: string;
+    /** Where the plan comes from (for example `default`, a purchase or a grant). */
+    planOrigin: string;
+    /** When the plan ends (a yearly plan or a grant); null for no end. */
+    planEndsAt: string | null;
+    storageUsedBytes: number;
+    storageLimitBytes: number;
+    /** What the plan includes; null when the entitlements could not be read. */
+    settingsSync: boolean | null;
+    proDesktop: boolean | null;
+  } | null;
+  /** Dashboard pages for the profile, the plan and account deletion; null when signed out. */
+  links: { profile: string; plan: string; deletion: string } | null;
+}
+
+export interface SetupConnectionCheck {
+  status: 'ok' | 'failed' | 'unavailable';
+  host?: string;
+  bytes?: number;
+  elapsedMs?: number;
+  bytesPerSecond?: number;
+  error?: string;
+  checkedAt: number;
+}
+
 export interface VoiceStudioBridge {
-  pro: {
-    status(): Promise<{ active: boolean; configured: boolean; error?: 'offline' | 'invalid' | 'storage' }>;
-    activate(key: string): Promise<{ active: boolean; configured: boolean; error?: 'offline' | 'invalid' | 'storage' }>;
-    deactivate(): Promise<{ active: boolean; configured: boolean; error?: 'offline' | 'invalid' | 'storage' }>;
+  /** VoiceStudio Cloud account; never carries a token. */
+  account: {
+    get(): Promise<AccountPublicState>;
+    /** Reload profile, plan and photo, then notify every open window. */
+    refresh(): Promise<AccountPublicState>;
+    signIn(options?: AccountSignInOptions): Promise<void>;
+    cancelSignIn(): Promise<void>;
+    signOut(): Promise<void>;
+    setSwitches(patch: {
+      accountEnabled?: boolean;
+      syncEnabled?: boolean;
+    }): Promise<AccountPublicState>;
+    updateProfile(patch: { display_name?: string }): Promise<AccountPublicState>;
+    onState(cb: (state: AccountPublicState) => void): () => void;
   };
+  browser: import('../shared/site-browser').SiteBrowserBridge;
   repair: {
-    list(): Promise<RepairAgentInfo[]>;
+    /** Cached for a short TTL; `refresh` rescans for CLIs installed since. */
+    list(options?: { refresh?: boolean }): Promise<RepairAgentInfo[]>;
     getState(): Promise<RepairAgentState>;
     chooseWorkspace(): Promise<RepairAgentState>;
     start(request: RepairAgentRunRequest): Promise<{ sessionId: string }>;
@@ -299,9 +420,9 @@ export interface VoiceStudioBridge {
     check(): Promise<UpdateState>;
     download(): Promise<UpdateState>;
     dismiss(): Promise<UpdateState>;
-    install(): Promise<void>;
     setChannel(channel: UpdateChannel): Promise<UpdateState>;
-    listReleases(channel: UpdateChannel): Promise<UpdateReleaseInfo[]>;
+    install(): Promise<void>;
+    listReleases(): Promise<UpdateReleaseInfo[]>;
     onState(cb: (state: UpdateState) => void): () => void;
   };
   maintenance: {
@@ -325,6 +446,9 @@ export interface VoiceStudioBridge {
     platform: NodeJS.Platform;
     isDev: boolean;
     onNavigate(callback: (path: string) => void): () => void;
+    /** Native fullscreen state (macOS hides the traffic lights there); the callback fires on every change. */
+    isFullScreen(): Promise<boolean>;
+    onFullScreen(callback: (fullscreen: boolean) => void): () => void;
     onPersistenceFlush(callback: () => void | Promise<void>): () => void;
   };
   backend: {
@@ -336,10 +460,14 @@ export interface VoiceStudioBridge {
     restart(): Promise<void>;
     setupRuntime(): Promise<void>;
     cleanSetupRuntime(): Promise<void>;
+    setupRuntimeOnCpu(): Promise<void>;
     setRuntimeRegion(region: RuntimeRegion): Promise<RuntimeRegion>;
     chooseRuntimeLocation(title: string): Promise<RuntimeLocation | null>;
     useDefaultRuntimeLocation(): Promise<RuntimeLocation>;
     getConnection(): Promise<BackendConnection>;
+    getHostSnapshot(): Promise<HostSnapshotLike>;
+    getSetupDiagnostics(): Promise<string>;
+    checkSetupConnection(): Promise<SetupConnectionCheck>;
     testRemote(input: { url: string; apiKey: string }): Promise<RemoteBackendProbe>;
     useRemote(input: { url: string; apiKey: string }): Promise<RemoteBackendProbe>;
     useLocal(): Promise<BackendConnection>;

@@ -51,6 +51,69 @@ function stripMarkup(text) {
   return (text || '').replace(BRACKET_RE, ' ');
 }
 
+function headingSpans(norm) {
+  const heads = [];
+  const hre = new RegExp(HEADING_RE.source, HEADING_RE.flags);
+  let match;
+  while ((match = hre.exec(norm)) !== null) {
+    heads.push({
+      index: match.index,
+      end: match.index + match[0].length,
+      title: (match[1] || '').trim(),
+    });
+    if (hre.lastIndex === match.index) hre.lastIndex++;
+  }
+  return heads;
+}
+
+function spokenWordCount(text) {
+  return stripMarkup(text).split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * `# ` H1 chapters for the script outline. Offsets are into a CRLF-normalized
+ * manuscript so the editor can select the heading and scroll to it.
+ */
+export function parseChapterOutline(text) {
+  const norm = (text || '').replace(/\r\n?/g, '\n');
+  const heads = headingSpans(norm);
+  // One forward scan for line numbers: rescanning each heading's prefix is
+  // quadratic and stalls typing in large chaptered manuscripts.
+  let line = 1;
+  let scanned = 0;
+  return heads.map((head, index) => {
+    for (let at = norm.indexOf('\n', scanned); at !== -1 && at < head.index;) {
+      line++;
+      at = norm.indexOf('\n', at + 1);
+    }
+    scanned = head.index;
+    const bodyEnd = index + 1 < heads.length ? heads[index + 1].index : norm.length;
+    return {
+      index,
+      title: head.title,
+      start: head.index,
+      headingEnd: head.end,
+      line,
+      words: spokenWordCount(norm.slice(head.end, bodyEnd)),
+    };
+  });
+}
+
+/**
+ * Heading to insert at `caret`, with a leading newline when not already at a
+ * line start and a trailing one when text follows on the same line (after
+ * `end`, the selection end), so that text stays out of the heading.
+ */
+export function chapterHeadingSnippet(text, caret, end = caret) {
+  const value = text || '';
+  const clamp = (n) => (Number.isFinite(n) ? Math.max(0, Math.min(n, value.length)) : value.length);
+  const at = clamp(caret);
+  const to = Math.max(at, clamp(end));
+  const atLineStart = at === 0 || value[at - 1] === '\n';
+  const atLineEnd = to === value.length || value[to] === '\n';
+  return (atLineStart ? '' : '\n') + '# ' + (atLineEnd ? '' : '\n');
+}
+
 /**
  * Live script stats: chapters (`# ` H1 count, ≥1 so a title-less script still
  * reads as one chapter), spoken word count (whitespace split, markup stripped),
@@ -105,13 +168,7 @@ export function validateScript(text, { mappedNames = [], profileIds = [] } = {})
 
   // 2. Empty chapters — a `# heading` whose body has no spoken text. Split on
   //    headings (mirroring the parser) and check each body for any word.
-  const heads = [];
-  const hre = new RegExp(HEADING_RE.source, HEADING_RE.flags);
-  let hm;
-  while ((hm = hre.exec(norm)) !== null) {
-    heads.push({ index: hm.index, end: hm.index + hm[0].length, title: (hm[1] || '').trim() });
-    if (hre.lastIndex === hm.index) hre.lastIndex++;
-  }
+  const heads = headingSpans(norm);
   for (let i = 0; i < heads.length; i++) {
     const bodyEnd = i + 1 < heads.length ? heads[i + 1].index : norm.length;
     const body = norm.slice(heads[i].end, bodyEnd);

@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from services.subprocess_backend import SubprocessBackend
@@ -86,6 +87,20 @@ def _duration_factor(text: str, language: str, duration: float) -> float:
     return max(0.5, min(float(duration) / natural_s, 2.0))
 
 
+def _speed_duration(text: str, language: str, speed: object) -> float | None:
+    """The target duration a public ``speed`` multiplier asks for, if any."""
+    from services.speech_rate import expected_duration
+
+    try:
+        rate = float(speed)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rate) or rate <= 0 or abs(rate - 1.0) < 1e-6:
+        return None
+    natural_s = expected_duration(text, language)
+    return natural_s / rate if natural_s > 0 else None
+
+
 class IndexTTS2Backend(SubprocessBackend):
     """IndexTTS 2.5 (Bilibili) — isolated subprocess with IndexTTS-2 fallback.
 
@@ -130,9 +145,11 @@ class IndexTTS2Backend(SubprocessBackend):
     _DEFAULT_SAMPLE_RATE = 24000
     # Explicit so IndexTTS2 stops advertising the inherited CPU-only default:
     # the sidecar runs the IndexTTS PyTorch model on CUDA when present, else
-    # CPU. ROCm left unclaimed (the sidecar's own venv would need a ROCm torch);
-    # a ROCm host honestly resolves to cpu_fallback.
-    gpu_compat = ("cuda", "cpu")
+    # CPU. ROCm is claimed since the one-click installer puts a ROCm torch in
+    # the sidecar venv on ROCm hosts (sidecar_install.uses_rocm_index, #2371),
+    # which `torch.cuda.is_available()` satisfies; a user-managed environment
+    # must supply its own ROCm torch to benefit.
+    gpu_compat = ("cuda", "rocm", "cpu")
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
@@ -159,6 +176,65 @@ class IndexTTS2Backend(SubprocessBackend):
                 f"{INDEXTTS_SIDECAR_SCRIPT} — reinstall VoiceStudio."
             )
         return True, "ok"
+
+    @classmethod
+    def _sidecar_torch_is_cuda_only(cls) -> bool:
+        """Whether sidecar metadata cannot support an accelerated ROCm claim.
+
+        ``gpu_compat`` claims ROCm because the one-click installer provisions a
+        ROCm torch on ROCm hosts (#2371). A venv that predates that, or a
+        user-managed clone, can still carry the CUDA wheel upstream resolves -
+        which sees no AMD GPU, so the engine would run on the CPU while routing
+        reported acceleration (the PR #2423 review finding). Unknown environments
+        are conservative only for explicit Windows ROCm opt-in; defaults on
+        every platform retain their existing behavior.
+        This metadata check never spawns a probe or changes the sidecar pins.
+        """
+        import sys
+
+        windows_rocm = (
+            sys.platform == "win32"
+            and os.environ.get("OMNIVOICE_TORCH_VARIANT", "").strip().lower() == "rocm"
+        )
+        try:
+            from engines.indextts import bootstrap
+            from services.sidecar_install import venv_torch_hip
+
+            # The venv bootstrap will use: the one it already resolved, else the
+            # first candidate on disk in its own probe order (user clone, then
+            # this package's managed venv) - never spawning the import probe.
+            python = bootstrap._resolved_python or next(
+                (p for p in bootstrap._probe_paths() if p.is_file()), None
+            )
+            if python is None:
+                return windows_rocm
+            hip = venv_torch_hip(Path(python).parent.parent)
+            return hip is False or (hip is None and windows_rocm)
+        except Exception:  # noqa: BLE001 - metadata only, never break the picker
+            return windows_rocm
+
+    @classmethod
+    def runtime_compute_profile(cls, caps) -> dict:
+        from services.engine_routing import resolve_routing
+
+        compat = tuple(cls.gpu_compat)
+        if caps.family == "rocm" and cls._sidecar_torch_is_cuda_only():
+            # Honest on this host: the sidecar's torch cannot see the GPU.
+            compat = tuple(c for c in compat if c != "rocm")
+        floor = float(getattr(cls, "min_vram_gb", 0.0) or 0.0)
+        return {
+            "gpu_compat": compat,
+            "min_vram_gb": floor,
+            # Own torch in its sidecar venv: the parent's CPU fallback does
+            # not reach it, so a kernel mismatch stays a caveat.
+            **resolve_routing(compat, caps, floor, parent_torch=False),
+            "runtime_backend": None,
+            "runtime_device_index": None,
+            "runtime_device_name": None,
+            "runtime_hardware_family": None,
+            "runtime_vram_gb": None,
+            "runtime_device_verified": None,
+        }
 
     @classmethod
     def venv_python(cls):
@@ -249,6 +325,13 @@ class IndexTTS2Backend(SubprocessBackend):
 
         # Duration control — codec frame rate ≈ 21 Hz.
         duration = kw.get("duration")
+        if duration is None and kw.get("duration_factor") is None:
+            # Public ``speed`` (every route sends it) has no native IndexTTS
+            # knob, and was silently dropped (#3588). Express it as the
+            # duration it implies, so it reaches both 2.5 (relative factor)
+            # and legacy IndexTTS-2 (target tokens). Explicit duration
+            # controls win, so speed is never applied twice.
+            duration = _speed_duration(text, language, kw.get("speed"))
         if duration is not None:
             target_tokens = int(float(duration) * 21)
             if target_tokens > 0:
@@ -265,11 +348,6 @@ class IndexTTS2Backend(SubprocessBackend):
             forwarded["duration_factor"] = _duration_factor(
                 text, language, float(duration)
             )
-        elif kw.get("speed") and abs(float(kw["speed"]) - 1.0) > 1e-3:
-            # IndexTTS has no speed of its own, so a dub line's speed was
-            # dropped. 2.5's duration factor scales the take's length exactly
-            # (the S2M target length), keeping the pitch.
-            forwarded["duration_factor"] = max(0.5, min(1.0 / float(kw["speed"]), 2.0))
 
         if (
             emo_vector

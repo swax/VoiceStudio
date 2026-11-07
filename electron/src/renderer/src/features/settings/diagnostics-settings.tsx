@@ -26,6 +26,7 @@ import { apiJson, describeError } from '@/lib/api/client';
 import type { SystemInfo } from '@/lib/api/types';
 import { brandIcon } from '@/lib/brand';
 import { SettingsActionError } from './settings-action-error';
+import { ModelCredits } from './model-credits';
 import { SettingsRow, SettingsSection } from './settings-layout';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
@@ -162,7 +163,9 @@ export function DiagnosticsSettings() {
           </span>
         </SettingsRow>
         <SettingsRow id="diagnostics-version" title={t('about.version')}>
-          <span className="font-mono text-xs">{bridge?.app.version ?? __APP_VERSION__}</span>
+          <span className="font-mono text-xs">
+            {bridge?.app.version ?? __APP_VERSION__} ({__BUILD_COMMIT__})
+          </span>
         </SettingsRow>
         <SettingsRow id="diagnostics-platform" title={t('about.platform')}>
           <span className="max-w-xl text-right font-mono text-xs">{platform}</span>
@@ -263,6 +266,8 @@ export function DiagnosticsSettings() {
           </span>
         </SettingsRow>
       </SettingsSection>
+
+      <ModelCredits />
 
       <SettingsSection icon={ActivityIcon} title={t('about.diagnostics')}>
         <div className="flex flex-wrap items-center gap-2 p-4">

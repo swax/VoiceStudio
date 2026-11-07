@@ -18,6 +18,35 @@ vi.mock('./backendCrash', async (importOriginal) => {
   return { ...actual, getLastBackendCrash: vi.fn().mockResolvedValue(null) };
 });
 
+describe('scrubText removes a home folder name with spaces (#3724)', () => {
+  it.each([
+    ['C:\\Users\\Alice Smith\\model.bin', '~\\model.bin'],
+    ['c:/Users/Alice Smith/AppData/x.log', '~/AppData/x.log'],
+    ['file:///C:/Users/Ann Lee/app.js', '~/app.js'],
+    ['/Users/Alice Smith/Library/Logs/app.log', '~/Library/Logs/app.log'],
+    ['/home/alice smith/.omnivoice/omnivoice.log', '~/.omnivoice/omnivoice.log'],
+    ['loaded "C:\\Users\\Jo Ann Lee\\a b\\m.bin"', 'loaded "~\\a b\\m.bin"'],
+  ])('%s', (raw, expected) => {
+    expect(scrubText(raw)).toBe(expected);
+    expect(scrubText(raw)).not.toMatch(/Smith|Ann|Lee|alice/i);
+  });
+
+  it('keeps the words after a home path that ends the text', () => {
+    expect(scrubText('/home/bob and more')).toBe('~ and more');
+    expect(scrubText('at C:\\Users\\bob said hi')).toBe('at ~ said hi');
+  });
+
+  it("removes the running user's real home whole, even where nothing follows it", () => {
+    vi.stubEnv('USERPROFILE', 'C:\\Users\\Alice Smith');
+    try {
+      expect(scrubText('profile at C:\\Users\\Alice Smith')).toBe('profile at ~');
+      expect(scrubText('profile at c:/users/alice smith')).toBe('profile at ~');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
 describe('scrubText — frontend twin of backend/core/scrub.py', () => {
   it.each([
     ['/Users/alice/Library/Logs/app.log', '~/Library/Logs/app.log'],
@@ -139,6 +168,31 @@ describe('buildBugReportUrl', () => {
     err.stack = 'at frame\n'.repeat(5000);
     const url = await buildBugReportUrl({ error: err });
     expect(url.length).toBeLessThan(8000);
+  });
+
+  it('includes arch and active ASR engine when the backend answers (#2416)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation((url) => {
+        const u = String(url);
+        if (u.includes('/system/info'))
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ arch: 'x86_64', disk_free_gb: 752.1 }),
+          });
+        if (u.includes('/engines'))
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({ tts: { active: 'omnivoice' }, asr: { active: 'faster-whisper' } }),
+          });
+        return Promise.reject(new Error('ECONNREFUSED'));
+      }),
+    );
+    const body = decodeURIComponent(await buildBugReportUrl());
+    expect(body).toContain('**Arch:** `x86_64`');
+    expect(body).toContain('**Active TTS engine:** `omnivoice`');
+    expect(body).toContain('**Active ASR engine:** `faster-whisper`');
   });
 });
 
