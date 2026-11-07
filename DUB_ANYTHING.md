@@ -13,6 +13,11 @@ This fork integrates upstream commit
   build on Windows; leave other runtimes' upstream dispatch policy intact.
 - Preserve LF bytes for hash-pinned bundled model text assets on Windows.
 
+The IndexTTS adapter declares its per-request seed capability so both ordinary
+generation and dubbing forward seeds to its isolated worker. The English fork
+notice is also included before every upstream README translation; the upstream
+translation bodies and their link/command parity checks remain intact.
+
 CPU float32 and IndexTTS speed are now provided by upstream. The old early-cache
 marker was retired in favor of upstream's atomic publication rules. Reusing
 failed renders' takes remains a separate follow-up that must keep unaccepted

@@ -88,13 +88,29 @@ def _probe(flag, calls):
 def test_the_seed_reaches_audiocpp_and_gguf_through_generate():
     from api.routers.generation import _run_backend_inference
 
-    for module, name in (("engines.audiocpp", "AudioCPPBackend"),
-                         ("engines.omnivoice_gguf", "OmniVoiceGGUFBackend")):
+    for module, name in (
+        ("engines.audiocpp", "AudioCPPBackend"),
+        ("engines.omnivoice_gguf", "OmniVoiceGGUFBackend"),
+        ("engines.indextts", "IndexTTS2Backend"),
+    ):
         cls = getattr(importlib.import_module(module), name)
         calls = []
-        _run_backend_inference(_probe(cls.supports_generation_seed, calls), "Hello.",
-                               "English", None, None, "male", None,
-                               32, 2, 1, True, True, 1234, "raw")
+        _run_backend_inference(
+            _probe(cls.supports_generation_seed, calls),
+            "Hello.",
+            "English",
+            None,
+            None,
+            "male",
+            None,
+            32,
+            2,
+            1,
+            True,
+            True,
+            1234,
+            "raw",
+        )
         assert calls[-1].get("seed") == 1234, name
 
 

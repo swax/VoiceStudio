@@ -1,3 +1,40 @@
+# VoiceStudio for Dub Anything
+
+This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the public
+VoiceStudio fork used as the voice backend for
+[Dub Anything](https://github.com/swax/dub-anything). Dub Anything directs,
+renders and checks video dubs through this backend, and includes it as a Git
+submodule pinned to a tested commit.
+
+This fork integrates upstream commit `2e195d72d3794a88b7cb37f87a3e92a20193574e`
+and keeps these additional controls:
+
+- **Transcription:** respect the selected source language when transcribing dub audio.
+- **Per-line direction:** accept voice references, emotion references and random seeds
+  for individual segments, forward seeds to IndexTTS, and invalidate cached takes
+  when these controls change.
+- **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
+- **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
+  adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
+  dispatch and precision policy.
+- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets.
+
+Upstream now supplies CPU float32 selection and IndexTTS speed control, so the
+original overrides were removed. The integration also keeps upstream's atomic
+cache publication: failed or cancelled renders cannot replace published takes.
+Reusing newly synthesized takes after a timing failure needs a separate design
+that preserves that safeguard.
+
+For installation, use [Dub Anything's setup guide](https://github.com/swax/dub-anything/blob/main/docs/setup.md).
+The former standalone patch is maintained here as commits. See
+[fork maintenance notes](../../DUB_ANYTHING.md) for the baseline and update workflow.
+VoiceStudio retains its [AGPL-3.0 license and notices](../../LICENSE-NOTICE.md);
+model weights retain their own licenses.
+
+The original project's README follows.
+
+---
+
 <div align="center">
   <h1><sub><img src="../../docs/logo.png" alt="" width="36" height="36" /></sub> VoiceStudio</h1>
   <p>
