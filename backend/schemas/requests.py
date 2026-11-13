@@ -256,6 +256,19 @@ class TranscriptSyncRequest(BaseModel):
     segments: List[TranscriptSegment] = Field(min_length=1, max_length=20000)
 
 
+class DubAttachStemsRequest(BaseModel):
+    """Stems the client separated itself, as file names in the job folder."""
+
+    vocals: str = Field(min_length=1, max_length=255)
+    no_vocals: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
+class DubForkRequest(BaseModel):
+    """The id of the new job that shares the source job's media."""
+
+    job_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 class CleanupSegmentsRequest(BaseModel):
     """The editor's current segments; without them the stored copy is cleaned."""
 

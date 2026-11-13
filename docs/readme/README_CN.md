@@ -14,6 +14,8 @@ and keeps these additional controls:
   for individual segments, forward seeds to IndexTTS, and invalidate cached takes
   when these controls change.
 - **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
+- **Shared media:** upload without separating the voices, attach stems the client
+  separated itself, and fork a job over the same media to render it in another voice.
 - **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
   adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
   dispatch and precision policy.

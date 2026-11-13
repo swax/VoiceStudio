@@ -595,6 +595,115 @@ def merge_and_save_job(
         return True
 
 
+#: The ingest layer of a job record: its media and their properties. A fork
+#: carries these; transcription, voice references and render state stay with
+#: the job that made them.
+_FORK_FIELDS = (
+    "video_path", "audio_path", "vocals_path", "no_vocals_path", "thumb_path",
+    "duration", "filename", "scene_cuts", "youtube_subs", "input_type",
+    "source_lang_override",
+)
+#: Ingest artifacts kept by file presence rather than in the record.
+_FORK_FILES = ("audio_hq.wav",)
+#: How far an attached stem's length may differ from the job's audio.
+_STEM_TOLERANCE_S = 1.0
+
+
+def _stem_in_job(job_dir: str, name: str, duration: float) -> str:
+    """A stem file directly inside ``job_dir``: a readable audio file as long
+    as the job's audio. Returns its real path."""
+    if not name or os.path.basename(name) != name or name in (".", ".."):
+        raise ValueError(f"stem {name!r} must be a file name inside the job folder")
+    path = os.path.realpath(os.path.join(job_dir, name))
+    if os.path.dirname(path) != os.path.realpath(job_dir) or not os.path.isfile(path):
+        raise ValueError(f"stem {name!r} is not a file in the job folder")
+    try:
+        info = sf.info(path)
+    except Exception as exc:  # any decoder failure means the stem is unusable
+        raise ValueError(f"stem {name!r} is not readable audio") from exc
+    length = info.frames / float(info.samplerate)
+    if duration and abs(length - duration) > _STEM_TOLERANCE_S:
+        raise ValueError(f"stem {name!r} lasts {length:.2f} s; the job's audio lasts {duration:.2f} s")
+    return path
+
+
+def attach_stems(job_id: str, vocals: str, no_vocals: Optional[str]) -> dict:
+    """Record stems a client separated itself as the job's voices and bed.
+
+    The files must already be in the job folder (named relative to it) and as
+    long as the job's audio. Transcription, voice references and mixing read
+    the job's ``vocals_path`` / ``no_vocals_path``, so attach before
+    transcribing. Raises LookupError for an unknown job, ValueError for a bad
+    stem.
+    """
+    job_dir = safe_job_dir(job_id)
+    job = get_job(job_id) if job_dir else None
+    if job is None:
+        raise LookupError("Dub job not found")
+    with _dub_jobs_lock:
+        if job_id in _inflight_jobs:
+            raise ValueError("The job is still being prepared")
+    duration = float(job.get("duration") or 0.0)
+    updates = {"vocals_path": _stem_in_job(job_dir, vocals, duration)}
+    updates["no_vocals_path"] = _stem_in_job(job_dir, no_vocals, duration) if no_vocals else None
+    if not merge_and_save_job(job_id, updates, filename=job.get("filename") or "", duration=duration):
+        raise LookupError("Dub job not found")
+    return updates
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """Hard-link ``src`` to ``dst`` (copy across volumes). A linked file is
+    shared: replace it (write elsewhere, then os.replace), never rewrite it."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def fork_job(source_id: str, new_id: str) -> dict:
+    """A new job over the same media as ``source_id``, for rendering the same
+    audio again (another voice) without uploading, extracting or separating
+    it again. Media in the source folder are hard-linked; transcription and
+    render state are not carried. Raises LookupError for an unknown source,
+    FileExistsError for a taken id, ValueError for an unusable one.
+    """
+    source_dir, new_dir = safe_job_dir(source_id), safe_job_dir(new_id)
+    if new_dir is None or len(new_id) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", new_id):
+        raise ValueError("Invalid job_id. Must be alphanumeric + hyphens/underscores only, <=64 chars.")
+    job = get_job(source_id) if source_dir else None
+    if job is None:
+        raise LookupError("Dub job not found")
+    with _dub_jobs_lock:
+        if source_id in _inflight_jobs:
+            raise ValueError("The job is still being prepared")
+    real_source = os.path.realpath(source_dir)
+    os.makedirs(new_dir, exist_ok=False)  # FileExistsError: the id is taken
+    try:
+        record = {key: job.get(key) for key in _FORK_FIELDS}
+        for key in ("video_path", "audio_path", "vocals_path", "no_vocals_path", "thumb_path"):
+            path = record.get(key)
+            if path and os.path.dirname(os.path.realpath(path)) == real_source and os.path.isfile(path):
+                record[key] = os.path.join(new_dir, os.path.basename(path))
+                if not os.path.exists(record[key]):
+                    _link_or_copy(path, record[key])
+        for name in _FORK_FILES:
+            if os.path.isfile(os.path.join(source_dir, name)):
+                _link_or_copy(os.path.join(source_dir, name), os.path.join(new_dir, name))
+        record.update(segments=None, dubbed_tracks={}, forked_from=source_id)
+        begin_ingest(new_id)  # clears a tombstone left by a deleted job of this id
+        try:
+            put_and_save_job(
+                new_id, record, filename=record.get("filename") or "",
+                duration=float(record.get("duration") or 0.0),
+            )
+        finally:
+            end_ingest(new_id)
+    except BaseException:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise
+    return record
+
+
 def purge_jobs(job_ids, *, delete_rows, include_inflight: bool = False) -> None:
     """Delete history rows and evict the in-memory records as ONE atomic step.
 
@@ -1635,7 +1744,11 @@ async def ingest_pipeline(
             video_path = await _ensure_browser_playable_mp4_for_job(job_id, video_path)
 
         # Content-hash cache: reuse artifacts from previous matching jobs.
-        content_hash = await asyncio.to_thread(compute_file_hash, audio_path)
+        # A client that separates the voices itself (``separate`` false, its
+        # stems attached later by attach_stems) neither reuses another job's
+        # stems nor offers its own, which do not exist yet.
+        separate = source.get("separate", True)
+        content_hash = await asyncio.to_thread(compute_file_hash, audio_path) if separate else ""
         cached = find_cached_job(content_hash, job_id)
         if cached:
             logger.info("Cache hit for job %s (hash %s) → reusing artifacts from %s",
@@ -1715,50 +1828,56 @@ async def ingest_pipeline(
             no_vocals_path = os.path.join(job_dir, "no_vocals.wav")
             scene_cuts: list = []
 
-            yield prep_event("demucs_start")
-            try:
-                demucs_cmd = [sys.executable, "-m", "demucs.separate",
-                              "--two-stems", "vocals", "-n", "htdemucs", "-d", get_best_device(),
-                              audio_hq_path or audio_path, "-o", job_dir]
-                rc = -1
-                stderr_full = b""
-                last_pct = -1
-                # demucs writes a tqdm progress bar to stderr as
-                # "  42%|████      | …" — surface each new integer percent
-                # to the UI so the user sees the bar instead of a static
-                # spinner during the multi-minute separation step.
-                async for evt in run_proc_streaming_stderr(job_id, demucs_cmd, timeout=1800.0):
-                    if evt[0] == "stderr":
-                        m = re.search(r"(\d{1,3})%", evt[1])
-                        if m:
-                            pct = max(0, min(100, int(m.group(1))))
-                            if pct != last_pct:
-                                last_pct = pct
-                                yield prep_event("demucs_progress", percent=pct)
-                    elif evt[0] == "done":
-                        rc, stderr_full = evt[1], evt[2]
-                if rc != 0:
-                    raise Exception(_media_process_error("Demucs", rc, stderr_full, paths=(audio_hq_path, audio_path, job_dir)))
-                # Stems land under the INPUT's basename ("audio_hq" when the
-                # full-quality extraction succeeded, "audio" on its fallback).
-                demucs_out = os.path.join(
-                    job_dir, "htdemucs",
-                    os.path.splitext(os.path.basename(audio_hq_path or audio_path))[0],
-                )
-                if os.path.exists(os.path.join(demucs_out, "vocals.wav")):
-                    shutil.move(os.path.join(demucs_out, "vocals.wav"), vocals_path)
-                    shutil.move(os.path.join(demucs_out, "no_vocals.wav"), no_vocals_path)
-                    shutil.rmtree(os.path.join(job_dir, "htdemucs"), ignore_errors=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Demucs failed for %s, falling back to mixed audio: %s", log_safe(job_id), log_safe(e))
-                # plan-04: surface the degradation (job continues with mixed audio).
-                yield prep_event("warning", **failure.build_failure(e, stage="demucs", include_diagnostic=False))
-                vocals_path = audio_path
-                no_vocals_path = None
+            if not separate:
+                # The client separates the voices itself and attaches its stems
+                # (POST /dub/stems/{job_id}); until then the mix stands in.
+                vocals_path, no_vocals_path = audio_path, None
+            else:
+                yield prep_event("demucs_start")
+                try:
+                    demucs_cmd = [sys.executable, "-m", "demucs.separate",
+                                  "--two-stems", "vocals", "-n", "htdemucs", "-d", get_best_device(),
+                                  audio_hq_path or audio_path, "-o", job_dir]
+                    rc = -1
+                    stderr_full = b""
+                    last_pct = -1
+                    # demucs writes a tqdm progress bar to stderr as
+                    # "  42%|████      | …" — surface each new integer percent
+                    # to the UI so the user sees the bar instead of a static
+                    # spinner during the multi-minute separation step.
+                    async for evt in run_proc_streaming_stderr(job_id, demucs_cmd, timeout=1800.0):
+                        if evt[0] == "stderr":
+                            m = re.search(r"(\d{1,3})%", evt[1])
+                            if m:
+                                pct = max(0, min(100, int(m.group(1))))
+                                if pct != last_pct:
+                                    last_pct = pct
+                                    yield prep_event("demucs_progress", percent=pct)
+                        elif evt[0] == "done":
+                            rc, stderr_full = evt[1], evt[2]
+                    if rc != 0:
+                        raise Exception(_media_process_error("Demucs", rc, stderr_full, paths=(audio_hq_path, audio_path, job_dir)))
+                    # Stems land under the INPUT's basename ("audio_hq" when the
+                    # full-quality extraction succeeded, "audio" on its fallback).
+                    demucs_out = os.path.join(
+                        job_dir, "htdemucs",
+                        os.path.splitext(os.path.basename(audio_hq_path or audio_path))[0],
+                    )
+                    if os.path.exists(os.path.join(demucs_out, "vocals.wav")):
+                        shutil.move(os.path.join(demucs_out, "vocals.wav"), vocals_path)
+                        shutil.move(os.path.join(demucs_out, "no_vocals.wav"), no_vocals_path)
+                        shutil.rmtree(os.path.join(job_dir, "htdemucs"), ignore_errors=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Demucs failed for %s, falling back to mixed audio: %s", log_safe(job_id), log_safe(e))
+                    # plan-04: surface the degradation (job continues with mixed audio).
+                    yield prep_event("warning", **failure.build_failure(e, stage="demucs", include_diagnostic=False))
+                    vocals_path = audio_path
+                    no_vocals_path = None
             yield prep_event("demucs_done",
-                             has_bg=bool(no_vocals_path and os.path.exists(no_vocals_path)))
+                             has_bg=bool(no_vocals_path and os.path.exists(no_vocals_path)),
+                             skipped=not separate)
 
             # Audio-only jobs (#119) have no video to scan or thumbnail. Skip
             # both ffmpeg passes but still emit scene_done (count=0) so the

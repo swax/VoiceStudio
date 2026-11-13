@@ -24,7 +24,7 @@ from core.media_types import AUDIO_EXTS, MEDIA_EXTS, media_extension, media_uplo
 from core.url_safety import UnsafeURLError, check_public_url, is_manifest_head, is_manifest_file
 from core.failure import InvalidMediaFileError
 from core import event_bus
-from schemas.requests import CleanupSegmentsRequest, DubIngestUrlRequest, ParseSubtitleTextRequest, TranscriptSyncRequest
+from schemas.requests import CleanupSegmentsRequest, DubAttachStemsRequest, DubForkRequest, DubIngestUrlRequest, ParseSubtitleTextRequest, TranscriptSyncRequest
 from services.srt_parser import CUE_SOURCE_FIELDS, CUE_SOURCE_ID, vouch_cue_source
 from services.dub_language import (
     DUB_SOURCE_LANG_CODES as _DUB_SOURCE_LANG_CODES,
@@ -823,8 +823,13 @@ async def dub_upload(
     job_id: Optional[str] = Form(None),
     input_type: str = Form("video"),
     source_lang: Optional[str] = Form(None),
+    separate: bool = Form(True),
 ):
     """Accept a media upload, write to disk, queue background prep task.
+
+    With ``separate`` false the voices are not separated: the client
+    separates them itself and attaches its stems (``POST /dub/stems``)
+    before transcribing.
 
     `input_type` is "video" (default) or "audio". Audio-only jobs (#119) skip
     scene detection, thumbnailing, and the final video mux — the transcribe →
@@ -955,6 +960,7 @@ async def dub_upload(
             "path": video_path,
             "input_type": input_type,
             "source_lang": source_lang_override,
+            "separate": separate,
         },
         filename,
     )
@@ -962,6 +968,39 @@ async def dub_upload(
         status_code=202,
         content={"job_id": job_id, "task_id": task_id, "filename": filename},
     )
+
+
+@router.post("/dub/stems/{job_id}")
+async def dub_attach_stems(job_id: str, req: DubAttachStemsRequest):
+    """Make stems the client separated itself the job's voices and bed.
+
+    The files must already be in the job folder; they are named relative to
+    it, and must last as long as the job's audio.
+    """
+    try:
+        updates = await asyncio.to_thread(dub_pipeline.attach_stems, job_id, req.vocals, req.no_vocals)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Dub job not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"job_id": job_id, **updates}
+
+
+@router.post("/dub/fork/{job_id}")
+async def dub_fork(job_id: str, req: DubForkRequest):
+    """A new job over this job's media (hard-linked where the volume allows),
+    to render the same audio again in another voice without uploading,
+    extracting or separating it again. Transcription and render state stay
+    with the source job."""
+    try:
+        record = await asyncio.to_thread(dub_pipeline.fork_job, job_id, req.job_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Dub job not found") from None
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="This job ID is already in use.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"job_id": req.job_id, "forked_from": job_id, "duration": record.get("duration")}
 
 
 @router.post("/dub/ingest-url")

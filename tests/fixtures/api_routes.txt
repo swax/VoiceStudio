@@ -232,6 +232,7 @@ POST /dictation/prefs
 POST /dub/abort/{job_id}
 POST /dub/agent-fit
 POST /dub/cleanup-segments/{job_id}
+POST /dub/fork/{job_id}
 POST /dub/generate/{job_id}
 POST /dub/import-srt/{job_id}
 POST /dub/ingest-url
@@ -239,6 +240,7 @@ POST /dub/parse-subtitle-text
 POST /dub/preview-segment/{job_id}
 POST /dub/prosody-mirror/{job_id}
 POST /dub/qc/{job_id}
+POST /dub/stems/{job_id}
 POST /dub/sync-transcript/{job_id}
 POST /dub/transcribe/{job_id}
 POST /dub/translate

@@ -9,6 +9,9 @@ This fork integrates upstream commit
 - Add per-segment voice and emotion references and IndexTTS seeds, including
   these optional inputs in take fingerprints while preserving old defaults.
 - Add echo and public-address effects with reverb tails.
+- Let a client skip the built-in separation (`separate=false` on upload),
+  attach the stems it separated itself (`POST /dub/stems/{job_id}`), and fork a
+  job over the same hard-linked media for another voice (`POST /dub/fork/{job_id}`).
 - Adapt the backend and IndexTTS sidecar to the legacy `2.9.1+rocm7.13.x` Torch
   build on Windows; leave other runtimes' upstream dispatch policy intact.
 - Preserve LF bytes for hash-pinned bundled model text assets on Windows.
