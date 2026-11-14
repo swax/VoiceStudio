@@ -16,6 +16,8 @@ and keeps these additional controls:
 - **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
 - **Shared media:** upload without separating the voices, attach stems the client
   separated itself, and fork a job over the same media to render it in another voice.
+- **Responsive rendering:** embed each new dub segment's provenance watermark
+  on the watermark worker so health checks stay responsive during the operation.
 - **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
   adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
   dispatch and precision policy.

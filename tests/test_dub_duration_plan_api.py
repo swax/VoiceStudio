@@ -17,6 +17,7 @@ import os
 os.environ.setdefault("OMNIVOICE_DISABLE_FILE_LOG", "1")
 
 import asyncio
+from unittest.mock import AsyncMock
 import json
 
 import pytest
@@ -253,6 +254,7 @@ def patched_generate(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(dg, "rvc_is_enabled", lambda: False)
     monkeypatch.setattr(dg, "mark_synthetic", lambda wav, sr, **kw: wav)
+    monkeypatch.setattr(dg, "mark_synthetic_async", AsyncMock(side_effect=lambda wav, sr, **kw: wav))
     monkeypatch.setattr(dg, "apply_mastering", lambda a, sample_rate=None: a)
     monkeypatch.setattr(dg, "get_effect_chain", lambda preset: None)
     monkeypatch.setattr(dg, "apply_effects_chain", lambda a, **k: a)

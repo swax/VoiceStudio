@@ -38,7 +38,7 @@ from services.ffmpeg_utils import (
 from services.rvc import apply_rvc, is_enabled as rvc_is_enabled
 from services.incremental import segment_fingerprint, fit_fingerprint
 from services.fit_planner import FitParams, plan_fit
-from services.watermark import mark_synthetic
+from services.watermark import mark_synthetic, mark_synthetic_async
 from services.speaker_clone import auto_profile_id
 from api.routers.dub_core import _get_job, _safe_lang_or_400, _save_job
 from services.dub_pipeline import (
@@ -1511,8 +1511,11 @@ async def dub_generate(job_id: str, req: DubRequest):
                 # downloadable segment and the assembly input, so the final
                 # track inherits the mark. Cached reuse is already marked and
                 # silence has nothing to mark, so nothing else marks again.
-                audio_tensor = mark_synthetic(audio_tensor, backend.sample_rate,
-                                              context="dub_generate.segment")
+                # AudioSeal is CPU work; its worker keeps health checks and
+                # cancellation responsive while the mark is being embedded.
+                audio_tensor = await mark_synthetic_async(
+                    audio_tensor, backend.sample_rate, context="dub_generate.segment"
+                )
 
                 seg_wav_path = _staged_seg_path(seg_id)
                 try:

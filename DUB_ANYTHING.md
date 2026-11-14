@@ -15,6 +15,8 @@ This fork integrates upstream commit
 - Adapt the backend and IndexTTS sidecar to the legacy `2.9.1+rocm7.13.x` Torch
   build on Windows; leave other runtimes' upstream dispatch policy intact.
 - Preserve LF bytes for hash-pinned bundled model text assets on Windows.
+- Dispatch new dub segments' provenance marking through the existing watermark
+  worker, preserving the marked output while keeping health checks responsive.
 
 The IndexTTS adapter declares its per-request seed capability so both ordinary
 generation and dubbing forward seeds to its isolated worker. The English fork

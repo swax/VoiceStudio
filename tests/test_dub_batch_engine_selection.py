@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 import importlib
 import os
 
@@ -161,6 +162,7 @@ def dub_job_env(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(dg, "rvc_is_enabled", lambda: False)
     monkeypatch.setattr(dg, "mark_synthetic", lambda wav, sr, **kw: wav)
+    monkeypatch.setattr(dg, "mark_synthetic_async", AsyncMock(side_effect=lambda wav, sr, **kw: wav))
     monkeypatch.setattr(dg, "apply_mastering", lambda a, sample_rate=None: a)
     monkeypatch.setattr(dg, "get_effect_chain", lambda preset: None)
     monkeypatch.setattr(dg, "apply_effects_chain", lambda a, **k: a)
