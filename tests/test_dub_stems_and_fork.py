@@ -148,10 +148,10 @@ def test_a_taken_id_is_refused_and_left_alone(jobs):
     root, _ = jobs
     ingested(root, "part-01")
     (root / "part-01-us").mkdir()
-    (root / "part-01-us" / "keep.txt").write_text("mine")
+    (root / "part-01-us" / "keep.txt").write_text("mine", encoding="utf-8")
     with pytest.raises(FileExistsError):
         dub_pipeline.fork_job("part-01", "part-01-us")
-    assert (root / "part-01-us" / "keep.txt").read_text() == "mine"
+    assert (root / "part-01-us" / "keep.txt").read_text(encoding="utf-8") == "mine"
 
 
 @pytest.mark.parametrize("new_id", ["../escape", "a/b", "", "has space"])
