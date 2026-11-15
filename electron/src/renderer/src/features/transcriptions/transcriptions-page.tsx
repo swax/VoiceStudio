@@ -6,6 +6,8 @@ import {
   segTimeRange,
   formatTranscriptExport,
   preferredTranscript,
+  canExportTranscriptSubtitles,
+  type TranscriptExportFormat,
 } from '@shared/utils/transcriptionFormat';
 import { RecordingInputs } from '@/components/recording-inputs';
 import { NotReadyNotice, SetUpLink } from '@/components/engine-notice';
@@ -35,6 +37,7 @@ import { toast } from 'sonner';
 import { runRendererTask } from '@/lib/global-error-recovery';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { VirtualList } from '@/components/virtual-list';
 import { Switch } from '@/components/ui/switch';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { WaveformPlayer } from '@/components/waveform-player';
@@ -172,6 +175,7 @@ export function TranscriptionsPage() {
     setUrl(next);
     return () => URL.revokeObjectURL(next);
   }, [file]);
+  const historyRef = useRef<HTMLDivElement>(null);
   const visible = useMemo(
     () =>
       entries.filter((entry) =>
@@ -182,6 +186,10 @@ export function TranscriptionsPage() {
     [entries, search],
   );
   const selected = visible.find((entry) => entry.id === selectedId);
+  const subtitlesAvailable = useMemo(
+    () => !!selected && canExportTranscriptSubtitles(selected),
+    [selected],
+  );
   useEffect(() => {
     const next = visible[0]?.id ?? null;
     if (!visible.some((entry) => entry.id === selectedId) && selectedId !== next) {
@@ -208,12 +216,20 @@ export function TranscriptionsPage() {
       toast.error(t('modelSettings.failed'));
     }
   };
-  const exportText = async (list: TranscriptEntry[]) => {
+  const exportText = async (
+    list: TranscriptEntry[],
+    format: TranscriptExportFormat = 'history',
+  ) => {
     try {
-      const text = formatTranscriptExport(list);
+      const text = formatTranscriptExport(list, { format });
       const result = await saveLocalFile(
-        new Blob([text], { type: 'text/plain;charset=utf-8' }),
-        `transcriptions_${new Date().toISOString().slice(0, 10)}.txt`,
+        new Blob([text], {
+          type:
+            format === 'srt' ? 'application/x-subrip;charset=utf-8' : 'text/plain;charset=utf-8',
+        }),
+        format === 'history'
+          ? `transcriptions_${new Date().toISOString().slice(0, 10)}.txt`
+          : `transcript.${format === 'srt' ? 'srt' : 'txt'}`,
       );
       if (!result.canceled) toast.success(t('transcriptions.exported'));
     } catch (cause) {
@@ -258,42 +274,50 @@ export function TranscriptionsPage() {
             />
           ) : null}
           {entries.length > 0 && (
-            <div className="mt-3 min-h-0 flex-1 space-y-1 overflow-y-auto">
-              {visible.map((entry) => (
-                <button
-                  key={entry.id}
-                  className={cn(
-                    'w-full rounded-xl border border-transparent px-3 py-2.5 text-left text-sm transition-[color,background-color,border-color,box-shadow] hover:border-border/55 hover:bg-accent/60',
-                    selectedId === entry.id &&
-                      'border-primary/20 bg-primary/[0.07] shadow-[inset_2px_0_0_var(--primary)]',
-                  )}
-                  aria-pressed={selectedId === entry.id}
-                  onClick={() => setSelectedId(entry.id)}
-                >
-                  <p className="line-clamp-2 text-[13px] leading-5 font-medium" dir="auto">
-                    {preferredTranscript(entry)}
-                  </p>
-                  <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                    <span className="inline-flex min-w-0 items-center gap-1">
-                      <Clock3Icon className="size-3 shrink-0" aria-hidden="true" />
-                      <span className="truncate">
-                        {formatRelative(entry.timestamp, i18n.language)}
-                      </span>
-                    </span>
-                    {entry.language && entry.language !== 'unknown' ? (
+            <div ref={historyRef} className="mt-3 min-h-0 flex-1 overflow-y-auto">
+              <VirtualList
+                items={visible}
+                scrollRef={historyRef}
+                getKey={(entry) => entry.id}
+                activeKey={selectedId}
+                estimateSize={72}
+                rowClassName="pb-1"
+                renderRow={(entry) => (
+                  <button
+                    key={entry.id}
+                    className={cn(
+                      'w-full rounded-xl border border-transparent px-3 py-2.5 text-left text-sm transition-[color,background-color,border-color,box-shadow] hover:border-border/55 hover:bg-accent/60',
+                      selectedId === entry.id &&
+                        'border-primary/20 bg-primary/[0.07] shadow-[inset_2px_0_0_var(--primary)]',
+                    )}
+                    aria-pressed={selectedId === entry.id}
+                    onClick={() => setSelectedId(entry.id)}
+                  >
+                    <p className="line-clamp-2 text-[13px] leading-5 font-medium" dir="auto">
+                      {preferredTranscript(entry)}
+                    </p>
+                    <div className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
                       <span className="inline-flex min-w-0 items-center gap-1">
-                        <LanguagesIcon className="size-3 shrink-0" aria-hidden="true" />
-                        <span className="truncate">{entry.language}</span>
+                        <Clock3Icon className="size-3 shrink-0" aria-hidden="true" />
+                        <span className="truncate">
+                          {formatRelative(entry.timestamp, i18n.language)}
+                        </span>
                       </span>
-                    ) : null}
-                    {Number(entry.duration_s) > 0 ? (
-                      <span className="shrink-0 tabular-nums">
-                        {Number(entry.duration_s).toFixed(1)}s
-                      </span>
-                    ) : null}
-                  </div>
-                </button>
-              ))}
+                      {entry.language && entry.language !== 'unknown' ? (
+                        <span className="inline-flex min-w-0 items-center gap-1">
+                          <LanguagesIcon className="size-3 shrink-0" aria-hidden="true" />
+                          <span className="truncate">{entry.language}</span>
+                        </span>
+                      ) : null}
+                      {Number(entry.duration_s) > 0 ? (
+                        <span className="shrink-0 tabular-nums">
+                          {Number(entry.duration_s).toFixed(1)}s
+                        </span>
+                      ) : null}
+                    </div>
+                  </button>
+                )}
+              />
             </div>
           )}
           {entries.length > 0 && (
@@ -606,7 +630,7 @@ export function TranscriptionsPage() {
                       </span>
                     ) : null}
                   </div>
-                  <div className="flex gap-1">
+                  <div className="flex flex-wrap gap-1">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -626,6 +650,27 @@ export function TranscriptionsPage() {
                     </Button>
                     <Button
                       variant="ghost"
+                      size="sm"
+                      onClick={() => void exportText([selected], 'text')}
+                    >
+                      <FileTextIcon />
+                      {t('transcriptions.export_plain')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!subtitlesAvailable}
+                      aria-describedby={
+                        !subtitlesAvailable ? 'transcript-subtitle-hint' : undefined
+                      }
+                      title={t('transcriptions.original_transcript')}
+                      onClick={() => void exportText([selected], 'srt')}
+                    >
+                      <DownloadIcon />
+                      {t('transcriptions.export_srt')}
+                    </Button>
+                    <Button
+                      variant="ghost"
                       size="icon-sm"
                       aria-label={t('transcriptions.delete')}
                       onClick={() => remove(selected.id)}
@@ -634,6 +679,11 @@ export function TranscriptionsPage() {
                     </Button>
                   </div>
                 </div>
+                {!subtitlesAvailable && (
+                  <p id="transcript-subtitle-hint" className="text-xs text-muted-foreground">
+                    {t('transcriptions.timestamps_unavailable')}
+                  </p>
+                )}
                 <p className="whitespace-pre-wrap text-base leading-7" dir="auto">
                   {preferredTranscript(selected)}
                 </p>

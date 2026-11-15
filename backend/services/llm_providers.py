@@ -37,6 +37,7 @@ logger = logging.getLogger("omnivoice.llm_providers")
 _ACTIVE_PROVIDER_KEY = "llm.active_provider"
 _BASE_URL_KEY = "llm.base_url."   # + provider id
 _MODEL_KEY = "llm.model."         # + provider id
+_PLAIN_HTTP_KEY = "llm.plain_http_lan."  # + provider id; "1" = key may cross a trusted LAN in clear
 SECRET_PREFIX = "llm_key."        # + provider id  → settings_store secret name
 
 
@@ -347,8 +348,26 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
 def _probe_lmstudio_loaded_model(
     base_url: str, api_key: str = "local"
 ) -> Optional[str]:
-    """Return a typed, resident LM Studio chat model without following redirects."""
+    """Return a typed, resident LM Studio chat model without following redirects.
+
+    Defence in depth for #4131: this is the one place a stored key becomes an
+    ``Authorization`` header, so the transport gate is re-checked here rather
+    than trusted to the caller — a future call site must not be able to leak it.
+    LM Studio is the only provider with a native probe, so its per-provider
+    plaintext-LAN opt-in is the one that applies; absent it, a non-loopback
+    plaintext URL fails closed. Costs no network work, and only runs when a real
+    key would actually be sent.
+    """
     if not base_url:
+        return None
+    provider = get_provider("lmstudio")
+    allow_lan = provider is not None and plain_http_lan_allowed(provider)
+    if api_key and api_key != "local" and _plaintext_url_carries_credentials(
+        base_url, allow_private_lan=allow_lan
+    ):
+        logger.debug(
+            "LM Studio probe refused: a stored key would cross plaintext to a remote host"
+        )
         return None
     try:
         parsed = urlsplit(base_url)
@@ -392,6 +411,14 @@ def discover_model(p: Provider) -> Optional[str]:
         return cached
     base_url = resolve_base_url(p)
     if not base_url:
+        return None
+    # The transport gate refuses a credential over remote plaintext (#4131);
+    # discovery must not be the way around it — the LM Studio probe attaches
+    # the stored key as a Bearer header. This is a configuration refusal, not a
+    # probe failure: like the missing-base_url return above it writes NO
+    # negative-cache entry, so fixing the URL or switching the plaintext-LAN
+    # opt-in on takes effect on the next call, not after DISCOVERY_FAILURE_TTL_S.
+    if credential_transport_error(p):
         return None
 
     if p.id == "lmstudio":
@@ -505,21 +532,49 @@ def _key_in_store(pid: str) -> bool:
     return (SECRET_PREFIX + pid) in settings_store.list_secret_names()
 
 
-def credential_transport_error(p: Provider) -> Optional[str]:
-    """Never send provider credentials over remote plaintext transport."""
+def plain_http_lan_allowed(p: Provider) -> bool:
+    """Per-provider, explicit opt-in (#3811) to send a key over plain HTTP.
+
+    Only OpenAI-compatible providers can use it; the SDK transport keeps its
+    HTTPS-only rule. Off unless the user switched it on for this provider.
+    """
+    from services import settings_store
+    return p.transport == "openai" and settings_store.get_text(_PLAIN_HTTP_KEY + p.id) == "1"
+
+
+def is_private_ip_literal(host: str) -> bool:
+    """True only for a private, loopback or link-local IP *literal*.
+
+    DNS names are never accepted: a name can resolve to a public address (or be
+    re-pointed after the check), so the opt-in requires the user to type the
+    LAN address itself. IPv4-mapped IPv6 is judged by its IPv4 address.
+    """
+    from ipaddress import IPv6Address, ip_address
+    try:
+        ip = ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(ip, IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_unspecified or ip.is_multicast:
+        return False
+    return ip.is_loopback or ip.is_link_local or ip.is_private
+
+
+def _plaintext_url_carries_credentials(base_url: str, *, allow_private_lan: bool) -> bool:
+    """True when ``base_url`` is unencrypted remote HTTP and would leak a key.
+
+    Split out of ``credential_transport_error`` (#4131) so the LM Studio probe
+    can apply the same URL rule to the exact URL it is about to call instead of
+    re-resolving a provider's own base_url.
+    """
     from ipaddress import ip_address
     from urllib.parse import urlsplit
 
-    base = resolve_base_url(p)
-    if not base or p.transport == "cli":
-        return None
-    key = resolve_api_key(p)
-    if p.transport != "sdk" and (not key or key == "local"):
-        return None
     try:
-        url = urlsplit(base)
+        url = urlsplit(base_url)
         if url.scheme == "https" and url.hostname:
-            return None
+            return False
         host = (url.hostname or "").lower()
         loopback = host == "localhost"
         if not loopback:
@@ -528,9 +583,26 @@ def credential_transport_error(p: Provider) -> Optional[str]:
             except ValueError:
                 pass
         if url.scheme == "http" and loopback:
-            return None
+            return False
+        if url.scheme == "http" and allow_private_lan and is_private_ip_literal(host):
+            return False
     except ValueError:
         pass
+    return True
+
+
+def credential_transport_error(p: Provider) -> Optional[str]:
+    """Never send provider credentials over remote plaintext transport."""
+    base = resolve_base_url(p)
+    if not base or p.transport == "cli":
+        return None
+    key = resolve_api_key(p)
+    if p.transport != "sdk" and (not key or key == "local"):
+        return None
+    if not _plaintext_url_carries_credentials(
+        base, allow_private_lan=plain_http_lan_allowed(p)
+    ):
+        return None
     return "Use HTTPS for a credentialed provider, or HTTP on localhost."
 
 
@@ -650,7 +722,8 @@ def save_key(pid: str, api_key: str) -> None:
 
 def save_overrides(pid: str, *, base_url: Optional[str] = None,
                    model: Optional[str] = None,
-                   account_id: Optional[str] = None) -> None:
+                   account_id: Optional[str] = None,
+                   allow_plain_http: Optional[bool] = None) -> None:
     from services import settings_store
     if pid not in _BY_ID:
         raise ValueError(f"unknown provider {pid!r}")
@@ -672,6 +745,8 @@ def save_overrides(pid: str, *, base_url: Optional[str] = None,
         forget_discovered_models(pid)
     if account_id is not None:
         settings_store.set_text(f"llm.account.{pid}", account_id.strip())
+    if allow_plain_http is not None and p.transport == "openai":
+        settings_store.set_text(_PLAIN_HTTP_KEY + pid, "1" if allow_plain_http else "")
 
 
 def _active_env_pin() -> Optional[str]:
@@ -712,6 +787,8 @@ def describe(p: Provider) -> dict:
             or os.environ.get("OMNIVOICE_LLM_BACKEND") not in (None, "", "openai-compat")
         ),
         "configured": is_configured(p),
+        "allow_plain_http": plain_http_lan_allowed(p),
+        "supports_plain_http": p.transport == "openai",
     }
     if p.needs_account:
         d["account_id"] = resolve_account_id(p)

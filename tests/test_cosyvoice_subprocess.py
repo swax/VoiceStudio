@@ -95,6 +95,33 @@ def test_loads_the_installed_weights_with_matcha_on_the_path(monkeypatch, tmp_pa
     assert audio["op"] == "audio" and audio["sample_rate"] == 24000 and audio["n_samples"] == 2400
 
 
+@pytest.mark.parametrize("change_during_load", [False, True])
+def test_inprocess_recovery_identity_precedes_native_load(monkeypatch, tmp_path, change_during_load):
+    from services import local_model_paths
+    from services.tts_backend import CosyVoiceBackend
+
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"before load")
+    expected = local_model_paths.loading_fingerprint(str(tmp_path))
+    monkeypatch.setenv("OMNIVOICE_COSYVOICE_MODEL", str(tmp_path))
+    backend = CosyVoiceBackend()
+    monkeypatch.setattr(backend, "is_available", lambda: (True, "ready"))
+
+    def construct(**_kwargs):
+        if change_during_load:
+            weights.write_bytes(b"changed during native load")
+        return types.SimpleNamespace(sample_rate=24000)
+
+    cli = types.ModuleType("cosyvoice.cli.cosyvoice")
+    cli.AutoModel = construct
+    monkeypatch.setitem(sys.modules, "cosyvoice", types.ModuleType("cosyvoice"))
+    monkeypatch.setitem(sys.modules, "cosyvoice.cli", types.ModuleType("cosyvoice.cli"))
+    monkeypatch.setitem(sys.modules, "cosyvoice.cli.cosyvoice", cli)
+    backend._ensure_loaded()
+    assert backend._model._voicestudio_checkpoint == str(tmp_path)
+    assert backend._model._voicestudio_weights_fingerprint == (None if change_during_load else expected)
+
+
 def test_a_missing_model_folder_never_reaches_a_modelscope_download(monkeypatch, tmp_path):
     calls = []
     sidecar, checkout = _load_sidecar(monkeypatch, tmp_path, calls)
@@ -284,13 +311,13 @@ def test_load_uses_full_precision_without_cuda(monkeypatch, tmp_path, cuda):
 def test_managed_install_probes_late_imports_and_restores_dependencies():
     from services import sidecar_install
     spec = sidecar_install.SPECS['cosyvoice']
-    reqs = _REQUIREMENTS.read_text()
+    reqs = _REQUIREMENTS.read_text(encoding="utf-8")
     for dependency in ('gdown==6.4.0', 'wget==3.2', 'pyarrow==25.0.1'):
         assert dependency in reqs
     assert 'cosyvoice.dataset.processor' in spec.probe_code
     assert 'matcha.utils' in spec.probe_code
     assert '{checkout}/third_party/PyWorld' in spec.install_args
-    assert spec.install_revision == 'security-floors-v4'
+    assert spec.install_revision == 'rocm-routing-v5'
     sources = {source.path: source for source in spec.extra_sources}
     assert sources['third_party/PyWorld'].revision == 'f31ad88d543fdaebbda2d0c9a5e4d4f991ae0b6c'
     assert sources['third_party/PyWorld/lib/World'].revision == 'd625e7608ca23a870018f01e7c562ac683d9847f'
@@ -371,6 +398,7 @@ def test_load_preserves_legacy_non_qwen_checkout(monkeypatch, tmp_path):
 # completion marker and never receive the change.
 _REQUIREMENTS_BY_REVISION = {
     "security-floors-v3": "10d15c52b78ae41cfd040880f97a3b9b71c2fa2dab9893bceb982fc46b72d9dd",
+    "rocm-routing-v5": "eb92a6a6dc01fc02e46c72654f91c33169d77824c8e88d468a6003d09b6bfc80",
     "security-floors-v4": "607deac39c6ee97e595d05426af10e87070b4b52a3df2ad809d71e20d5058658",
 }
 

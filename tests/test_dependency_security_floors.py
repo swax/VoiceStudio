@@ -71,6 +71,8 @@ def test_python_security_floors_are_locked():
 DAGGER_FLOORS = {
     # Memory leak in aborted validation (denial of service), fixed in 3.3.1.
     "graphql-core": "3.3.1",
+    # GHSA-mf5v-w3w3-f6cg: quadratic-time traceparent parsing, fixed in 1.45.2.
+    "opentelemetry-api": "1.45.2",
 }
 
 
@@ -89,3 +91,25 @@ def test_duplicate_lock_entries_cannot_hide_a_vulnerable_version():
     resolved = _resolved_versions(packages, floors)
     assert resolved == {"demo": [Version("2.0"), Version("0.9")]}
     assert _versions_below_floors(resolved, floors) == {"demo": ["0.9"]}
+
+
+def test_installed_keeps_the_first_copy_on_sys_path(monkeypatch):
+    """#4066: a stale apt copy later on sys.path must not shadow the imported one."""
+    import importlib.metadata as md
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
+    try:
+        import security_floors
+    finally:
+        sys.path.pop(0)
+
+    class Dist:
+        def __init__(self, name, version):
+            self.metadata = {"Name": name}
+            self.version = version
+
+    monkeypatch.setattr(
+        md, "distributions", lambda: iter([Dist("Mako", "1.4.3"), Dist("mako", "1.3.2.dev0")])
+    )
+    assert security_floors.installed() == {"mako": "1.4.3"}

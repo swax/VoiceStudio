@@ -24,11 +24,6 @@ const define = {
   __BUILD_COMMIT__: JSON.stringify(buildCommit()),
   __DISTRIBUTION_TARGET__: JSON.stringify(DISTRIBUTION_TARGET),
   __WEB_DEPLOYMENT__: false,
-  // Keep the renderer and its managed Python backend on one analytics project.
-  __POSTHOG_PROJECT_TOKEN__: JSON.stringify(
-    process.env.VITE_POSTHOG_KEY ?? process.env.POSTHOG_PROJECT_TOKEN ?? '',
-  ),
-  __POSTHOG_HOST__: JSON.stringify(process.env.VITE_POSTHOG_HOST ?? process.env.POSTHOG_HOST ?? ''),
 };
 
 // OMNIVOICE_UI_PORT is canonical (the backend reads it for its origin
@@ -126,7 +121,9 @@ export default defineConfig({
             });
           },
         },
-        '/api': {
+        // Exactly /api or /api/...: a bare '/api' prefix also proxies app paths such as
+        // /api-reference/..., where Settings > API (Scalar) leaves the page, so a reload broke.
+        '^/api(?:[/?]|$)': {
           target:
             'http://127.0.0.1:' +
             (process.env.VOICESTUDIO_ELECTRON_PROXY_PORT || DEFAULT_ELECTRON_PROXY_PORT),

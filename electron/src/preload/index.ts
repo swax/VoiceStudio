@@ -9,6 +9,7 @@ import type {
   VoiceStudioBridge,
   RepairAgentEvent,
   AccountPublicState,
+  PythonDiscoveryResult,
 } from './index.d';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -53,6 +54,9 @@ const bridge: VoiceStudioBridge = {
     dismiss: () => ipcRenderer.invoke('updates:dismiss') as Promise<UpdateState>,
     setChannel: (channel) =>
       ipcRenderer.invoke('updates:setChannel', channel) as Promise<UpdateState>,
+    setAutoDownload: (enabled) =>
+      ipcRenderer.invoke('updates:setAutoDownload', enabled) as Promise<UpdateState>,
+    later: () => ipcRenderer.invoke('updates:later') as Promise<UpdateState>,
     install: () => ipcRenderer.invoke('updates:install') as Promise<void>,
     listReleases: () => ipcRenderer.invoke('updates:listReleases') as Promise<UpdateReleaseInfo[]>,
     onState: (cb) => subscribe<UpdateState>('updates:state', cb),
@@ -62,6 +66,10 @@ const bridge: VoiceStudioBridge = {
     scan: (token) => ipcRenderer.invoke('watch:scan', token),
     enqueue: (request) => ipcRenderer.invoke('watch:enqueue', request),
     stop: (token) => ipcRenderer.invoke('watch:stop', token),
+  },
+  terminal: {
+    status: () => ipcRenderer.invoke('terminal:status'),
+    addToPath: () => ipcRenderer.invoke('terminal:add-to-path'),
   },
   app: {
     version: __APP_VERSION__,
@@ -106,7 +114,21 @@ const bridge: VoiceStudioBridge = {
     setRuntimeRegion: (region) => ipcRenderer.invoke('backend:setRuntimeRegion', region),
     chooseRuntimeLocation: (title) => ipcRenderer.invoke('backend:chooseRuntimeLocation', title),
     useDefaultRuntimeLocation: () => ipcRenderer.invoke('backend:useDefaultRuntimeLocation'),
+    getPythonRuntime: () => ipcRenderer.invoke('backend:getPythonRuntime') as Promise<{
+      selection: { pythonPath: string } | null;
+      overrideActive: boolean;
+    }>,
+    choosePythonRuntime: (title) => ipcRenderer.invoke('backend:choosePythonRuntime', title),
+    confirmPythonRuntime: (token) => ipcRenderer.invoke('backend:confirmPythonRuntime', token),
+    planPythonRepair: (pythonPath) => ipcRenderer.invoke('backend:planPythonRepair', pythonPath),
+    installPythonRepair: (request) => ipcRenderer.invoke('backend:installPythonRepair', request),
+    onPythonRepairProgress: (callback) => subscribe('backend:pythonRepairProgress', callback),
+    useManagedPython: () => ipcRenderer.invoke('backend:useManagedPython'),
+    discoverPythonRuntimes: () => ipcRenderer.invoke('backend:discoverPythonRuntimes') as Promise<PythonDiscoveryResult>,
+    useDiscoveredPythonRuntime: (pythonPath) =>
+      ipcRenderer.invoke('backend:useDiscoveredPythonRuntime', pythonPath),
     restart: () => ipcRenderer.invoke('backend:restart') as Promise<void>,
+    restartOnCpu: () => ipcRenderer.invoke('backend:restartOnCpu') as Promise<void>,
     getConnection: () => ipcRenderer.invoke('backend:getConnection'),
     getHostSnapshot: () => ipcRenderer.invoke('backend:hostSnapshot'),
     getSetupDiagnostics: () => ipcRenderer.invoke('backend:setupDiagnostics'),
@@ -150,6 +172,8 @@ const bridge: VoiceStudioBridge = {
     authorizeMediaTool: (kind) => ipcRenderer.invoke('files:authorizeMediaTool', kind),
     authorizeModelsDirectory: (reset = false) =>
       ipcRenderer.invoke('files:authorizeModelsDirectory', reset),
+    chooseEngineModelDirectory: (engineId) =>
+      ipcRenderer.invoke('files:chooseEngineModelDirectory', engineId),
     extractScript: (input) => ipcRenderer.invoke('files:extractScript', input) as Promise<string>,
     saveAudio: (req: SaveAudioRequest) =>
       ipcRenderer.invoke('files:saveAudio', req) as Promise<SaveAudioResult>,

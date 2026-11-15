@@ -1,5 +1,7 @@
 """Shared source-language normalization without importing router runtimes."""
 
+from core.language_variants import macrolanguage_of
+
 # Source-language choices exposed by the first-party dub UI, plus every
 # language code Whisper can write back after auto-detection. A restored job
 # may reuse that detected value as the next upload's override, so rejecting our
@@ -22,24 +24,50 @@ DUB_SOURCE_LANG_CODES = frozenset({
 
 _UNKNOWN_VALUES = frozenset({"", "auto", "unknown", "none", "und"})
 
+
+# Every ASR backend that only accepts Whisper's language table.
+WHISPER_ASR_BACKENDS = frozenset({
+    "whisperx",
+    "faster-whisper",
+    "faster-whisper-isolated",
+    "mlx-whisper",
+    "pytorch-whisper",
+    "whisper-cpp",
+})
+
+
+def asr_source_language(source_language: str | None, backend_id: str | None) -> str | None:
+    """Adapt a stored dub language to the selected ASR without mutating the job.
+
+    Chinese script choices share Whisper's spoken-language code. Other valid
+    dub choices outside Whisper's language table use automatic detection on
+    Whisper engines; custom and OpenAI-compatible engines keep their own codes.
+    """
+    language = "zh" if source_language in ("cmn-hans", "cmn-hant") else source_language or None
+    if language and backend_id in WHISPER_ASR_BACKENDS:
+        from transformers.models.whisper.tokenization_whisper import LANGUAGES
+
+        if language not in LANGUAGES:
+            return None
+    return language
+
+
 # Codes that are valid languages but are not in DUB_SOURCE_LANG_CODES, and
 # the dub code they mean. YouTube caption tracks and older ISO 639
 # assignments use several of these: ``fil`` is Filipino (``tl`` here),
 # ``iw`` is the retired Hebrew code (``he``), ``jv`` is Javanese
-# (Whisper writes ``jw``). Arabic varieties (``arb``/``aec``/``arz``)
-# collapse to the macrolanguage ``ar``, the only Arabic code dubbing knows.
+# (Whisper writes ``jw``). Arabic varieties (``arb``/``aec``/``arz``/``apc``
+# ...) collapse to the macrolanguage ``ar``, the only Arabic code dubbing
+# knows, through the shared ``core.language_variants`` table (#3816).
 # ISO 639-2/3 codes for a dub language map to that language, never to the
 # first two letters of the code.
 _CODE_ALIASES = {
     "fil": "tl",
     "iw": "he",
+    "ji": "yi",
     "jv": "jw",
     "in": "id",
     "ara": "ar",
-    "arb": "ar",
-    "aec": "ar",
-    "arz": "ar",
-    "arq": "ar",
     "est": "et",
     "swe": "sv",
     "kan": "kn",
@@ -264,7 +292,7 @@ def detected_source_language(value: str | None) -> str | None:
     # A name with spaces ("standard arabic", "haitian creole") is a name,
     # never a code: resolve it whole, or admit it is unknown.
     if " " in text:
-        return _NAME_ALIASES.get(text)
+        return _NAME_ALIASES.get(text) or _vocabulary_language(text)
     code = text.replace("_", "-")
     if code in _UNKNOWN_VALUES:
         return None
@@ -296,8 +324,24 @@ def detected_source_language(value: str | None) -> str | None:
                     if part in _ZH_VARIETY_SUBTAGS:
                         return None
             return prefix
-        alias = _CODE_ALIASES.get(prefix)
+        alias = _CODE_ALIASES.get(prefix) or macrolanguage_of(prefix)
         if alias is not None:
             return alias
     # Names match whole: "myanmar-english" is English, not Burmese.
-    return _NAME_ALIASES.get(code)
+    return _NAME_ALIASES.get(code) or _vocabulary_language(code)
+
+
+def _vocabulary_language(name: str) -> str | None:
+    """A whole language name from the bundled picker vocabulary ("kirghiz",
+    "panjabi", "moroccan arabic", "portuguese (brazil)") as its dub code,
+    or ``None``. Only a code that is, or explicitly means, a dub language
+    counts, so a known name never turns into a neighbouring language."""
+    from core.language_variants import VARIANT_CODES
+    from omnivoice.utils.lang_map import LANG_NAME_TO_ID
+
+    code = VARIANT_CODES.get(name) or LANG_NAME_TO_ID.get(name)
+    if code is None:
+        return None
+    if code in DUB_SOURCE_LANG_CODES:
+        return code
+    return _CODE_ALIASES.get(code) or macrolanguage_of(code)

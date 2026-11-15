@@ -31,7 +31,7 @@ The `_meta` block of `quant_map.json` carries the pins:
   used to download quant files. Currently `361609388ae572a820d085185bbbe2a2aac4b30e`.
 - `runtime_commit_sha` — `omnivoice.cpp` master HEAD that the bundled
   `bin/omnivoice-tts-<platform>` binaries were built from. Currently
-  `886fc079838ca7400cb2b42b36e2a65aa1daabe8`.
+  `040c8b344d8c670ce1475194751d119b5ef82c78`.
 
 Both SHAs are mirrored in the SPIKE-01 ADR so the engine code and the
 decision doc cannot drift.
@@ -125,8 +125,9 @@ through explicit Settings overrides.
 
 ## Subprocess invocation
 
-The engine spawns `bin/omnivoice-tts-<platform>` once per `generate()`
-call. The CLI matches the `omnivoice.cpp` README:
+Without a bundled server (below), the engine spawns
+`bin/omnivoice-tts-<platform>` once per `generate()` call. The CLI matches
+the `omnivoice.cpp` README:
 
 ```
 echo "Hello world." | ./build/omnivoice-tts \
@@ -139,6 +140,22 @@ The Python wrapper composes argv from typed `pathlib.Path` objects rooted
 in `$HF_HUB_CACHE`, never passes `shell=True`, and routes `stdin`/`stderr`
 through `SubprocessBackend.run()` so HF token leak redaction (AUTH-05)
 and the 120-second timeout (T-04-06) apply uniformly.
+
+## Resident server (#3654)
+
+`resident.py` keeps one loopback `bin/tts-server-<platform>` per loaded
+base + tokenizer pair when that binary is present and verified (same
+manifest, quarantine and execute-bit rules; an installer manifest that does
+not list it refuses it). It speaks upstream's OpenAI-compatible API
+(`tools/tts-server.cpp`, voice registry from `040c8b344d8c`):
+`POST /v1/audio/voices` once per clip + transcript, then
+`POST /v1/audio/speech` with `response_format: "wav"`. Requests that set
+duration, chunk settings, no-denoise or no-preprocess-prompt, or pass a clip
+without a transcript, use the spawn path. One restart on crash, then the
+spawn path; `unload()` (idle release, engine switch) stops the process. The
+toggle is the `omnivoice_gguf_resident` pref / `OMNIVOICE_GGUF_RESIDENT`,
+**off by default**: upstream `tts-server` has no API key and sends
+`Access-Control-Allow-Origin: *`. `docs/engines/omnivoice-gguf.md` has the user-facing notes.
 
 ## Settings override
 

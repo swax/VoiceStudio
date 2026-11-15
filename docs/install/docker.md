@@ -6,7 +6,7 @@ it in a normal browser. It is built from the same maintained renderer as the
 Electron desktop app; controls that require native desktop access are hidden.
 
 Inference runs inside the container. Nothing is sent off the machine without
-your explicit yes: product analytics are opt-in (PostHog, content-free usage
+your explicit yes: product analytics are opt-in (Supermetry, content-free usage
 metadata only) behind the same first-run consent prompt as the desktop app,
 and declining or skipping it keeps them off. Set
 `-e OMNIVOICE_ANALYTICS_DISABLED=1` to switch analytics off entirely. Model
@@ -71,8 +71,12 @@ with `no matching manifest for linux/arm64/v8`.
 
 Docker's NAT prevents the backend from proving that a browser is on the host,
 so server-mode settings and diagnostics require an administrator API key even
-when the published port is loopback-only. Generate one before using any Studio
-profile or `docker run` command below:
+when the published port is loopback-only. That includes the runtime log
+(`GET /system/logs`), the log stream (`/system/logs/stream`), recent errors and
+the last-run crash report: they are readable only from loopback or with the
+key, because they contain host paths and crash records. Bare-server bootstrap
+discovery stays open without a key (`GET /system/info`, `GET /stats/usage`).
+Generate a key before using any Studio profile or `docker run` command below:
 
 ```bash
 export OMNIVOICE_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -136,9 +140,8 @@ docker run -d --name omnivoice --gpus all \
 ```
 
 It needs the NVIDIA Container Toolkit and a driver that supports CUDA 12.9.
-The image is built from Ubuntu 24.04 with PyTorch 2.8.0 for CUDA 12.9 (PyTorch
-publishes no CUDA 12.8 build of 2.8.0 for aarch64), on GitHub's native arm64
-runners. Differences from the x86-64 CUDA image:
+The image is built from Ubuntu 24.04 with PyTorch 2.10.0 for CUDA 12.9 on
+GitHub's native arm64 runners. Differences from the x86-64 CUDA image:
 
 - CTranslate2-based ASR engines (faster-whisper, WhisperX) report unavailable:
   NVIDIA ships no aarch64 build of the cuDNN 8 libraries they need. Use
@@ -374,6 +377,85 @@ on the host. The backend inside the container binds to `0.0.0.0` so the
 host port mapping can forward — the host-side `127.0.0.1` binding is what
 enforces loopback-only.
 
+## Private remote access with Tailscale
+
+Run Tailscale on the **Docker host**, and let its Serve proxy reach the
+loopback-published container port. Keep `127.0.0.1:3900:3900` and the long random
+`OMNIVOICE_API_KEY` from the examples above. The container needs neither the host's
+Tailscale executable nor its daemon socket for this setup.
+
+1. Install and sign in to Tailscale on the host and the remote device. Restrict
+   access to the intended users/devices in your tailnet policy. Use a current
+   Docker Engine: [releases before 28.0.0 have a localhost-publishing caveat](https://docs.docker.com/engine/network/port-publishing/).
+2. From the **host**, open `http://127.0.0.1:3900` and check that VoiceStudio loads.
+   On Docker Desktop for macOS or Windows, run the commands below in the host's
+   terminal, not in the Linux container or Docker Desktop VM. Use the Tailscale
+   CLI supplied by that host installation.
+3. Inspect existing Serve listeners before choosing a port. The example uses
+   HTTPS port `8443`; if another app uses it, choose an unused port instead.
+   Enable MagicDNS and HTTPS certificates when Tailscale requests consent.
+
+   ```bash
+   tailscale serve status
+   tailscale serve --bg --https=8443 http://127.0.0.1:3900
+   tailscale serve status
+   ```
+
+4. On the remote device, open the **exact HTTPS URL printed by Serve**, including
+   its port. Confirm that the browser accepts its certificate without an override,
+   then sign in with the VoiceStudio API key. Keep UI and API on this same origin;
+   no separate `OMNIVOICE_PUBLIC_API_BASE` is needed. Test an authenticated action
+   as well as loading the page. A successful `/health` response alone proves
+   neither authentication nor TLS.
+
+Serve is private to the tailnet; [Funnel publishes to the internet](https://tailscale.com/docs/features/tailscale-serve).
+Do not enable Funnel for this setup. The tailnet controls reachability, while the
+VoiceStudio key still controls administrator access. Leave
+`OMNIVOICE_TRUST_HOST_LOOPBACK` and `OMNIVOICE_TRUSTED_NETWORKS` unset: a host proxy
+must not turn remote clients into credential-free administrators. See
+[API authentication and proxy handling](../api-auth.md#browsers-from-another-origin-cors).
+
+To remove this listener, first confirm that the selected port still proxies to
+VoiceStudio at `127.0.0.1:3900`, then turn off only that port:
+
+```bash
+tailscale serve status
+tailscale serve --bg --https=8443 off
+tailscale serve status
+```
+
+Avoid `tailscale serve reset`, which removes other applications' Serve settings
+too. See the official [Serve command reference](https://tailscale.com/docs/reference/tailscale-cli/serve)
+for flags and per-listener cleanup.
+
+### In-app sharing, HTTP fallback, and host-daemon access
+
+The in-app Tailscale control invokes a CLI **inside the backend's environment**.
+A Tailscale installation on the Docker host is not automatically available there;
+use the host-managed commands above instead of making the control appear installed.
+
+The existing helper attempts HTTPS only when the daemon reports certificate
+domains, and falls back to HTTP if HTTPS setup fails. Its success response can
+therefore contain an `http://` URL. HTTP between Tailscale peers still travels
+through an encrypted WireGuard tunnel, but a remote HTTP page has no browser TLS
+certificate and normally is not a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Secure_Contexts).
+Microphone and other secure-context APIs may be unavailable. Neither the helper's
+reported scheme nor an accepted forwarded-protocol header verifies a working
+certificate at the public endpoint; check the actual browser URL and certificate.
+
+Do not bind-mount the host's `tailscaled` socket merely to enable this button.
+An authorized client of that socket controls the **host's Tailscale daemon**,
+including shared Serve/Funnel configuration and other node settings, rather than
+just VoiceStudio's listener. A read-only bind mount does not turn the socket API
+into a read-only API. Such access requires trusting all code in the container
+with the daemon's granted privileges. Unix socket paths such as
+`/var/run/tailscale/tailscaled.sock` are Linux installation details, not portable
+Docker Desktop paths. A host binary also has to match the container's OS,
+architecture and dynamic loader/libc; a macOS or Windows executable cannot be
+used as a Linux container's CLI. This guide deliberately grants no host-daemon
+access. Tailscale's [LocalAPI permission model](https://github.com/tailscale/tailscale/blob/main/ipn/localapi/localapi.go)
+describes the read/write authority involved.
+
 ## LAN access
 
 <a id="lan-access"></a>
@@ -489,7 +571,7 @@ as root, so files it adds there are root-owned on the host.
   follows `main`, not releases. For a released version, pull `:stable` or the
   exact `:X.Y.Z` tag and recreate the container. The running version is shown
   in **Settings → About → Version** (read live from the backend).
-- **Checking which version is running:** `docker exec <container> python3 -c "import importlib.metadata; print(importlib.metadata.version('omnivoice'))"`, or hit the `/health` endpoint — it returns `{"status": "ok", "device": ..., "version": "0.3.x"}`. Use the container name listed by `docker compose ps` (or `omnivoice` for the `docker run` examples).
+- **Checking which version is running:** `docker exec <container> python3 -c "import importlib.metadata; print(importlib.metadata.version('omnivoice'))"`, or hit the `/health` endpoint — it returns `{"status": "ok", "device": ..., "engine": ..., "version": "0.3.x"}`, where `device` is what the active TTS engine generates on (`vulkan (...)`, `cuda (...)`, `rocm (...)`, `xpu (...)`, `mps` or `cpu`). GPU names are included only when the runtime identifies them or the host has a single accelerator family; otherwise the label is the bare family. An unverified native device is `unknown`; a conservative CPU timeout budget does not establish CPU execution. Explicit native CPU selection still reports `cpu`. Use the container name listed by `docker compose ps` (or `omnivoice` for the `docker run` examples).
 - **Watching startup:** the port answers within about a second of container
   start, but heavy initialization (PyTorch, API routes, database migration)
   continues in the background. During that window `/health` returns **503**
@@ -502,7 +584,9 @@ as root, so files it adds there are root-owned on the host.
   origin, but Docker's NAT makes every request look non-loopback, so the gate
   used to 403 the whole admin UI (issue #261). The image now ships with
   `OMNIVOICE_SERVER_MODE=1`, which relaxes that gate for the headless
-  deployment. Admin mutations still require `OMNIVOICE_API_KEY`; all commands
+  deployment. Admin mutations still require `OMNIVOICE_API_KEY`, and so do the
+  runtime log, log stream, recent errors and last-run crash report (they carry
+  host paths and crash records); all commands
   above pass it into the container, and the UI prompts for it on first use.
   Exposure is governed by your `-p` port mapping (keep the `127.0.0.1:` prefix
   to stay local) plus authentication. If you front

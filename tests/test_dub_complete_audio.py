@@ -97,6 +97,7 @@ def test_per_line_conditioning_reaches_engine_and_published_fingerprint(render_d
     from services.incremental import segment_fingerprint
 
     render_dub.backend.supports_emotion = True
+    render_dub.backend.supports_generation_seed = True
     reference = str(render_dub.path / "voice.wav")
     emotion = str(render_dub.path / "emotion.wav")
     sf.write(reference, torch.ones(24000).numpy() * 0.1, 24000)
@@ -118,6 +119,38 @@ def test_per_line_conditioning_reaches_engine_and_published_fingerprint(render_d
         assert take[key] == segment[key]
     assert take["cache_ref"] is False
     assert render_dub.job["seg_hashes"]["a"] == segment_fingerprint(segment, track_lang="en")
+
+
+@pytest.mark.parametrize("seed", [0, 23])
+def test_per_line_seed_does_not_require_emotion_support(render_dub, seed):
+    render_dub.backend.supports_generation_seed = True
+    render_dub.backend.supports_emotion = False
+    events = render_dub.run(segments=[dict(start=0, end=1, text="Hello.", seed=seed)])
+    assert any(event["type"] == "done" for event in events)
+    assert render_dub.generated[-1]["seed"] == seed
+
+
+def test_per_line_emotion_uses_scalar_generation_when_native_batch_has_no_emotion_contract(render_dub, monkeypatch):
+    import api.routers.dub_generate as dg
+
+    class BatchedBackend(SimpleNamespace):
+        def generate_batch(self, *_args, **_kwargs):
+            raise AssertionError("Native batch cannot receive per-line emotion references")
+
+    backend = BatchedBackend(**vars(render_dub.backend), supports_emotion=True)
+
+    async def resolve():
+        return "omnivoice", backend
+
+    monkeypatch.setattr(dg, "_resolve_dub_execution", resolve)
+    monkeypatch.setattr(dg, "native_batch_width", lambda _: 2)
+    emotion = str(render_dub.path / "emotion.wav")
+    sf.write(emotion, torch.ones(24000).numpy() * 0.1, 24000)
+    segments = [dict(start=i, end=i + 1, text="Hello.", emo_audio=emotion) for i in range(2)]
+    events = render_dub.run(segments=segments, segment_ids=["a", "b"])
+    assert any(event["type"] == "done" for event in events)
+    assert len(render_dub.generated) == 2
+    assert all(row["emo_audio"] == emotion for row in render_dub.generated)
 
 
 def test_failed_segment_does_not_publish_complete_track(render_dub):

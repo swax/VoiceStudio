@@ -1,39 +1,25 @@
 # VoiceStudio for Dub Anything
 
-This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the public
-VoiceStudio fork used as the voice backend for
-[Dub Anything](https://github.com/swax/dub-anything). Dub Anything directs,
-renders and checks video dubs through this backend, and includes it as a Git
-submodule pinned to a tested commit.
+This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the backend
+fork pinned by [Dub Anything](https://github.com/swax/dub-anything).
 
-This fork integrates upstream commit `2e195d72d3794a88b7cb37f87a3e92a20193574e`
-and keeps these additional controls:
+Additional behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
 
-- **Transcription:** respect the selected source language when transcribing dub audio.
-- **Per-line direction:** accept voice references, emotion references and random seeds
-  for individual segments, forward seeds to IndexTTS, and invalidate cached takes
-  when these controls change.
-- **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
-- **Shared media:** upload without separating the voices, attach stems the client
-  separated itself, and fork a job over the same media to render it in another voice.
-- **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
-  adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
-  dispatch and precision policy.
-- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets.
+- **Per-line direction:** accept voice references and transcripts, emotion references
+  and strengths, and seed overrides for individual dub segments. Include these
+  controls in incremental fingerprints and private crash-recovery identities.
+- **Audio effects:** add echo and public-address presets with reverb tails.
+- **Shared media:** let uploads skip built-in separation, attach client-separated
+  stems, and fork jobs over hard-linked media for another voice. Stem attachment
+  and job forking require administrator access.
+- **Responsive watermarking:** mark fresh dub segments on the existing watermark
+  worker; recovered segments keep their existing mark.
+- **Legacy Windows AMD support:** retain compatibility adjustments for the
+  `2.9.1+rocm7.13.x` Torch build in the backend and IndexTTS sidecar.
+- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets
+  and generated mobile contracts.
 
-Upstream now supplies CPU float32 selection and IndexTTS speed control, so the
-original overrides were removed. The integration also keeps upstream's atomic
-cache publication: failed or cancelled renders cannot replace published takes.
-Reusing newly synthesized takes after a timing failure needs a separate design
-that preserves that safeguard.
-
-For installation, use [Dub Anything's setup guide](https://github.com/swax/dub-anything/blob/main/docs/setup.md).
-The former standalone patch is maintained here as commits. See
-[fork maintenance notes](../../DUB_ANYTHING.md) for the baseline and update workflow.
-VoiceStudio retains its [AGPL-3.0 license and notices](../../LICENSE-NOTICE.md);
-model weights retain their own licenses.
-
-The original project's README follows.
+[Setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md) · [Fork notes](https://github.com/swax/VoiceStudio/blob/main/DUB_ANYTHING.md)
 
 ---
 
@@ -188,6 +174,8 @@ Mọi thứ ở trên đều miễn phí, chạy trên phần cứng của bạn
 
 Chọn hệ thống của bạn, sau đó mở rộng phương pháp cài đặt.
 
+Các bộ máy GGUF gốc cũng hỗ trợ tăng tốc Vulkan riêng cho từng bộ máy trên GPU AMD, Intel và NVIDIA ([OmniVoice](../../docs/engines/omnivoice-gguf.md#vulkan-acceleration), [CosyVoice](../../docs/engines/cosyvoice-gguf.md)). OmniVoice GGUF tự động chọn GPU và kích thước mô hình trên Windows và Linux. Nếu phép kiểm tra ẩn bị treo, quá trình phát hiện Vulkan thử lại bằng bản tóm tắt gốc; các bản dựng máy tính Windows và Linux sẽ thất bại thay vì âm thầm được phát hành mà thiếu mô-đun Vulkan.
+
 <a id="install-macos"></a>
 
 <details>
@@ -243,6 +231,8 @@ Giao diện ứng dụng chạy được trên máy Mac Intel; hãy kết nối 
 
 <details>
 <summary><img src="../../docs/assets/platforms/windows.svg" alt="" width="20" height="20" /> <strong>Windows</strong> · PowerShell · EXE</summary>
+
+[Thiết lập Windows ROCm](../../docs/install/windows-rocm.md) thử nghiệm hỗ trợ một số GPU RDNA 2 RX 6000 có đích `gfx1030`, `gfx1031` hoặc `gfx1032`; không bao gồm RX 6500 XT (`gfx1034`). Bản dựng CTranslate2 được ghim phiên bản riêng bao gồm nhân `gfx1031` gốc để chép lời trên RX 6700 XT; quá trình thiết lập kiểm tra việc thực thi nhân GPU thực tế. Các thử nghiệm RX 6700 XT cũng bao gồm tạo giọng nói Torch gốc và PyTorch Whisper. Trên ROCm 10, faster-whisper dùng tiến trình suy luận riêng để chọn CPU và chuyển về CPU an toàn. Các thẻ và khối lượng công việc khác vẫn tuân theo giới hạn kiểm chứng trong hướng dẫn. Cấu hình hiệu năng đặt sẵn xác minh trạng thái sẵn sàng của các bộ máy được thay đổi trong tiến trình con ngoại tuyến trước khi lưu, đồng thời giữ phương án dự phòng nếu môi trường thực thi đã cài đặt bị lỗi.
 
 <blockquote>
 
@@ -536,9 +526,9 @@ Nâng cấp từ phiên bản 0.5.3 trở xuống (ứng dụng Tauri)? [Cài ri
 | Trợ giúp cài đặt | [Khắc phục sự cố](../../docs/install/troubleshooting.md) · [Tải xuống mô hình](../../docs/downloading-models.md) |
 | Hướng dẫn | [Lồng tiếng cho nhiều người nói](../../docs/dubbing/multi-speaker-guide.md) · [Giọng nói biểu cảm](../../docs/expressive-speech.md) · [Xuất âm thanh lồng tiếng](../../docs/dubbing/export.md) |
 | Mô hình và chất lượng | [Hướng dẫn các công cụ](../../docs/engines/README.md) · [whisper.cpp ASR](../../docs/engines/whisper-cpp.md) · [Đo hiệu năng](../../docs/benchmarks.md) |
-| Tích hợp | [API cục bộ](../../docs/speech-platform.md) · [MCP](../../docs/mcp.md) · [Ví dụ](../../examples/README.md) |
+| Tích hợp | [CLI](../../docs/install/script.md#terminal-command) · [API cục bộ](../../docs/speech-platform.md) · [MCP](../../docs/mcp.md) · [Ví dụ](../../examples/README.md) |
 | Ứng dụng điện thoại | [iOS và Android](../../docs/mobile.md) |
-| Phát triển | [Đóng góp](../../.github/CONTRIBUTING.md) ([ký CLA](../../.github/CONTRIBUTING.md#contribution-licensing) trước PR đầu tiên) · [Nhật ký thay đổi](../../CHANGELOG.md) |
+| Phát triển | [Đóng góp](../../.github/CONTRIBUTING.md) ([ký CLA](../../.github/CONTRIBUTING.md#contribution-licensing) trước PR đầu tiên) · [Nhật ký thay đổi](../../CHANGELOG.md) · [Chính sách ký mã](../code-signing-policy.md) |
 
 Kỹ năng cho trợ lý lập trình: `npx skills add debpalash/VoiceStudio` (**voicestudio** cho công việc âm thanh, **voicestudio-maintainer** cho kho mã).
 

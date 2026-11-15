@@ -16,8 +16,10 @@ import * as pthAscii from './pth-ascii';
 import { PYPI_SPEED_SAMPLE_BYTES } from './pypi-mirror';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  installManagedPython,
   installRuntime,
   runtimeDownloadEnv,
+  runtimeRequiredGib,
   promoteLegacyRuntimeCaches,
   CUDNN8_COMPAT_PIN,
   MISSING_SYSTEM_LIBRARY_CODE,
@@ -47,6 +49,22 @@ import {
 } from './runtime-project';
 
 vi.mock('./runtime-download', () => ({ downloadRuntimeInstaller: vi.fn() }));
+
+it.each([
+  ['darwin', 'default', 5],
+  ['darwin', 'cpu', 5],
+  ['linux', 'cpu', 5],
+  ['win32', 'cpu', 5],
+  ['linux', 'default', 9],
+  ['win32', 'default', 9],
+  ['linux', 'rocm', 9],
+  ['win32', 'rocm', 9],
+] as const)(
+  'publishes the %s/%s runtime preflight minimum as %s GiB',
+  (platform, variant, expected) => {
+    expect(runtimeRequiredGib(platform, variant)).toBe(expected);
+  },
+);
 vi.mock('./wheel-prefetch', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./wheel-prefetch')>();
   return { ...actual, httpsRangeTransport: vi.fn(actual.httpsRangeTransport) };
@@ -109,6 +127,213 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   vi.mocked(statfs).mockClear();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe('Linux ROCm install dependency selection', () => {
+  const torchStack = ['torch', 'torchaudio', 'torchvision'];
+  const cudaRuntime = ['nvidia-cublas-cu12', 'nvidia-cudnn-cu12'];
+  const sharedDependencies = ['numpy', 'sympy', 'networkx', 'fsspec', 'nvidia-ml-py'];
+  const locked = [...torchStack, ...cudaRuntime, ...sharedDependencies];
+
+  async function setup(previous: 'fresh' | 'rocm' | 'cuda', broken = false) {
+    forcePlatform('linux');
+    vi.spyOn(process, 'arch', 'get').mockReturnValue('x64');
+    vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'rocm');
+    const { bundle, project } = await fixture();
+    const lock = locked
+      .map((name) => `[[package]]\nname = "${name}"\nversion = "1.0.0"\n`)
+      .join('\n');
+    await writeFile(join(bundle, 'uv.lock'), lock);
+    const installed = new Map<string, string>();
+    if (previous !== 'fresh') {
+      await interpreter(project);
+      for (const name of locked)
+        if (previous === 'cuda' || !cudaRuntime.includes(name))
+          installed.set(name, torchStack.includes(name) ? previous : 'locked');
+      await writeFile(join(project, '.runtime-torch'), previous === 'rocm' ? 'rocm' : 'default');
+    }
+    const planned: string[] = [];
+    const downloaded: string[] = [];
+    let synced = false;
+    let syncRuns = 0;
+    let interruptVerificationAt = -1;
+    const run = vi.fn(async (_command: string, args: string[]) => {
+      if (args.includes('sync')) {
+        const omitted = new Set(
+          args.flatMap((arg, index) => (arg === '--no-install-package' ? [args[index + 1]!] : [])),
+        );
+        const desired = locked.filter((name) => !omitted.has(name));
+        // Model uv's exact/inexact package-set semantics at the actual runner:
+        // omitted wheel payloads are not downloaded, but transitive deps remain.
+        const changes = desired.filter(
+          (name) =>
+            !installed.has(name) || (torchStack.includes(name) && installed.get(name) !== 'cuda'),
+        );
+        if (args.includes('--dry-run')) {
+          planned.push(...changes);
+          return undefined;
+        }
+        if (!args.includes('--inexact'))
+          for (const name of installed.keys()) if (!desired.includes(name)) installed.delete(name);
+        for (const name of changes) {
+          downloaded.push(name);
+          installed.set(name, torchStack.includes(name) ? 'cuda' : 'locked');
+        }
+        synced = true;
+        syncRuns++;
+        await interpreter(project);
+      } else if (args[0] === 'pip' && args[1] === 'install') {
+        if (args.some((arg) => arg.includes('+rocm')))
+          for (const name of torchStack) installed.set(name, 'rocm');
+        if (args.some((arg) => arg.includes('+cpu')))
+          for (const name of torchStack) installed.set(name, 'cpu');
+      } else if (args[0] === 'pip' && args[1] === 'uninstall') {
+        for (const name of cudaRuntime) if (args.includes(name)) installed.delete(name);
+      } else if (args[0] === '-c') {
+        if (args[1] === RUNTIME_IMPORT_PROBE && syncRuns === interruptVerificationAt) {
+          interruptVerificationAt = -1;
+          throw new Error('controlled interrupted post-sync verification');
+        }
+        if (
+          broken &&
+          !synced &&
+          (args[1] === RUNTIME_IMPORT_PROBE || args[1] === RUNTIME_NATIVE_IMPORT_PROBE)
+        )
+          throw new Error('controlled broken native torch');
+        if (args[1] === ROCM_TORCH_PROBE && installed.get('torch') !== 'rocm')
+          throw new Error('expected installed HIP torch');
+      }
+      return undefined;
+    });
+    return {
+      bundle,
+      project,
+      lock,
+      installed,
+      planned,
+      downloaded,
+      run,
+      interruptNextVerification: () => {
+        interruptVerificationAt = syncRuns + 1;
+      },
+    };
+  }
+
+  it.each(['fresh', 'rocm', 'cuda'] as const)(
+    'never downloads a throwaway CUDA stack during a %s ROCm installation',
+    async (previous) => {
+      const f = await setup(previous);
+      await installRuntime(
+        f.bundle,
+        f.project,
+        'uv',
+        f.run,
+        new AbortController().signal,
+        undefined,
+        'global',
+      );
+      expect(
+        f.planned.filter((name) => torchStack.includes(name) || cudaRuntime.includes(name)),
+      ).toEqual([]);
+      expect(
+        f.downloaded.filter((name) => torchStack.includes(name) || cudaRuntime.includes(name)),
+      ).toEqual([]);
+      for (const name of torchStack) expect(f.installed.get(name)).toBe('rocm');
+      for (const name of cudaRuntime) expect(f.installed.has(name)).toBe(false);
+      for (const name of sharedDependencies) expect(f.installed.get(name)).toBe('locked');
+      const sync = f.run.mock.calls.find(([, args]) => args[0] === 'sync')![1];
+      expect(sync).toContain('--frozen');
+      expect(sync.includes('--inexact')).toBe(previous === 'rocm');
+      expect(await readFile(join(f.project, 'uv.lock'), 'utf8')).toBe(f.lock);
+      expect(await runtimeReady(f.bundle, f.project)).toBe(true);
+    },
+  );
+
+  it.each([false, true])(
+    'repairs native ROCm wheels through the overlay (interrupted=%s)',
+    async (interrupted) => {
+      const f = await setup('rocm', true);
+      if (interrupted)
+        await writeFile(join(f.project, '.runtime-installing'), new Date().toISOString());
+      await installRuntime(
+        f.bundle,
+        f.project,
+        'uv',
+        f.run,
+        new AbortController().signal,
+        undefined,
+        'global',
+      );
+      expect(
+        f.downloaded.filter((name) => torchStack.includes(name) || cudaRuntime.includes(name)),
+      ).toEqual([]);
+      const sync = f.run.mock.calls.find(([, args]) => args[0] === 'sync')![1];
+      expect(sync).not.toContain('--reinstall-package');
+      expect(f.run.mock.calls.some(([, args]) => args[0] === 'cache')).toBe(!interrupted);
+      const overlay = f.run.mock.calls.find(
+        ([, args]) => args[0] === 'pip' && args[1] === 'install',
+      )![1];
+      expect(overlay).toEqual(expect.arrayContaining(rocmTorchInstallArgs(ROCM_TORCH_INDEX)));
+      expect(await runtimeInstallInterrupted(f.project)).toBe(false);
+      expect(await runtimeReady(f.bundle, f.project)).toBe(true);
+    },
+  );
+
+  it.each([['linux', 'rocm'], ['linux', 'cpu'], ['win32', 'cpu']] as const)(
+    'cleans CUDA packages after an interrupted switch away from %s/%s',
+    async (platform, variant) => {
+      const f = await setup('fresh');
+      forcePlatform(platform);
+      vi.stubEnv('OMNIVOICE_TORCH_VARIANT', variant);
+      const install = () =>
+        installRuntime(
+          f.bundle,
+          f.project,
+          'uv',
+          f.run,
+          new AbortController().signal,
+          undefined,
+          'global',
+        );
+      await install();
+      for (const name of torchStack) expect(f.installed.get(name)).toBe(variant);
+      vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'cuda');
+      f.interruptNextVerification();
+      await expect(install()).rejects.toThrow('controlled interrupted post-sync verification');
+      // The last successful marker is stale, while the actual sync completed.
+      expect(await readFile(join(f.project, '.runtime-torch'), 'utf8')).toBe(variant);
+      for (const name of cudaRuntime) expect(f.installed.has(name)).toBe(true);
+      for (const name of torchStack) expect(f.installed.get(name)).toBe('cuda');
+      vi.stubEnv('OMNIVOICE_TORCH_VARIANT', variant);
+      f.downloaded.length = 0;
+      f.planned.length = 0;
+      await install();
+      for (const name of cudaRuntime) expect(f.installed.has(name)).toBe(false);
+      for (const name of torchStack) expect(f.installed.get(name)).toBe(variant);
+      for (const name of sharedDependencies) expect(f.installed.get(name)).toBe('locked');
+      expect(
+        f.planned.filter((name) => torchStack.includes(name) || cudaRuntime.includes(name)),
+      ).toEqual([]);
+      expect(
+        f.downloaded.filter((name) => torchStack.includes(name) || cudaRuntime.includes(name)),
+      ).toEqual([]);
+      expect(await runtimeReady(f.bundle, f.project)).toBe(true);
+    },
+  );
+});
+
+it('estimates disk space without accepting unsupported Windows ARM64 ROCm installs', async () => {
+  forcePlatform('win32');
+  vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64');
+  vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'rocm');
+  expect(runtimeRequiredGib()).toBe(9);
+  const { bundle, project } = await fixture();
+  const run = vi.fn();
+  await expect(
+    installRuntime(bundle, project, null, run, new AbortController().signal),
+  ).rejects.toThrow('Windows ROCm requires Windows x64 Python 3.12 (cp312).');
+  expect(run).not.toHaveBeenCalled();
+  expect(downloadRuntimeInstaller).not.toHaveBeenCalled();
 });
 
 describe('packaged runtime setup', () => {
@@ -578,16 +803,16 @@ describe('packaged runtime setup', () => {
       'torchaudio',
       '--reinstall-package',
       'torchvision',
-      'torch==2.8.0+rocm6.4',
-      'torchaudio==2.8.0+rocm6.4',
-      'torchvision==0.23.0+rocm6.4',
+      'torch==2.10.0+rocm7.1',
+      'torchaudio==2.10.0+rocm7.1',
+      'torchvision==0.25.0+rocm7.1',
       '--extra-index-url',
       ROCM_TORCH_INDEX,
       '--index-strategy',
       'unsafe-best-match',
     ]);
     // A mirror without a rocm-style name keeps the bare pins.
-    expect(rocmTorchInstallArgs('https://mirror.invalid/rocm/')).toContain('torch==2.8.0');
+    expect(rocmTorchInstallArgs('https://mirror.invalid/rocm/')).toContain('torch==2.10.0');
   });
   it('leaves macOS on its native stack when ROCm is requested', async () => {
     forcePlatform('darwin');
@@ -1242,9 +1467,13 @@ describe('packaged runtime setup', () => {
           code: 'UNKNOWN',
         });
     });
-    const refused = await installRuntime(bundle, project, 'uv', run, new AbortController().signal).catch(
-      (error: unknown) => error,
-    );
+    const refused = await installRuntime(
+      bundle,
+      project,
+      'uv',
+      run,
+      new AbortController().signal,
+    ).catch((error: unknown) => error);
     expect(refused).toBeInstanceOf(RuntimeLaunchRefusedError);
     expect((refused as RuntimeLaunchRefusedError).program).toBe('/managed/python');
     expect((refused as Error).message).toBe('spawn UNKNOWN');
@@ -1380,6 +1609,42 @@ describe('regional PyPI mirror for the frozen sync (#3444)', () => {
     expect(await readFile(join(project, 'uv.lock'), 'utf8')).toBe(LOCK);
     expect(await runtimeReady(bundle, project)).toBe(true);
     expect(await runtimeCompatible(bundle, project)).toBe(true);
+  });
+
+  it('Auto recovers a later source-archive DNS failure through the pinned mirror', async () => {
+    const { bundle, project } = await fixture();
+    const archive = 'packages/hash/antlr4-python3-runtime-4.9.3.tar.gz';
+    const lock = `${LOCK}\n[[package]]\nname = "antlr4-python3-runtime"\nsdist = { url = "https://files.pythonhosted.org/${archive}", hash = "sha256:archive" }\n`;
+    await writeFile(join(bundle, 'uv.lock'), lock);
+    const seen: string[] = [];
+    const run = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] !== 'sync' || args.includes('--dry-run')) return undefined;
+      seen.push(await readFile(join(project, 'uv.lock'), 'utf8'));
+      expect(args).toContain('--frozen');
+      if (seen.length === 1)
+        throw Object.assign(new Error('Runtime setup exited with code 1'), {
+          stderr: `error sending request for url (https://files.pythonhosted.org/${archive})\ndns error: No such host is known`,
+        });
+      await interpreter(project);
+      return undefined;
+    });
+    await installRuntime(
+      bundle,
+      project,
+      'uv',
+      run,
+      new AbortController().signal,
+      undefined,
+      'auto',
+    );
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(lock);
+    expect(seen[1]).toContain(
+      `https://mirrors.aliyun.com/pypi/${archive}", hash = "sha256:archive"`,
+    );
+    expect(seen[1]).toContain('https://download-r2.pytorch.org/whl/cu128/torch.whl');
+    expect(await readFile(join(project, 'uv.lock'), 'utf8')).toBe(lock);
+    expect(await runtimeReady(bundle, project)).toBe(true);
   });
 
   it.each(['global', 'russia', 'restricted'] as const)(
@@ -1721,5 +1986,174 @@ describe('outdated Visual C++ runtime behind a native import crash (#3293)', () 
         new AbortController().signal,
       ),
     ).rejects.not.toMatchObject({ code: OUTDATED_SYSTEM_LIBRARY_CODE });
+  });
+});
+
+describe('retryTransientDownload (#3882)', () => {
+  const gateway = Object.assign(new Error('Runtime setup exited with code 2'), {
+    stderr:
+      'Failed to download `en-core-web-sm`\n  Request failed after 5 retries in 30.6s\n  HTTP status server error (504 Gateway Timeout)',
+  });
+  const noWait = async () => {};
+  const signal = () => new AbortController().signal;
+
+  it('settles cancellation during backoff before its timer and starts no second sync', async () => {
+    const { retryTransientDownload } = await import('./runtime-project');
+    const controller = new AbortController();
+    const reason = new Error('setup cancelled');
+    const sync = vi.fn().mockRejectedValue(gateway);
+    let settled = false;
+    const work = retryTransientDownload(
+      sync,
+      controller.signal,
+      () => queueMicrotask(() => controller.abort(reason)),
+      [200],
+    ).catch((error) => {
+      settled = true;
+      return error;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled).toBe(true);
+      expect(await work).toBe(reason);
+      expect(sync).toHaveBeenCalledTimes(1);
+    } finally {
+      controller.abort(reason);
+      await work;
+    }
+  });
+
+  it('does not start a sync when cancellation already won', async () => {
+    const { retryTransientDownload } = await import('./runtime-project');
+    const controller = new AbortController();
+    controller.abort();
+    const sync = vi.fn().mockResolvedValue(undefined);
+    await expect(retryTransientDownload(sync, controller.signal)).rejects.toBe(controller.signal.reason);
+    expect(sync).not.toHaveBeenCalled();
+  });
+
+  it('repeats the sync after a 5xx and succeeds', async () => {
+    const sync = vi.fn().mockRejectedValueOnce(gateway).mockResolvedValue(undefined);
+    const { retryTransientDownload } = await import('./runtime-project');
+    await retryTransientDownload(sync, signal(), undefined, [1, 1], noWait);
+    expect(sync).toHaveBeenCalledTimes(2);
+  });
+
+  it('explains a persistent server error and points to Retry', async () => {
+    const sync = vi.fn().mockRejectedValue(gateway);
+    const { retryTransientDownload } = await import('./runtime-project');
+    const failure = await retryTransientDownload(sync, signal(), undefined, [1, 1], noWait).catch(
+      (error: Error) => error,
+    );
+    expect((failure as Error).message).toMatch(/temporary error.*press Retry/s);
+    expect(sync).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not treat a status-like number in a path as a server error', async () => {
+    const { isTransientDownloadFailure } = await import('./runtime-project');
+    expect(
+      isTransientDownloadFailure(
+        Object.assign(new Error('Permission denied'), {
+          stderr: 'error: /home/u/504/.venv: denied',
+        }),
+      ),
+    ).toBe(false);
+    expect(isTransientDownloadFailure(gateway)).toBe(true);
+  });
+
+  it('keeps the original error code when giving up', async () => {
+    const sync = vi
+      .fn()
+      .mockRejectedValue(
+        Object.assign(new Error('Request failed: operation timed out'), { code: 'EACCES' }),
+      );
+    const { retryTransientDownload } = await import('./runtime-project');
+    const failure = await retryTransientDownload(sync, signal(), undefined, [1], noWait).catch(
+      (error: Error) => error,
+    );
+    expect(failure).toMatchObject({ code: 'EACCES' });
+  });
+
+  it('does not retry a lock timeout', async () => {
+    const { isTransientDownloadFailure } = await import('./runtime-project');
+    expect(isTransientDownloadFailure(new Error('lock timed out'))).toBe(false);
+  });
+
+  it('does not repeat a non-network failure', async () => {
+    const sync = vi.fn().mockRejectedValue(new Error('No solution found'));
+    const { retryTransientDownload } = await import('./runtime-project');
+    const failure = await retryTransientDownload(sync, signal(), undefined, [1, 1], noWait).catch(
+      (error: Error) => error,
+    );
+    expect((failure as Error).message).toBe('No solution found');
+    expect(sync).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('installManagedPython', () => {
+  const stalled = Object.assign(
+    new Error('Download timed out: no data for 120 s from github.com'),
+    { code: 'DOWNLOAD_STALLED' },
+  );
+  const mirror =
+    'https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download';
+
+  it('retries a stalled GitHub download from the mirror and keeps the mirror for setup', async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const seen: (string | undefined)[] = [];
+    const log = vi.fn();
+    const run = vi.fn(async (_c: string, _a: string[], _p: string, e?: NodeJS.ProcessEnv) => {
+      seen.push(e?.UV_PYTHON_INSTALL_MIRROR);
+      if (seen.length === 1) throw stalled;
+    });
+    await installManagedPython(
+      'uv',
+      ['python', 'install'],
+      '/p',
+      env,
+      run,
+      new AbortController().signal,
+      true,
+      log,
+    );
+    expect(seen).toEqual([undefined, mirror]);
+    expect(env.UV_PYTHON_INSTALL_MIRROR).toBe(mirror);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('retrying from gh-proxy.com'));
+  });
+
+  it('falls back from the mirror to GitHub, and restores the source when both fail', async () => {
+    const env: NodeJS.ProcessEnv = { UV_PYTHON_INSTALL_MIRROR: mirror };
+    const seen: (string | undefined)[] = [];
+    const run = vi.fn(async (_c: string, _a: string[], _p: string, e?: NodeJS.ProcessEnv) => {
+      seen.push(e?.UV_PYTHON_INSTALL_MIRROR);
+      throw stalled;
+    });
+    await expect(
+      installManagedPython('uv', [], '/p', env, run, new AbortController().signal, true),
+    ).rejects.toBe(stalled);
+    expect(seen).toEqual([mirror, undefined]);
+    expect(env.UV_PYTHON_INSTALL_MIRROR).toBe(mirror);
+  });
+
+  it('keeps a chosen region, a cancelled setup and a refused launch on the first attempt', async () => {
+    const run = vi.fn(async () => {
+      throw stalled;
+    });
+    await expect(
+      installManagedPython('uv', [], '/p', {}, run, new AbortController().signal, false),
+    ).rejects.toBe(stalled);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      installManagedPython('uv', [], '/p', {}, run, controller.signal, true),
+    ).rejects.toBeDefined();
+    const refused = vi.fn(async () => {
+      throw Object.assign(new Error('spawn EPERM'), { code: 'EPERM', syscall: 'spawn' });
+    });
+    await expect(
+      installManagedPython('uv', [], '/p', {}, refused, new AbortController().signal, true),
+    ).rejects.toMatchObject({ code: 'EPERM' });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(refused).toHaveBeenCalledTimes(1);
   });
 });

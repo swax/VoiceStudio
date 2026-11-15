@@ -1,41 +1,25 @@
 # VoiceStudio for Dub Anything
 
-This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the public
-VoiceStudio fork used as the voice backend for
-[Dub Anything](https://github.com/swax/dub-anything). Dub Anything directs,
-renders and checks video dubs through this backend, and includes it as a Git
-submodule pinned to a tested commit.
+This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the backend
+fork pinned by [Dub Anything](https://github.com/swax/dub-anything).
 
-This fork integrates upstream commit `2e195d72d3794a88b7cb37f87a3e92a20193574e`
-and keeps these additional controls:
+Additional behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
 
-- **Transcription:** respect the selected source language when transcribing dub audio.
-- **Per-line direction:** accept voice references, emotion references and random seeds
-  for individual segments, forward seeds to IndexTTS, and invalidate cached takes
-  when these controls change.
-- **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
-- **Shared media:** upload without separating the voices, attach stems the client
-  separated itself, and fork a job over the same media to render it in another voice.
-- **Responsive rendering:** embed each new dub segment's provenance watermark
-  on the watermark worker so health checks stay responsive during the operation.
-- **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
-  adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
-  dispatch and precision policy.
-- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets.
+- **Per-line direction:** accept voice references and transcripts, emotion references
+  and strengths, and seed overrides for individual dub segments. Include these
+  controls in incremental fingerprints and private crash-recovery identities.
+- **Audio effects:** add echo and public-address presets with reverb tails.
+- **Shared media:** let uploads skip built-in separation, attach client-separated
+  stems, and fork jobs over hard-linked media for another voice. Stem attachment
+  and job forking require administrator access.
+- **Responsive watermarking:** mark fresh dub segments on the existing watermark
+  worker; recovered segments keep their existing mark.
+- **Legacy Windows AMD support:** retain compatibility adjustments for the
+  `2.9.1+rocm7.13.x` Torch build in the backend and IndexTTS sidecar.
+- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets
+  and generated mobile contracts.
 
-Upstream now supplies CPU float32 selection and IndexTTS speed control, so the
-original overrides were removed. The integration also keeps upstream's atomic
-cache publication: failed or cancelled renders cannot replace published takes.
-Reusing newly synthesized takes after a timing failure needs a separate design
-that preserves that safeguard.
-
-For installation, use [Dub Anything's setup guide](https://github.com/swax/dub-anything/blob/main/docs/setup.md).
-The former standalone patch is maintained here as commits. See
-[fork maintenance notes](DUB_ANYTHING.md) for the baseline and update workflow.
-VoiceStudio retains its [AGPL-3.0 license and notices](LICENSE-NOTICE.md);
-model weights retain their own licenses.
-
-The original project's README follows.
+[Setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md) · [Fork notes](https://github.com/swax/VoiceStudio/blob/main/DUB_ANYTHING.md)
 
 ---
 
@@ -43,9 +27,6 @@ The original project's README follows.
   <h1><sub><img src="docs/logo.png" alt="" width="36" height="36" /></sub> VoiceStudio</h1>
   <p>
     <a href="https://trendshift.io/repositories/28176?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-28176" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/28176" alt="Trendshift badge showing where VoiceStudio ranks among trending repositories" width="220" height="48" /></a>
-  </p>
-  <p>
-    <strong>🎉 <a href="https://github.com/debpalash/VoiceStudio/stargazers">100,000 GitHub stars — thank you!</a></strong>
   </p>
   <h2>AI voice studio. On your device.</h2>
   <h3>Clone, design, dub, dictate, transcribe and narrate in 646 languages.</h3>
@@ -81,6 +62,7 @@ The original project's README follows.
       ·   <sub>Special sponsor</sub> 
     <a href="https://spicrawl.com?utm_source=voicestudio&amp;utm_medium=github_readme&amp;utm_campaign=special_sponsor&amp;utm_content=logo"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sponsors/spicrawl-dark.svg" /><img src="docs/sponsors/spicrawl.svg" alt="Spicrawl" height="32" align="middle" /></picture></a>
   </p>
+  <br />
 </div>
 
 <p align="center">
@@ -185,7 +167,17 @@ Everything above is free, runs on your own hardware and needs no account. Pro an
 
 ## Platforms
 
+Experimental [Windows ROCm setup](docs/install/windows-rocm.md) supports selected RDNA 2 RX 6000 GPUs with targets `gfx1030`, `gfx1031` or `gfx1032`; RX 6500 XT (`gfx1034`) is excluded. GPU transcription uses a CTranslate2 build with native
+`gfx1031` kernels that this repository builds from upstream source and pins by
+hash, and setup checks actual GPU kernel execution. RX 6700 XT tests also cover native Torch speech generation and
+PyTorch Whisper. ROCm 10 faster-whisper uses a separate inference process to
+preserve safe CPU selection and fallback. Other cards and workloads retain the qualification limits in the guide.
+Performance presets validate changed engine selections in an offline child
+process before saving them, preserving fallback when an installed runtime fails.
+
 Choose your system, then expand an installation method.
+
+Native GGUF engines additionally support engine-specific Vulkan acceleration on AMD, Intel and NVIDIA GPUs ([OmniVoice](docs/engines/omnivoice-gguf.md#vulkan-acceleration), [CosyVoice](docs/engines/cosyvoice-gguf.md)). OmniVoice GGUF selects its GPU and model size automatically on Windows and Linux. Vulkan discovery retries a stalled hidden probe with a native summary; Windows and Linux desktop builds fail rather than silently ship without their Vulkan module.
 
 <a id="install-macos"></a>
 
@@ -535,9 +527,9 @@ Upgrading from 0.5.3 or older (the Tauri app)? [Install the new app separately](
 | Setup help | [Troubleshooting](docs/install/troubleshooting.md) · [Model downloads](docs/downloading-models.md) |
 | Guides | [Multi-speaker dubbing](docs/dubbing/multi-speaker-guide.md) · [Expressive speech](docs/expressive-speech.md) · [Exporting dubs](docs/dubbing/export.md) |
 | Models & quality | [Engine guides](docs/engines/README.md) · [whisper.cpp ASR](docs/engines/whisper-cpp.md) · [Benchmarks](docs/benchmarks.md) |
-| Integrations | [Local API](docs/speech-platform.md) · [MCP](docs/mcp.md) · [Examples](examples/README.md) |
+| Integrations | [CLI](docs/install/script.md#terminal-command) · [Local API](docs/speech-platform.md) · [MCP](docs/mcp.md) · [Examples](examples/README.md) |
 | Phone apps | [iOS and Android](docs/mobile.md) |
-| Development | [Contributing](.github/CONTRIBUTING.md) ([sign the CLA](.github/CONTRIBUTING.md#contribution-licensing) before your first PR) · [Changelog](CHANGELOG.md) |
+| Development | [Contributing](.github/CONTRIBUTING.md) ([sign the CLA](.github/CONTRIBUTING.md#contribution-licensing) before your first PR) · [Changelog](CHANGELOG.md) · [Code signing policy](docs/code-signing-policy.md) |
 
 Agent skills: `npx skills add debpalash/VoiceStudio` (**voicestudio** for audio work, **voicestudio-maintainer** for the repo).
 
@@ -597,3 +589,7 @@ Thank you to everyone who sends code, reports, translations and ideas. [All cont
 </p>
 
 <p align="center"><a href="https://discord.gg/bzQavDfVV9"><img src="docs/assets/discord-community.svg" alt="Come say hello! Join us on Discord" height="64" /></a></p>
+
+**Disclaimer**
+
+VoiceStudio users are strictly prohibited from using it for unauthorized voice cloning, voice impersonation, fraud, scams, or any other illegal or unethical activities. All users shall ensure full compliance with applicable local laws, regulations, and ethical standards. The developers assume no liability for any misuse of VoiceStudio and advocate for responsible AI development and use, encouraging the community to uphold safety and ethical principles in AI research and applications.

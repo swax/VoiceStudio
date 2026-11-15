@@ -38,7 +38,21 @@ init_db()
 def client():
     app = FastAPI()
     app.include_router(personas_router.router)
-    return TestClient(app)
+    # Loopback peer so the router's require_admin gate lets these handler tests
+    # through; remote denial is covered by the policy tests.
+    return TestClient(app, client=("127.0.0.1", 50000))
+
+
+@pytest.fixture(autouse=True)
+def _clips_decode(monkeypatch):
+    """These bundles carry filler bytes; refusing clips that do not decode is
+    covered in tests/test_persona_kind.py."""
+    from api.routers import profiles
+
+    async def _decodes(_path):
+        return True
+
+    monkeypatch.setattr(profiles, "_is_decodable_audio", _decodes)
 
 
 # ── bundle builders (no torch) ───────────────────────────────────────────────

@@ -201,7 +201,7 @@ All tabs work without pairing once on-device models are installed (see M2); the 
 | Capability | Runtime | Pin |
 |---|---|---|
 | TTS (preset voices), dictation, transcription | sherpa-onnx | release `v1.13.8` |
-| Voice cloning | omnivoice.cpp (GGML) | commit `886fc079838ca7400cb2b42b36e2a65aa1daabe8` (same as desktop `quant_map.json`) |
+| Voice cloning | omnivoice.cpp (GGML) | commit `040c8b344d8c670ce1475194751d119b5ef82c78` (same as desktop `quant_map.json`) |
 | Dub translation | llama.cpp | release `b11716` |
 
 - Native libraries are built or fetched by `mobile/native/` scripts at the pins
@@ -469,6 +469,8 @@ Workflows on both platforms. These are native screens; no embedded desktop UI.
   provider before regeneration; resumed events validate original source text.
   Host export supports selected/default/original tracks, separated background,
   subtitle burn, dual/karaoke captions and existing audio/subtitle/package formats.
+  Both paired apps also share generated-track transcripts as UTF-8 TXT, without
+  timestamps or subtitle markup added, through the same host text-selection path.
   Acoustic diarization, isolated background separation and subtitle burn remain
   explicit computer tasks.
 - **Editable project handoff** uses a version-1 `.vsproject` stored ZIP with a
@@ -546,6 +548,9 @@ Workflows on both platforms. These are native screens; no embedded desktop UI.
   cloned voice. Publication follows successful marked cloned-preview synthesis;
   original reference WAV/PCM stays separate. Failed/canceled synthesis publishes
   no voice. Legacy voices without generated previews retain their old playback.
+  A phone clone is screen-owned: Android keeps the screen on while it runs, and
+  leaving the foreground (or a rotation) stops it with an explicit interrupted
+  notice that keeps the chosen sample and name for Retry (iOS resumes through its sustained job).
 - **Calls** run on the paired computer. Only an authenticated operator session
   or API key plus the computer's off-by-default `allow_remote_control` setting
   enables the desktop-mode exception. PIN/trusted-network callers never gain

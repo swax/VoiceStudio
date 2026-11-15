@@ -10,11 +10,11 @@ spark identifies creation. The product voice is clear, calm, and direct.
 | Primary vector mark | `docs/logo.svg` |
 | README mark | `docs/logo.png` and `docs/logo-256.png` |
 | Browser icon | `electron/public/favicon.svg` |
-| In-app mark | `electron/src/shared/components/brand/VoiceStudioMark.jsx` |
 | Desktop/platform icons | `electron/build/icons/` |
 | macOS menu-bar templates | `electron/build/icons/trayTemplate.svg` and `trayRecordingTemplate.svg` |
 | Electron sidebar and browser icon | `electron/public/favicon.svg` via `electron/src/renderer/src/lib/brand.ts` |
 | Sidebar/launchpad artwork | `electron/public/signal-field.webp` |
+| macOS DMG window background | `electron/build/dmg/background.svg` |
 
 Regenerate every desktop icon from the canonical vector after changing the
 mark:
@@ -29,6 +29,17 @@ the macOS artwork to Apple's icon grid. Then run the Electron packaging contract
 Keep `fill="none"` on the waveform path in every SVG copy of the mark; without it
 the curve fills black.
 
+The DMG install window uses the brand palette on the dark plum tile, with one
+headline and one footer line. After editing its SVG, re-render the 1x and 2x
+PNGs on macOS (needs `rsvg-convert`) with `bun run --cwd electron
+dmg:background`. Keep its icon slots in step with the `dmg` block in
+`electron/electron-builder.config.mjs`; `electron/tests/dmg-window.test.mjs`
+checks the sizes, slots and title.
+
+App icons can look grey on macOS 26 and later when **System Settings →
+Appearance → Icon & widget style** is Clear or Tinted. macOS applies that style
+to every app, Safari included; with the default style the ICNS shows in colour.
+
 Android generates its vectors from the same SVG with
 `mobile/android/scripts/generate_brand_resources.py`. SVG paint `none` becomes
 transparent Android color before applying the monochrome treatment, so the
@@ -38,7 +49,7 @@ macOS artwork (`icon.icns` and `icon-macos.png`) keeps Apple's icon grid: the ti
 spans the centred 824 px of a 1024 px canvas, so it matches other apps in the Dock,
 Launchpad and Finder. `tests/test_macos_icon_grid.py` checks it.
 
-Do not redraw the waveform per screen. Use `VoiceStudioMark` in React and the
+Do not redraw the waveform per screen. Use `electron/src/renderer/src/lib/brand.ts` in React and the
 canonical SVG elsewhere so the silhouette stays recognizable at 16–512 px.
 
 ## Palette

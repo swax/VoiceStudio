@@ -15,9 +15,16 @@ from __future__ import annotations
 
 import types
 
+import psutil  # noqa: F401  (see below)
 import pytest
 
 from core import device_caps
+
+# psutil picks its platform module when first imported. The autouse fixture
+# below fakes sys.platform == "linux", so a first import inside a test (via
+# services.model_manager) failed on macOS and Windows and left psutil._common
+# cached as Linux, breaking every later importer in the same session. Importing
+# it here, under the real platform, keeps this file from polluting others.
 from core.device_caps import KERNEL_RISK_MARKER
 
 # A rocm7.2 wheel's real arch list shape; gfx1151 is natively supported there.
@@ -364,8 +371,9 @@ def test_nvidia_never_gets_an_hsa_override():
 
 # ── #3418: RDNA4 (RX 9060 / 9070, gfx1200 / gfx1201) ────────────────────
 
-# torch 2.8.0's ROCm wheels (the pinned rocm6.4 index) are built with
-# PYTORCH_ROCM_ARCH including gfx1200;gfx1201 (.ci/docker/manywheel/build.sh).
+# torch 2.10.0's ROCm wheels (the pinned rocm7.1 index) are built with
+# PYTORCH_ROCM_ARCH including gfx1200;gfx1201 (.ci/docker/manywheel/build.sh),
+# a superset of 2.8.0's rocm6.4 list, so no GPU lost kernels in the move.
 ROCM64_ARCHS = ["gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1030",
                 "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"]
 PRE_RDNA4_ARCHS = ["gfx900", "gfx906", "gfx90a", "gfx1030", "gfx1100"]
@@ -407,7 +415,7 @@ def test_rdna4_on_an_old_build_is_a_mismatch_with_no_remap_advice(monkeypatch):
     assert compatible is False
     assert "11.0.0" not in warning
     assert "No HSA_OVERRIDE_GFX_VERSION remap can help" in warning
-    assert "gfx1201" in warning and "rocm6.4" in warning
+    assert "gfx1201" in warning and "rocm7.1" in warning
 
 
 def test_remap_advice_names_a_same_generation_target_the_build_ships(monkeypatch):

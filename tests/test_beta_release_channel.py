@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 import yaml
@@ -60,7 +61,8 @@ def test_beta_release_uses_beta_notes_and_skips_sunset_feeds(release_module, mon
     Path("package.json").write_text(json.dumps({"version": "1.2.3-beta.2"}))
     Path("CHANGELOG.md").write_text(
         "## [Unreleased]\n\n- Later\n\n## [1.2.3-beta.2] — 2026-10-22\n\n- Beta fix\n\n"
-        "## [1.2.2] — 2026-10-01\n\n- Older\n"
+        "## [1.2.2] — 2026-10-01\n\n- Older\n",
+        encoding="utf-8",
     )
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -78,7 +80,7 @@ def test_beta_release_uses_beta_notes_and_skips_sunset_feeds(release_module, mon
 
     assert seen["channel"] == "beta"
     assert seen["release"]["isPrerelease"] is True
-    assert (assets / "RELEASE_NOTES.md").read_text() == "- Beta fix\n"
+    assert (assets / "RELEASE_NOTES.md").read_text(encoding="utf-8") == "- Beta fix\n"
 
 
 def test_prepare_rejects_a_tag_that_is_not_the_package_version(release_module, monkeypatch, tmp_path):
@@ -147,3 +149,34 @@ def test_appimage_update_info_contract_matches_the_embed_script():
     assert "isBeta ? releaseTag : 'latest'" in embed
     assert "channel.startsWith('electron-beta-') ? `v${version}` : 'latest'" in contract
     assert "|latest|VoiceStudio-" not in contract, "contract must not hardcode latest"
+
+
+@pytest.mark.parametrize(
+    "channel,latest,ok",
+    [("beta", "v0.5.7", True), ("beta", "v0.5.8-beta.2", False),
+     ("beta", "v0.5.8-beta.1", False),  # any beta served as latest reaches stable users
+     ("stable", "v0.5.8", True), ("stable", "v0.5.7", False)],
+)
+def test_publish_proves_where_latest_points(tmp_path, channel, latest, ok):
+    import os
+    import subprocess
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/electron-release.yml").read_text(encoding="utf-8"))
+    step = next(s for s in workflow["jobs"]["release"]["steps"] if s.get("name") == "Publish only when explicitly requested")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "gh").write_text(
+        f'#!/bin/sh\ncase "$*" in *releases/latest*) echo "{latest}";; esac\nexit 0\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    (fake / "gh").chmod(0o755)
+    tag = "v0.5.8-beta.2" if channel == "beta" else "v0.5.8"
+    env = dict(os.environ, PATH=f"{fake}{os.pathsep}{os.environ['PATH']}", CHANNEL=channel, TAG=tag,
+               GITHUB_REPOSITORY="debpalash/VoiceStudio", REHEARSAL="false")
+    script = tmp_path / "publish.sh"
+    script.write_text(step["run"], encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", "-e", script.as_posix()], env=env, capture_output=True, text=True
+    )
+    assert (result.returncode == 0) is ok, result.stdout + result.stderr

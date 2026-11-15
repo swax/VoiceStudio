@@ -39,6 +39,9 @@ def test_unset_controls_keep_raw_and_parsed_fingerprints_identical():
 
 @pytest.mark.parametrize("hint,supports_language", [(None, True), ("ja", True), ("ja", False)])
 def test_transcription_worker_pins_language_only_for_supported_backends(hint, supports_language):
+    from services.asr_backend import transcribe_request_kwargs
+    from services.dub_language import asr_source_language
+
     # Exercise the real nested chunk worker without loading ASR or a GPU.
     source = (ROOT / "backend/api/routers/dub_core.py").read_text(encoding="utf-8")
     worker = next(
@@ -63,6 +66,8 @@ def test_transcription_worker_pins_language_only_for_supported_backends(hint, su
         "_safe_soundfile_write": lambda *args: None,
         "tempfile": tempfile,
         "os": os,
+        "asr_source_language": asr_source_language,
+        "transcribe_request_kwargs": transcribe_request_kwargs,
     }
     exec(
         compile(ast.Module(body=[worker], type_ignores=[]), str(ROOT / "backend/api/routers/dub_core.py"), "exec"),

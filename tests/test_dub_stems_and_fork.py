@@ -191,4 +191,4 @@ def test_an_unseparated_upload_neither_offers_nor_reuses_cached_stems():
 
     src = inspect.getsource(dub_pipeline.ingest_pipeline)
     assert 'separate = source.get("separate", True)' in src
-    assert "compute_file_hash, audio_path) if separate else \"\"" in src
+    assert 'compute_file_hash, audio_path) if separate else ""' in src

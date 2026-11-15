@@ -15,9 +15,10 @@
 #  `:latest` / `:rocm` to follow the rolling preview built from main.
 #
 #  SECURITY: The port is bound to 127.0.0.1 by default — only this
-#  machine can reach the API. To expose VoiceStudio on your LAN (or
-#  through a reverse proxy / tunnel), change the port mapping to
-#  "0.0.0.0:3900:3900" or "3900:3900". Export a long random
+#  machine can reach the published API port. For host-managed Tailscale Serve,
+#  keep loopback publishing and follow docs/install/docker.md#private-remote-access-with-tailscale;
+#  no host CLI/socket mounts are needed. Direct LAN publishing instead needs
+#  an explicit mapping such as "0.0.0.0:3900:3900". Export a long random
 #  OMNIVOICE_API_KEY before starting a Studio profile; use HTTPS or an
 #  encrypted private overlay whenever traffic leaves a fully trusted LAN.
 # ──────────────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ services:
     #   context: ..
     #   dockerfile: deploy/Dockerfile
     #   args:
-    #     BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
+    #     BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
     #     GPU_FLAVOR: rocm
     container_name: omnivoice-studio-rocm
     profiles: ["rocm"]

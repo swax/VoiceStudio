@@ -11,6 +11,7 @@
 // in afterPack on Windows (the .exe is signed while it is copied), and before
 // the bundle seal on macOS (signMac).
 import { execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -49,18 +50,39 @@ export function omnivoiceTtsBinaryName(slug) {
   return `omnivoice-tts-${slug}${slug.startsWith('windows') ? '.exe' : ''}`;
 }
 
+/** The resident server (#3654) the backend looks for beside the CLI. */
+export function omnivoiceTtsServerName(slug) {
+  return `tts-server-${slug}${slug.startsWith('windows') ? '.exe' : ''}`;
+}
+
 function stagedFiles(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter((name) => statSync(join(dir, name)).isFile());
 }
 
-/** extraResources entry for a staged runtime; empty when nothing was staged. */
+/**
+ * extraResources entry for a staged runtime; empty when nothing was staged.
+ * A staged runtime must carry the resident server too: a build whose pin
+ * predates it would otherwise ship a runtime on which resident mode can never
+ * engage, so packaging fails instead.
+ */
 export function omnivoiceTtsResources(dir = OMNIVOICE_TTS_STAGING_DIR) {
   const files = stagedFiles(dir);
-  return files.some((name) => name.startsWith('omnivoice-tts-')) &&
-    files.includes(OMNIVOICE_TTS_MANIFEST)
-    ? [{ from: dir, to: OMNIVOICE_TTS_RESOURCE_DIR, filter: ['**/*'] }]
-    : [];
+  // Zero-byte placeholders (the files tracked in bin/ for other platforms,
+  // which the Mac App Store workflow copies along with the built runtime) are
+  // not runtimes and need no server.
+  const cli = files.filter(
+    (name) => name.startsWith('omnivoice-tts-') && statSync(join(dir, name)).size > 0,
+  );
+  if (!cli.length || !files.includes(OMNIVOICE_TTS_MANIFEST)) return [];
+  const manifest = readManifest(join(dir, OMNIVOICE_TTS_MANIFEST));
+  for (const name of cli) {
+    const server = name.replace(/^omnivoice-tts-/, 'tts-server-');
+    if (!files.includes(server) || !manifest.has(server)) {
+      throw new Error(`Staged GGUF runtime is missing the resident server ${server} (or its ${OMNIVOICE_TTS_MANIFEST} entry)`);
+    }
+  }
+  return [{ from: dir, to: OMNIVOICE_TTS_RESOURCE_DIR, filter: ['**/*'] }];
 }
 
 export function sha256File(path) {
@@ -143,6 +165,55 @@ export function isMachO(path) {
   }
 }
 
+const TIMESTAMP_RETRY_PATTERNS = [
+  /a timestamp was expected but was not found/i,
+  /the timestamp service is not available/i,
+  /timestamp[^\n]*(timed out|timeout|network|connection|unreachable|could not connect|offline|internet)/i,
+  /(timed out|network|connection|unreachable|offline|internet)[^\n]*timestamp/i,
+];
+
+/** True when codesign failed only because Apple's timestamp service was unreachable. */
+export function isTimestampServiceError(text) {
+  return TIMESTAMP_RETRY_PATTERNS.some((pattern) => pattern.test(String(text ?? '')));
+}
+
+function redactHome(text) {
+  const home = homedir();
+  return home && home.length > 1 ? String(text).split(home).join('~') : String(text);
+}
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Run `codesign`, retrying only transient timestamp-service failures with
+ * growing backoff. Any other failure throws immediately.
+ */
+export async function runCodesign(args, {
+  run = execFileSync,
+  sleep = defaultSleep,
+  delaysMs = [5000, 15000, 30000],
+  log = console.warn,
+} = {}) {
+  const attempts = delaysMs.length + 1;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      run('codesign', args, { stdio: ['inherit', 'inherit', 'pipe'] });
+      return;
+    } catch (error) {
+      const stderr = redactHome(error?.stderr ?? '');
+      if (stderr) process.stderr.write(stderr.endsWith('\n') ? stderr : `${stderr}\n`);
+      const reason = stderr || String(error?.message ?? error);
+      if (!isTimestampServiceError(reason)) throw error;
+      if (attempt >= attempts) {
+        throw new Error(`codesign timestamp service failed after ${attempts} attempts: ${redactHome(reason).trim()}`, { cause: error });
+      }
+      const delay = delaysMs[attempt - 1];
+      log(`codesign timestamp service error (attempt ${attempt}/${attempts}), retrying in ${delay / 1000}s: ${redactHome(reason).trim().split('\n')[0]}`);
+      await sleep(delay);
+    }
+  }
+}
+
 /** The codesign arguments @electron/osx-sign uses for one file. */
 export function codesignArgs(opts, file) {
   const options = (opts.optionsForFile && opts.optionsForFile(file)) || {};
@@ -170,12 +241,21 @@ export function codesignArgs(opts, file) {
  * manifest the bundle seal now covers).
  */
 export async function signMac(opts, packager) {
+  const cliDir = join(opts.app, 'Contents', 'Resources', 'cli');
+  const cliFiles = (dir) => !existsSync(dir) ? [] : readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    return entry.isDirectory() ? cliFiles(path) : entry.isFile() && isMachO(path) ? [path] : [];
+  });
+  // PyInstaller's interpreter and extension modules need the app's signing identity too.
+  if (opts.identity) {
+    for (const file of cliFiles(cliDir)) await runCodesign(codesignArgs(opts, file), opts.codesignRetry);
+  }
   const binDir = join(opts.app, 'Contents', 'Resources', OMNIVOICE_TTS_RESOURCE_DIR);
   let ignore = opts.ignore;
   if (opts.identity && existsSync(join(binDir, OMNIVOICE_TTS_MANIFEST))) {
     for (const name of stagedFiles(binDir)) {
       const file = join(binDir, name);
-      if (isMachO(file)) execFileSync('codesign', codesignArgs(opts, file), { stdio: 'inherit' });
+      if (isMachO(file)) await runCodesign(codesignArgs(opts, file), opts.codesignRetry);
     }
     rewriteManifest(binDir);
     const previous = [opts.ignore ?? []].flat();

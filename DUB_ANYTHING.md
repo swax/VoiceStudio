@@ -1,38 +1,17 @@
 # VoiceStudio for Dub Anything
 
-This fork integrates upstream commit
-`2e195d72d3794a88b7cb37f87a3e92a20193574e`. Its original baseline was
-`c52618afa75f5a838228fe4eeac6301e790bafcf`, with backend changes shipped as
-`voicestudio-local-fixes.patch`; those moved here on 2026-11-07.
+Fork-specific behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
 
-- Respect the source-language hint during dubbing transcription.
-- Add per-segment voice and emotion references and IndexTTS seeds, including
-  these optional inputs in take fingerprints while preserving old defaults.
-- Add echo and public-address effects with reverb tails.
-- Let a client skip the built-in separation (`separate=false` on upload),
-  attach the stems it separated itself (`POST /dub/stems/{job_id}`), and fork a
-  job over the same hard-linked media for another voice (`POST /dub/fork/{job_id}`).
-- Adapt the backend and IndexTTS sidecar to the legacy `2.9.1+rocm7.13.x` Torch
-  build on Windows; leave other runtimes' upstream dispatch policy intact.
-- Preserve LF bytes for hash-pinned bundled model text assets on Windows.
-- Dispatch new dub segments' provenance marking through the existing watermark
-  worker, preserving the marked output while keeping health checks responsive.
-
-The IndexTTS adapter declares its per-request seed capability so both ordinary
-generation and dubbing forward seeds to its isolated worker. The English fork
-notice is also included before every upstream README translation; the upstream
-translation bodies and their link/command parity checks remain intact.
-
-CPU float32 and IndexTTS speed are now provided by upstream. The old early-cache
-marker was retired in favor of upstream's atomic publication rules. Reusing
-failed renders' takes remains a separate follow-up that must keep unaccepted
-audio out of published previews.
-
-Dub Anything pins a tested commit of this repository as `vendor/VoiceStudio`.
-Keep upstream updates deliberate: merge them here, verify the dubbing flow,
-then update Dub Anything's submodule pointer. Setup uses the recorded commit,
-without following the latest branch head.
-
-The upstream license and notices remain in `LICENSE` and `LICENSE-NOTICE.md`.
-Model weights retain their own licenses. Media, voice references, generated
-audio, model downloads and local environments are not part of this fork.
+- **Per-line direction:** accept voice references and transcripts, emotion references
+  and strengths, and seed overrides for individual dub segments. Include these
+  controls in incremental fingerprints and private crash-recovery identities.
+- **Audio effects:** add echo and public-address presets with reverb tails.
+- **Shared media:** let uploads skip built-in separation, attach client-separated
+  stems, and fork jobs over hard-linked media for another voice. Stem attachment
+  and job forking require administrator access.
+- **Responsive watermarking:** mark fresh dub segments on the existing watermark
+  worker; recovered segments keep their existing mark.
+- **Legacy Windows AMD support:** retain compatibility adjustments for the
+  `2.9.1+rocm7.13.x` Torch build in the backend and IndexTTS sidecar.
+- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets
+  and generated mobile contracts.

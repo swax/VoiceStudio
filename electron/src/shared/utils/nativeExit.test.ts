@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import {
   describeExitCode,
+  isExternalKillExit,
   isNativeFaultExit,
   normalizeExitCode,
   normalizeSignal,
@@ -14,6 +15,13 @@ const NT_TABLE = [
   ['STATUS_PRIVILEGED_INSTRUCTION', 3221225622, -1073741674],
   ['STATUS_STACK_BUFFER_OVERRUN', 3221226505, -1073740791],
   ['STATUS_STACK_OVERFLOW', 3221225725, -1073741571],
+  // #3872 and #3835 reported these as bare numbers.
+  ['STATUS_IN_PAGE_ERROR', 3221225478, -1073741818],
+  ['STATUS_HEAP_CORRUPTION', 3221226356, -1073740940],
+  ['STATUS_NO_MEMORY', 3221225495, -1073741801],
+  ['STATUS_INTEGER_DIVIDE_BY_ZERO', 3221225620, -1073741676],
+  ['STATUS_ASSERTION_FAILURE', 3221226528, -1073740768],
+  ['STATUS_FAIL_FAST_EXCEPTION', 3221227010, -1073740286],
 ] as const;
 
 describe.each(NT_TABLE)('%s', (name, unsigned, signed) => {
@@ -45,6 +53,33 @@ describe.each([
     expect(ntStatusName(code)).toBeNull();
     expect(isNativeFaultExit({ exitCode: code })).toBe(false);
     expect(describeExitCode(code)).toBe(String(code));
+  });
+});
+
+describe('external termination (0xFFFFFFFF / -1)', () => {
+  test('both encodings collapse to one unsigned value and classify together', () => {
+    expect(normalizeExitCode(-1)).toBe(4294967295);
+    expect(normalizeExitCode(4294967295)).toBe(4294967295);
+    expect(isExternalKillExit(-1)).toBe(true);
+    expect(isExternalKillExit(4294967295)).toBe(true);
+    expect(isExternalKillExit(0)).toBe(false);
+    expect(isExternalKillExit(null)).toBe(false);
+  });
+  test('is never reported as a native fault', () => {
+    expect(isNativeFaultExit({ exitCode: -1 })).toBe(false);
+    expect(isNativeFaultExit({ exitCode: 4294967295 })).toBe(false);
+    expect(ntStatusName(-1)).toBeNull();
+    expect(ntStatusName(4294967295)).toBeNull();
+  });
+  test('description names the external termination with its hex form', () => {
+    expect(describeExitCode(-1)).toBe('-1 (0xFFFFFFFF EXTERNAL_TERMINATION)');
+    expect(describeExitCode(4294967295)).toBe('4294967295 (0xFFFFFFFF EXTERNAL_TERMINATION)');
+  });
+  test('a Python traceback in the output keeps the exit code unlabelled', () => {
+    const tb = ['Traceback (most recent call last):', '  File "a.py"', 'ValueError: x'];
+    expect(describeExitCode(-1, 'unknown', tb)).toBe('-1');
+    expect(describeExitCode(-1, 'unknown', tb.join('\n'))).toBe('-1');
+    expect(describeExitCode(-1, 'unknown', ['plain output'])).toBe('-1 (0xFFFFFFFF EXTERNAL_TERMINATION)');
   });
 });
 

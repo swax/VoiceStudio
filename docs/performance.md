@@ -39,7 +39,8 @@ Before touching any knob, check these — they account for most slowness reports
      warns explicitly: *"cpu (no GPU acceleration detected)"* with a hint
      about drivers.
    - **Model Catalogue** shows a routing badge per engine — "GPU active",
-     "CPU fallback", or "CPU" — with the *reason* shown as small text under
+     "CPU fallback", "CPU", or "unknown" when a sidecar GPU runtime has not
+     been verified — with the *reason* shown as small text under
      the badge (full text on hover).
    Note: **PyTorch GPU acceleration on Windows is NVIDIA/CUDA-only** — AMD and
    Intel GPUs run PyTorch engines on the CPU there (audio.cpp can still use a
@@ -86,6 +87,7 @@ None of them are required — the defaults are chosen for the common case.
 | Variable | Default | What it does |
 |---|---|---|
 | `OMNIVOICE_DEVICE` | `auto` | Pin the compute device (`cuda` / `rocm` / `xpu` / `mps` / `cpu`) instead of auto-detect. Same control lives in **Settings → Performance & Device** (the env var wins over the UI pick). Honored only for devices the host actually has — a family that isn't detected is noted and ignored, never obeyed blindly. Applies at the next backend start. |
+| `OMNIVOICE_XPU_DTYPE` | `bfloat16` | Precision OmniVoice loads in on Intel XPU: `bfloat16`, `float16` or `float32`. Unknown values are ignored. |
 | `CUDA_VISIBLE_DEVICES` | all NVIDIA GPUs | On a multi-GPU NVIDIA host, expose only the selected physical adapter to VoiceStudio and its engine subprocesses. **Settings → Performance & Device → CUDA** lists adapters by index and name, persists their stable GPU UUID, and applies the choice after restart. An externally supplied environment variable wins over the saved UI choice. |
 | `OMNIVOICE_FLASHINFER` | `0` | CUDA-only accelerated decoding for the default engine via [FlashInfer](https://github.com/flashinfer-ai/flashinfer) kernels (packed CFG attention, fused RMSNorm/RoPE/GEMM) — ~2x on upstream's benchmarks. `1` enables it; `graph` also captures CUDA graphs (best when you render one thing at a time). Requires installing the optional `flashinfer-python` package into the backend environment first (`uv pip install flashinfer-python flashinfer-jit-cache --extra-index-url https://flashinfer.ai/whl/cu128/`, matching your CUDA build). Replaces `torch.compile` for that session, pins inference to a single GPU thread (the FlashInfer attention plan is per-generation state), and keeps fused copies of the attention/MLP weights resident (~roughly half the LLM's weight size extra VRAM) — leave it off on tight-VRAM cards. If the package is missing or a FlashInfer/CUDA-graph kernel fails at runtime, the app logs the reason and falls back to the standard path; failures outside those kernels (e.g. a genuine out-of-memory) surface normally. |
 | `OMNIVOICE_PROMPT_DISK_CACHE` | `1` | Persist encoded voice-clone references (`prompt_cache/` in the app data dir, ~10 KB per voice, 32 newest kept) so the first generation with a known voice after a restart skips the reference re-encode and any auto-transcription. Set `0` to keep the cache in memory only. |
@@ -99,6 +101,7 @@ None of them are required — the defaults are chosen for the common case.
 | `OMNIVOICE_CPU_POOL` | `min(8, cores)` | Thread pool for CPU-side work (translation dispatch, audio I/O). |
 | `OMNIVOICE_SINGLE_ENGINE_RESIDENT` | `1` | Keep only one TTS engine in memory at a time. Set `0` on 32 GB+ machines to keep several engines warm across switches. |
 | `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB` | `6` | On unified memory (Apple Silicon): if free RAM is below this when a dub needs the transcription model, the TTS model is fully released first (it reloads on the next generation). Raise to be more aggressive about freeing, lower on 32 GB+ machines to avoid the reload. |
+| `OMNIVOICE_FREE_VRAM_BEFORE_GENERATE` | `auto` | Free idle GPU memory (the dictation model, cached voice prompts, allocator caches) just before a generation. `auto` does it when free RAM is below `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB`, or when a CUDA/ROCm GPU has less free VRAM than `OMNIVOICE_LOW_MEMORY_HEADROOM_GB` (2 GB, the same figure that logs "Low GPU memory"). On a small card a nearly full VRAM otherwise spills into shared system memory and renders several times slower. `always` frees before every generation; `never` turns it off. |
 | `OMNIVOICE_INDEXTTS_FP16` | `1` | IndexTTS half-precision. Leave on. On ROCm the bfloat16 claim is verified with a tiny test matmul in a child process first: GPUs whose rocBLAS crashes on bf16 load fp32 automatically instead of segfaulting the sidecar. Set `0` to force fp32 outright. |
 | `OMNIVOICE_ASR_VRAM_PREFLIGHT` | `1` | Downgrade transcription precision instead of crashing when VRAM is short (CUDA). Leave on. |
 | `OMNIVOICE_GENERATE_TIMEOUT_S` | `300` | Abandon a generation after this many seconds **of actual compute** on an accelerated (GPU-family) host — the clock starts when a worker picks the job up, never while it waits in line. It's a floor, not a ceiling: the budget grows with the text (+1 s per 40 characters past the first 1200), so long inputs rarely need this raised. A **CUDA or ROCm** GPU with less dedicated VRAM than the engine declares it needs is the exception — it pages to system RAM and renders slower than the same machine's CPU, so it floors at `OMNIVOICE_CPU_GENERATE_TIMEOUT_S` below instead. Apple Silicon (MPS) is not included: its reported VRAM is a heuristic over a *unified* memory pool, not a dedicated one, so there is no comparable floor to measure it against. Setting **this** var explicitly turns that off — an explicit value here is the base on every device, under-provisioned or not, so lowering it to fail fast still works. Also settable from **Settings → Performance & Device → Compute-time budget** (persists to `prefs.json`; takes effect on the next backend restart, same as `OMNIVOICE_DEVICE` above). |
@@ -329,6 +332,10 @@ RAM/VRAM) turns a guessing game into a bisect.
 Measured results per engine/device — and how to contribute yours — live in
 [benchmarks.md](benchmarks.md).
 
+App startup, idle memory, idle CPU and renderer bundle size have their own
+offline harness, `scripts/bench/bench.py`; how to run it and the recorded
+baselines are in [performance-baselines.md](performance-baselines.md).
+
 ## Performance budgets
 
 CI guards the hot paths above against regressions — not with wall-clock
@@ -349,6 +356,11 @@ but with **operation-count budgets** in
 - **NLLB dubbing translation**: rows sharing a target language render in
   bounded batches instead of one model forward per subtitle. Mixed targets
   retain their request order, and a failed batch retries per row.
+
+The renderer bundle has a size budget too: CI's Linux desktop UI job runs
+`node scripts/bench/bundle.mjs --check` on the app it already builds and flags
+(without failing the job) startup or total gzip size more than 10 % over
+`scripts/bench/bundle-baseline.json`.
 
 Updating a budget is a deliberate act: if a change legitimately adds an
 operation to a guarded path, change the expected count in the same PR with a

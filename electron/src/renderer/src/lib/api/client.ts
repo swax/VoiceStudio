@@ -275,6 +275,16 @@ export async function apiFetch(
         );
       }
     }
+    // The share PIN limiter answers 429 "Too many wrong PINs" (with
+    // Retry-After) before it compares the PIN: back to the PIN form with the wait.
+    if (__WEB_DEPLOYMENT__ && error.status === 429 && detail.includes("wrong pin")) {
+      const wait = Number(res.headers.get("Retry-After"));
+      window.dispatchEvent(
+        new CustomEvent("ov:auth-required", {
+          detail: { mode: "pin", retryAfter: Number.isFinite(wait) && wait > 0 ? wait : 0 },
+        }),
+      );
+    }
     throw error;
   }
   // The active engine decides which compute route (and so which generate
@@ -304,6 +314,12 @@ export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
 /** Playable URL for a generated take (`audio_path` from history / X-Audio-Path). */
 export function audioUrl(filename: string): string {
   return `${API_BASE}/audio/${encodeURIComponent(filename)}`;
+}
+
+/** MP3 export of a generated take, or undefined when the path is not a backend render. */
+export function audioMp3Url(filename: string): string | undefined {
+  const id = /^([0-9a-f]{8})\.wav$/.exec(filename)?.[1];
+  return id ? `${API_BASE}/audio/${id}.mp3` : undefined;
 }
 
 /**

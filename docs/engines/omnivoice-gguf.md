@@ -13,7 +13,7 @@ with nothing to configure, and the quant is sized to the GPU it will use.
   PyTorch on Windows cannot use but this engine reaches through Vulkan.
 - CPU-only machines that still want OmniVoice's voice and language coverage.
 - You want generation isolated in a separate process (a crash or leak never
-  takes the app down — each generation spawns the binary fresh).
+  takes the app down — the runtime always runs outside the app).
 
 ## Quantization selection
 
@@ -146,6 +146,9 @@ The desktop installers ship this native binary under `resources/bin/`
 Windows on ARM (the x64 binary, run under emulation like the rest of the local
 backend), macOS Apple Silicon and the Linux AppImage/deb. The Windows binary
 carries its own Visual C++ runtime, so no redistributable install is needed.
+The app passes that folder to the backend as `OMNIVOICE_GGUF_BIN_DIR`, so the
+engine finds it wherever the app environment lives
+([#4051](https://github.com/debpalash/VoiceStudio/issues/4051)).
 The Intel Mac download has no binary because Intel Macs cannot run the local
 backend at all ([macOS install](../install/macos.md)). Store builds (Microsoft
 Store, Mac App Store, Snap Store) and the Docker image do not include it yet;
@@ -153,6 +156,18 @@ use the default in-process OmniVoice engine there, which is the same model.
 
 Select the engine via **Model Catalogue** (TTS tab → **Use**) or
 `OMNIVOICE_TTS_BACKEND=omnivoice-gguf`.
+
+**Self-test.** Settings › Models › OmniVoice GGUF → **Self-test** runs one
+short real synthesis with installed weights (it never downloads them) and,
+when the runtime used Vulkan, names the GPU, for example `Vulkan 1: AMD Radeon
+RX 5500M`; the name comes from that run's own log, so a CPU run shows none.
+**Details** opens the runtime's device log, with folder paths removed. When
+resident mode already has the model loaded, the test runs on it instead of
+loading a second copy, and never stops it; if it still holds a different
+quant than the one selected, run one generation first. A single time limit
+(`OMNIVOICE_SELFTEST_TIMEOUT_S`, default 90 s) covers the whole test,
+including any wait for a previous test to finish, and stops the one-shot
+runtime when it runs out.
 
 **GPU offer.** When Compute device is Auto, PyTorch has no GPU, and the bundled
 runtime with its Vulkan module finds a GPU, VoiceStudio asks once: *Use your
@@ -191,9 +206,18 @@ build falls back to CPU. Expect roughly 2–4x slower generation than macOS
 Metal while upstream Mesa and llama.cpp Vulkan optimizations mature; still
 well ahead of CPU-only.
 
+## Intel Mac Radeon experiments
+
+Intel Mac installers use a remote backend and include no GGUF runtime. The
+local Intel source-build recipe remains CPU-only. For the discrete-Metal
+failures reproduced in a native source build, the experimental workaround,
+and the remaining application integration work, see
+[Intel Mac Radeon findings](intel-mac-radeon.md). This does not enable Metal
+inside Docker Desktop or change supported hardware defaults.
+
 ## Vulkan acceleration
 
-The Windows x64 and Linux x64 installers ship the runtime with GGML's Vulkan
+The Windows x64 and Linux x64 installer builds require the runtime with GGML's Vulkan
 module (`ggml-vulkan`), built in CI with the Vulkan SDK. Any GPU with a working
 Vulkan driver is used: AMD Radeon and Ryzen AI, Intel Arc and Core Ultra, and
 NVIDIA.
@@ -202,14 +226,23 @@ To size the quant and report the device, VoiceStudio finds the adapter GGML
 will open without PyTorch:
 
 1. `vulkaninfo` (installed with the GPU driver on Windows, `vulkan-tools` on
-   Linux) gives each GPU's type and its device-local memory heap as a 64-bit
-   byte count.
+   Linux) verifies the working driver and gives the GPUs in Vulkan order. The
+   full report runs first and gives each GPU's type and device-local memory
+   heap as a 64-bit byte count. If it fails or takes longer than 10 seconds,
+   `vulkaninfo --summary` runs instead (3 seconds); it has no memory heaps, so
+   the OS GPU list fills in each GPU's memory for quant sizing (see below).
 2. Without it, the OS GPU list is used when the Vulkan loader is installed:
    the 64-bit `HardwareInformation.qwMemorySize` registry value on Windows, or
    DRM sysfs on Linux. WMI's `AdapterRAM` is never used; it is 32-bit and
    reports an 8 GB card as 4 GB or less. This list only sizes the quant: it
    does not prove the driver can open the GPU, so without `vulkaninfo` the
    engine keeps the CPU time budget and the GPU offer is not shown.
+
+A hidden Windows full report can stall while checking display surfaces. VoiceStudio
+retries with the surface-free `vulkaninfo --summary` after a bounded timeout.
+A successful native summary proves driver access; only an exact, unique vendor/name
+match in the OS inventory supplies missing VRAM. Unknown BF16 support stays unknown,
+so the automatic choice stays at Q8_0 or below. A failed command is never GPU proof.
 
 GGML numbers every discrete and integrated GPU in Vulkan order and opens the
 first discrete one, else the first integrated one. With an Intel UHD iGPU at
@@ -248,6 +281,21 @@ explicit CPU choice also selects the CPU quant (Q4_K_M) and requires that
 pair to be installed — a larger cached quant is not substituted for it. An
 explicit quant override remains authoritative in either case.
 
+### GPU crash fallback
+
+Some GPU and driver pairs load ggml's Vulkan backend and then crash the
+runtime natively (for example an access violation, exit `3221225477` /
+`0xC0000005`, on a GeForce GTX 1080, a Pascal card without fp16 shaders).
+When a run that could use a GPU (an explicit GPU pin, Metal on Apple Silicon, or
+Vulkan where the runtime ships that module) exits with such a crash code,
+VoiceStudio retries that request on the CPU (`GGML_BACKEND=CPU`) within the time
+left of the original timeout, keeps every later request of the session on the
+CPU (Compute device and the generate timeout then report the CPU), and logs the
+reason once. The CPU quant is not
+re-selected; the loaded pair is reused. Ordinary errors, timeouts and crashes
+of an explicit CPU run are reported unchanged. To skip the GPU attempt on every
+start, set `OMNIVOICE_GGUF_BACKEND=cpu`.
+
 ## Checking Vulkan on your machine
 
 1. **Driver.** Run `vulkaninfo --summary` (installed with the GPU driver on
@@ -277,10 +325,15 @@ Expected automatic picks:
 | GPU | Device | Effective memory | Quant |
 | --- | --- | --- | --- |
 | Radeon 890M APU, 32 GB RAM | Vulkan0, shared memory | ~15–16 GB (half the RAM) | Q8_0 (BF16 if `bf16: 1`) |
+| Radeon RX 5500M 4 GB | Vulkan1 when an iGPU is Vulkan0; otherwise Vulkan0 | ~4 GB | Q8_0 |
 | Radeon RX 6700 XT 12 GB (`bf16: 0`) | Vulkan0 | ~12 GB | Q8_0 |
 | RX 7600 / Arc A750 8 GB | Vulkan0 (or the discrete card's index) | ~8 GB | Q8_0 |
 | Intel UHD iGPU + Arc A770 / B580 | Vulkan1 (the Arc card) | 16 / 12 GB | Q8_0 (BF16 if `bf16: 1`) |
 | Compute device set to CPU | — | — | Q4_K_M |
+
+On a hybrid laptop where the integrated GPU is Vulkan0 and the RX 5500M is
+Vulkan1, automatic selection prefers the discrete GPU. To pin it explicitly,
+set `OMNIVOICE_GGUF_BACKEND=vulkan` and `OMNIVOICE_GGUF_DEVICE=1`.
 
 If yours differs, report the `vulkaninfo --summary` device list, the
 `/engines/omnivoice-gguf/quants` response, and your OS, GPU driver version and
@@ -300,19 +353,75 @@ Before reporting ready, the engine:
   out-of-memory — [#437](https://github.com/debpalash/VoiceStudio/issues/437)).
   The chmod runs only after the SHA check confirms it's the right file.
 
+## Resident server
+
+Each generation normally spawns `omnivoice-tts`, which reloads the model
+every time (a few seconds per request, whatever the text length). The
+desktop installers bundle omnivoice.cpp's `tts-server` as
+`bin/tts-server-<platform>` (next to `omnivoice-tts-<platform>`, same
+integrity rules), and you can opt in to keeping one server per loaded quant
+running instead, so later requests skip the reload
+([#3654](https://github.com/debpalash/VoiceStudio/issues/3654)). It is off
+by default.
+
+- Started on the first request; listens on `127.0.0.1` on a random port.
+- A cloned voice is sent to it once per reference clip and transcript.
+- Stopped, and its memory freed, when the engine is idle-released or
+  unloaded, when the quant changes, and when the setting is turned off.
+- A crash gets one restart. A server that cannot start, crashes again, or
+  refuses a request hands that request to the per-request binary; the log
+  says why.
+- Requests that set duration, chunk duration or threshold, no-denoise,
+  no-preprocess-prompt, or a reference clip without a transcript always use
+  the per-request binary, because the server does not take those controls.
+- The server needs omnivoice.cpp `040c8b344d8c` or newer (voice registry).
+  An older server is detected at start-up and not used.
+- Upstream `tts-server` has no API key and answers any origin
+  (`Access-Control-Allow-Origin: *`): while it runs, other programs on this
+  computer, and web pages that find the port, can reach it, including your
+  registered cloned voices. This is why it is opt-in.
+
+Turn it on in **Settings → Performance → Keep the GGUF engine loaded
+between requests** (shown only when the server is bundled), or with
+`OMNIVOICE_GGUF_RESIDENT=1`; `0` keeps it off and overrides Settings.
+Without a usable server binary (a source build that lacks it, a failed
+integrity check), nothing changes: requests use the per-request binary and the
+log says why once.
+
+### Before making this the default
+
+- Upstream `tts-server` support for `--api-key` (or an equivalent
+  per-launch secret), sent by the engine on every request, so other
+  programs cannot use the server.
+- A reference-audio trim parity check: confirm a voice registered with
+  the server gets the same silence trim and transcript handling as the
+  CLI's `--ref-wav` / `--ref-text` path, and compare the output.
+
 ## Behaviour notes
 
 - Output is 24 kHz mono — same model, same rate as in-process OmniVoice.
-- Cloning from a reference clip (with optional transcript) and style
-  instructions are supported; no voice design.
+- Cloning from a reference clip (with optional transcript), style
+  instructions, voice design (describe a voice with no reference clip) and
+  the non-verbal tags (`[laughter]`, `[sigh]`, ...) work as on the PyTorch
+  engine.
+- Decode steps (the "refine voice" slider) are supported and default to 32.
+  With resident mode on, the pinned `tts-server` always decodes 32 (the app
+  sends the step count anyway and logs once); turn resident mode off to apply
+  other step counts. Guidance scale is not supported.
+- The runtime reads WAV containers only, and inside a WAV it decodes
+  PCM16, PCM24 and float32, so a reference clip saved in another format
+  (MP3, FLAC, Ogg, ...) — or in a WAV sample format it cannot decode — is
+  converted to a temporary WAV before the binary is spawned.
 - Same multilingual surface as OmniVoice ([languages.md](../languages.md)).
 - Because generation runs in another process, the app's own GPU counters
   don't see its allocations — diagnostics label it accordingly.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `OMNIVOICE_GGUF_BIN_DIR` | `bin/` at the repo root | Absolute folder holding `omnivoice-tts-<platform>` and `checksums.sha256`; the desktop app sets it to its `resources/bin/` |
 | `OMNIVOICE_GGUF_GENERATE_TIMEOUT_S` | (generous built-in) | Per-generation timeout for the spawned binary |
 | `OMNIVOICE_GGUF_QUANT` | `auto` | Pin a quant (`Q4_K_M`, `Q8_0`, `BF16`, `F32`); overrides Settings |
+| `OMNIVOICE_GGUF_RESIDENT` | `0` | `1` keeps a bundled `tts-server` loaded between requests (opt-in, see Resident server); overrides Settings |
 
 ## Troubleshooting
 

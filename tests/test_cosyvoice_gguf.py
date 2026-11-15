@@ -2,16 +2,59 @@
 
 from __future__ import annotations
 
+import importlib
 import io
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
-from engines.cosyvoice_gguf import bootstrap
-from engines.cosyvoice_gguf.bootstrap import choose_backend, parse_backends
 from engines.cosyvoice_gguf.prompt_cache import prompt_cache_key
 from engines.cosyvoice_gguf.server import build_speech_payload, decode_speech_response
+
+
+class _LiveModule:
+    """Resolve the module at use time so sys.modules pollution cannot leave stale refs."""
+
+    def __init__(self, name):
+        object.__setattr__(self, "_name", name)
+
+    def _mod(self):
+        return importlib.import_module(object.__getattribute__(self, "_name"))
+
+    def __getattr__(self, attr):
+        return getattr(self._mod(), attr)
+
+    def __setattr__(self, attr, value):
+        setattr(self._mod(), attr, value)
+
+    def __delattr__(self, attr):
+        delattr(self._mod(), attr)
+
+
+bootstrap = _LiveModule("engines.cosyvoice_gguf.bootstrap")
+
+
+def parse_backends(*args, **kwargs):
+    return bootstrap.parse_backends(*args, **kwargs)
+
+
+def choose_backend(*args, **kwargs):
+    return bootstrap.choose_backend(*args, **kwargs)
+
+
+def test_bootstrap_proxy_follows_a_replaced_module(monkeypatch):
+    """Regression: a module captured at import goes stale once another test
+    replaces sys.modules["engines.cosyvoice_gguf.bootstrap"]; the proxy must not."""
+    import sys
+    import types
+
+    replacement = types.ModuleType("engines.cosyvoice_gguf.bootstrap")
+    replacement.parse_backends = lambda *a, **k: "replacement"
+    monkeypatch.setitem(sys.modules, "engines.cosyvoice_gguf.bootstrap", replacement)
+    assert parse_backends("") == "replacement"
+    bootstrap.marker = 1
+    assert replacement.marker == 1
 
 
 def test_parse_and_choose_vulkan_backend():
@@ -24,6 +67,44 @@ def test_parse_and_choose_vulkan_backend():
     assert chosen.name == "Vulkan0"
     assert chosen.target == "vulkan"
     assert chosen.device_name == "AMD Radeon RX 6700 XT"
+
+
+# #3980: the exact ``cosyvoice-cli.exe --list-backends`` output from a GTX 1080 Ti.
+# GPU rows carry a PCI bus id in the middle column; CPU rows carry ``-``.
+REPORTED_LOG = (
+    "ggml_vulkan: Found 1 Vulkan devices:\n"
+    "ggml_vulkan: 0 = NVIDIA GeForce GTX 1080 Ti (NVIDIA)\n"
+)
+REPORTED_TABLE = (
+    "Available GGML backends:\n"
+    "  Vulkan0    0000:01:00.0         NVIDIA GeForce GTX 1080 Ti\n"
+    "  CPU        -                    Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz\n"
+)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        REPORTED_LOG + REPORTED_TABLE,
+        (REPORTED_LOG + REPORTED_TABLE).replace("\n", "\r\n"),  # Windows console
+        REPORTED_TABLE + "\n" + REPORTED_LOG,  # stdout first, ggml log on stderr
+        "\ufeff" + REPORTED_TABLE.replace("    ", "\t"),
+    ],
+)
+def test_reported_list_backends_output_selects_vulkan(output):
+    rows = parse_backends(output)
+    assert [(row.name, row.target, row.device_name) for row in rows] == [
+        ("Vulkan0", "vulkan", "NVIDIA GeForce GTX 1080 Ti"),
+        ("CPU", "cpu", "Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz"),
+    ]
+    chosen = choose_backend(rows, "auto")
+    assert (chosen.name, chosen.fallback_reason) == ("Vulkan0", None)
+
+
+def test_log_and_header_lines_never_parse_as_devices():
+    assert parse_backends(
+        REPORTED_LOG + "Available GGML backends:\nDevice count: 2\nusage: cosyvoice-cli [options]\n"
+    ) == []
 
 
 def test_backend_selection_falls_back_only_in_auto_mode():
@@ -261,23 +342,18 @@ def test_invalid_explicit_overrides_error_instead_of_using_the_cache(tmp_path, m
         bootstrap.frontend_dir()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        __import__("subprocess").TimeoutExpired(["cli"], 30),
-        __import__("subprocess").CalledProcessError(3, ["cli"]),
-    ],
-)
-def test_failed_backend_probe_reports_unavailable(tmp_path, monkeypatch, error):
+def test_failed_backend_probe_falls_back_to_cpu_with_its_reason(tmp_path, monkeypatch):
     import engines.cosyvoice_gguf as engine_module
 
     def run(*_args, **_kwargs):
-        raise error
+        raise __import__("subprocess").TimeoutExpired(["cli"], 30)
 
+    monkeypatch.delenv(bootstrap.BACKEND_ENV, raising=False)
+    bootstrap._PROBE_CACHE.clear()
     monkeypatch.setattr(bootstrap, "resolve_cli", lambda: tmp_path / "cli")
     monkeypatch.setattr(bootstrap.subprocess, "run", run)
     profile = engine_module.CosyVoiceGGUFBackend.runtime_compute_profile(None)
-    assert profile["routing_status"] == "unavailable"
+    assert profile["routing_status"] == "cpu_fallback"
     assert "probe" in profile["routing_reason"]
 
 

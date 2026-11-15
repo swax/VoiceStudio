@@ -8,6 +8,9 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { packageNativeHelper } from './native-helper-build.mjs';
+import { packageCli } from './cli-bundle.mjs';
+import { debMaintainerScripts } from './packaging/deb-scripts.mjs';
+import { assertBundleSymlinks } from './packaging/bundle-symlinks.mjs';
 import { finalizeOmnivoiceTts, omnivoiceTtsResources, signMac } from './omnivoice-tts-bundle.mjs';
 import { repairSnapArtifacts } from './snap-template-payload.mjs';
 import { signMasRuntime } from './mas-runtime-bundle.mjs';
@@ -90,10 +93,14 @@ export function distributionPackaging(target = DISTRIBUTION_TARGET) {
   }
   return {
     linuxTargets: ['AppImage', 'deb'],
+    linuxExecutableName: 'voicestudio',
     publish: {
       provider: 'generic',
       url: updateUrl,
       channel: updateChannel,
+      // GitHub release downloads reject multi-range requests (HTTP 501), which
+      // turns every patch download into a full one; see updater.ts.
+      useMultipleRangeRequest: false,
     },
   };
 }
@@ -199,6 +206,7 @@ export default {
     { from: '../LICENSE', to: 'LICENSE' },
     { from: '../LICENSE-NOTICE.md', to: 'LICENSE-NOTICE.md' },
     { from: '../config/app.json', to: 'config/app.json' },
+    { from: '../config/analytics.json', to: 'config/analytics.json' },
     { from: 'T3CODE-LICENSE.txt', to: 'electron/T3CODE-LICENSE.txt' },
     ...(!isMacAppStore ? bundledUvResources : []),
     ...bundledOmnivoiceTtsResources,
@@ -211,8 +219,11 @@ export default {
   ],
   asar: true,
   afterPack: async (context) => {
+    await packageCli(context);
     await packageNativeHelper(context);
     finalizeOmnivoiceTts(context);
+    // Before signing: a broken or escaping link fails here with its name.
+    assertBundleSymlinks(context.appOutDir);
   },
   ...(DISTRIBUTION_TARGET === 'snap-store'
     ? { afterAllArtifactBuild: ({ artifactPaths }) => repairSnapArtifacts(artifactPaths) }
@@ -226,6 +237,7 @@ export default {
     target: ['nsis'],
   },
   nsis: {
+    include: 'packaging/cli-installer.nsh',
     oneClick: false,
     allowToChangeInstallationDirectory: true,
     perMachine: false,
@@ -240,11 +252,7 @@ export default {
     ...(adhocSignMac ? { identity: '-' } : {}),
     // Signs the bundled GGUF runtime and refreshes its checksum manifest
     // before the bundle seal (electron/omnivoice-tts-bundle.mjs).
-    ...(isMacAppStore
-      ? { sign: signMasRuntime }
-      : bundledOmnivoiceTtsResources.length
-        ? { sign: signMac }
-        : {}),
+    ...(isMacAppStore ? { sign: signMasRuntime } : { sign: signMac }),
     notarize: notarizeMac,
     extendInfo: {
       NSMicrophoneUsageDescription: readFileSync(resolve(here, 'build/Info.plist'), 'utf8')
@@ -254,6 +262,24 @@ export default {
     // The CLI matrix selects one architecture per runner and updater feed.
     target: isMacAppStore ? ['mas'] : ['dmg', 'zip'],
     category: 'public.app-category.productivity',
+  },
+  // The DMG install window (both architectures; the MAS target has no DMG).
+  // The background is build/dmg/background.svg rendered by
+  // `bun run dmg:background`. electron-builder sizes the window from the 1x
+  // image (a background makes it ignore dmg.window); `window` repeats that
+  // size and the icons sit on the drawn slots (tests/dmg-window.test.mjs).
+  // The title drops the arch suffix electron-builder adds by default; the
+  // file name still comes from artifactName.
+  dmg: {
+    title: '${productName} ${version}',
+    background: 'build/dmg-background.png',
+    window: { width: 660, height: 440 },
+    iconSize: 112,
+    iconTextSize: 12,
+    contents: [
+      { x: 170, y: 160, type: 'file' },
+      { x: 490, y: 160, type: 'link', path: '/Applications' },
+    ],
   },
   mas: {
     entitlements: 'build/entitlements.mas.plist',
@@ -270,6 +296,16 @@ export default {
     target: packaging.linuxTargets,
     ...(packaging.linuxExecutableName ? { executableName: packaging.linuxExecutableName } : {}),
     category: 'Audio',
+  },
+  deb: {
+    appArmorProfile: 'packaging/cli-apparmor-profile.tpl',
+    // Generated on first read, so importing this config stays side-effect free.
+    get afterInstall() {
+      return debMaintainerScripts().afterInstall;
+    },
+    get afterRemove() {
+      return debMaintainerScripts().afterRemove;
+    },
   },
   ...(packaging.snapcraft ? { snapcraft: packaging.snapcraft } : {}),
   publish: packaging.publish,

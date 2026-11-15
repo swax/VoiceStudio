@@ -10,7 +10,8 @@ import time
 import threading
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from api.dependencies import consumer_generation, require_consumer_reads_admin_writes
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from core.config import OUTPUTS_DIR, VOICES_DIR, DUB_DIR
@@ -20,13 +21,17 @@ from core.path_security import resolve_within, UnsafePath
 from core.safe_archive import ArchiveError
 from services import project_bundle as bundles
 
-router = APIRouter(prefix='/project-bundles', tags=['Project handoff'])
+router = APIRouter(prefix='/project-bundles', tags=['Project handoff'], dependencies=[Depends(require_consumer_reads_admin_writes)])
 logger = logging.getLogger(__name__)
 EXPORT_RETENTION_SECONDS = 24 * 60 * 60
 MAX_RETAINED_EXPORTS = 20
 MAX_RETAINED_EXPORT_BYTES = 2 * bundles.MAX_TOTAL
 _transfer_lock = threading.RLock()
 _active_transfers: dict[Path, int] = {}
+
+from core import activity as _activity  # noqa: E402
+
+_activity.register_probe("project-transfers", lambda: any(count > 0 for count in list(_active_transfers.values())))
 
 
 class _BundleResponse(FileResponse):
@@ -292,6 +297,7 @@ class BundleExport(BaseModel):
 
 
 @router.post('/export')
+@consumer_generation
 def export_project_bundle(body: BundleExport):
     identifier = str(uuid.uuid4()); directory = _directory(identifier); directory.mkdir()
     files = {}
@@ -471,7 +477,12 @@ def _import(directory: Path,source: Path,allow_voices: bool):
                         from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
                         import subprocess
                         audio = str(job_directory/'original.wav')
-                        subprocess.run([find_ffmpeg(),'-nostdin','-v','error',*local_inputs_only(),'-i',source_asset,'-vn','-ac','1','-ar','24000',audio],check=True,timeout=300)
+                        # The source asset comes straight out of an untrusted
+                        # archive: a file named .mp4 can be a playlist, and the
+                        # whitelist is what stops ffmpeg fetching the URLs in
+                        # it. Pass the argv through the guard before running.
+                        cmd = local_inputs_only([find_ffmpeg(),'-nostdin','-v','error','-i',source_asset,'-vn','-ac','1','-ar','24000',audio],tool='ffmpeg')
+                        subprocess.run(cmd,check=True,timeout=300)
                 target = (doc.get('targets') or [{'code':'en','name':'English'}])[0]
                 state['handoff'] = {'document':{k:v for k,v in doc.items() if k != 'desktop'},'assets':[{**asset,'source':str(files[asset['path']])} for asset in manifest['assets']]}
                 if doc.get('native'):

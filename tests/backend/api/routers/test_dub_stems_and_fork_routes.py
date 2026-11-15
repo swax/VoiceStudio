@@ -1,4 +1,5 @@
 """POST /dub/stems/{job_id} and POST /dub/fork/{job_id}, and the upload's separate flag."""
+
 from __future__ import annotations
 
 import os
@@ -34,9 +35,19 @@ def job():
     audio = os.path.join(folder, "audio.wav")
     sf.write(audio, np.zeros(16000 * 2, dtype="float32"), 16000)
     sf.write(os.path.join(folder, "vocals.wav"), np.zeros(44100 * 2, dtype="float32"), 44100)
-    dub_pipeline.put_job(jid, {"audio_path": audio, "vocals_path": audio, "no_vocals_path": None,
-                               "duration": 2.0, "filename": "part.mp4", "segments": None,
-                               "dubbed_tracks": {}, "scene_cuts": []})
+    dub_pipeline.put_job(
+        jid,
+        {
+            "audio_path": audio,
+            "vocals_path": audio,
+            "no_vocals_path": None,
+            "duration": 2.0,
+            "filename": "part.mp4",
+            "segments": None,
+            "dubbed_tracks": {},
+            "scene_cuts": [],
+        },
+    )
     yield jid
     for j in (jid, jid + "-us"):
         dub_pipeline._dub_jobs.pop(j, None)
@@ -67,6 +78,16 @@ def test_fork_ids_are_validated(client, job):
     assert client.post("/dub/fork/nojob123", json={"job_id": "nojob123-us"}).status_code == 404
 
 
+@pytest.mark.parametrize("route,payload", [("stems", {"vocals": "vocals.wav"}), ("fork", {"job_id": "new-job"})])
+def test_stems_and_fork_require_an_administrator_for_remote_callers(job, route, payload):
+    from fastapi.testclient import TestClient
+    from main import app
+
+    with TestClient(app, client=("198.51.100.23", 50000)) as remote:
+        response = remote.post(f"/dub/{route}/{job}", json=payload)
+    assert response.status_code in {401, 403}
+
+
 def test_the_upload_passes_separate_to_the_ingest(monkeypatch, client):
     from api.routers import dub_core
 
@@ -76,10 +97,14 @@ def test_the_upload_passes_separate_to_the_ingest(monkeypatch, client):
         seen.update(source)
 
     monkeypatch.setattr(dub_core.task_manager, "add_task", add_task)
-    res = client.post("/dub/upload", files={"video": ("part.wav", b"RIFF0000WAVE", "audio/wav")},
-                      data={"input_type": "audio", "separate": "false"})
+    res = client.post(
+        "/dub/upload",
+        files={"video": ("part.wav", b"RIFF0000WAVE", "audio/wav")},
+        data={"input_type": "audio", "separate": "false"},
+    )
     assert res.status_code == 202, res.text
     assert seen["separate"] is False
     import shutil
     from services import dub_pipeline
+
     shutil.rmtree(dub_pipeline.safe_job_dir(res.json()["job_id"]), ignore_errors=True)

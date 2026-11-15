@@ -30,7 +30,8 @@ vi.mock('node:net', () => ({
     return server;
   },
 }));
-vi.mock('./runtime-project', () => ({
+vi.mock('./runtime-project', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./runtime-project')>()),
   runtimeReady: async () => true,
   runtimeCompatible: async () => true,
   runtimeDependenciesReady: async () => true,
@@ -178,7 +179,9 @@ it('never classifies download-period health timeouts on a live managed child as 
     await vi.advanceTimersByTimeAsync(20_000);
     expect(supervisor.status.stage).toBe('unresponsive');
     // v0.5.6's wording must not come back in any stage.
-    expect(supervisor.status.message ?? '').not.toMatch(/temporarily not responding|Waiting for recovery/i);
+    expect(supervisor.status.message ?? '').not.toMatch(
+      /temporarily not responding|Waiting for recovery/i,
+    );
     // No destructive recovery: the child was observed, never killed or respawned.
     expect(supervisor.status.managed).toBe(true);
     expect(child.exitCode).toBeNull();
@@ -219,6 +222,26 @@ it('still reports an attached backend that refuses connections as crashed', asyn
     await vi.advanceTimersByTimeAsync(7_000);
     expect(supervisor.status.stage).toBe('crashed');
     expect(supervisor.status.message).toMatch(/stopped answering/);
+  } finally {
+    await supervisor.shutdown();
+  }
+});
+
+it('probes a steady backend less often, and still reports a crash within seconds (#3924)', async () => {
+  const health: Health = { mode: 'up' };
+  const supervisor = await attachedSupervisor(health);
+  try {
+    await vi.advanceTimersByTimeAsync(120_000); // past the healthy streak
+    const before = calls.filter((url) => url.endsWith('/health')).length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    const steady = calls.filter((url) => url.endsWith('/health')).length - before;
+    // 2 s active cadence would be 30 probes a minute; the calm cadence is about 10.
+    expect(steady).toBeLessThanOrEqual(12);
+    expect(steady).toBeGreaterThanOrEqual(8);
+
+    health.mode = 'down';
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(supervisor.status.stage).toBe('crashed');
   } finally {
     await supervisor.shutdown();
   }
@@ -590,5 +613,7 @@ it('demotes a recovering remote whose credentials are rejected, even after incon
 
 it('asserts the desktop origin in main-owned backend headers', () => {
   const supervisor = new BackendSupervisor();
-  expect(supervisor.requestHeaders()).toMatchObject({ 'X-VoiceStudio-Desktop-Origin': 'app://voicestudio' });
+  expect(supervisor.requestHeaders()).toMatchObject({
+    'X-VoiceStudio-Desktop-Origin': 'app://voicestudio',
+  });
 });

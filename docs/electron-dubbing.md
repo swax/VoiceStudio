@@ -99,7 +99,22 @@ re-transcribing subtitles while it runs, keeps the previous track (the latter as
 generation). Fresh segment speech enters the cache behind segment previews and partial
 regeneration only when its track is published, together with its fingerprint; a new track starts
 without the previous track's QC marks, and a dub that finishes as cancellation arrives reports
-done. Subtitles imported, or a dub published, during transcription replace its result, and
+done. If the app or backend stops mid-dub, the segments that had finished are kept as recovery
+copies inside that job's folder (one set per track language, at most 1 GiB). The next eligible
+generation removes copies older than 7 days; publication or deleting the job removes them too.
+The next generation of the same job reuses a copy
+only when its text, voice reference audio, engine and effective checkpoint (including
+environment overrides, CosyVoice's actual weights directory and local model files), language, steps, guidance, speed, seed, watermark setting, mastering and
+effect preset are all identical, and only after the audio verifies; anything else, or any problem
+reading the copies, renders the segment normally without an error. Recovery copies never count as
+cached speech: previews and partial regeneration still see a segment only after its track is
+published. Recovery currently supports in-process OmniVoice and CosyVoice selected
+through a local weights directory, when their load-time checkpoint and file snapshot
+can be verified. Hub repository names, sidecars and engines without that proof render
+normally; a display name or configured folder alone is insufficient.
+If different weights load after recovery has begun, the render stops before publication;
+retrying renders the new checkpoint without mixing old speech into the track.
+Subtitles imported, or a dub published, during transcription replace its result, and
 imported cues keep their matched voice references: each transcription writes its references to
 its own folder.
 Interrupted preparation/generation offers Resume, which reads the existing task
@@ -189,14 +204,39 @@ Export options expand inside the existing sidebar. Users can select included vid
 tracks and the default track, background mixing, burned subtitles, dual layout and
 karaoke (disabled with dual layout). Audio supports WAV or MP3 with bitrate choice;
 SRT/VTT/ASS sidecars and per-language stem/segment ZIPs use the existing backend.
+**Save plain text** exports the selected transcript as UTF-8 TXT: the complete
+ordered nonempty cue text, with line breaks between cues and no timestamps, cue numbers,
+headers or subtitle markup added. Before any dub exists, it saves the current
+edited transcript; after generation, the selected language uses that track's
+stored text just like SRT. No new transcription or speech generation is needed.
+Desktop uses native Save As, and the web app downloads the same bytes; canceling
+the save leaves the transcript and export choices available for retry.
+Paired iOS and Android exports offer the same TXT format for generated tracks.
+The archived v0.3.8 Tauri SRT405 report is separate; this does not establish a
+legacy fix or a reporter migration retest (#4127).
+The backend compresses ZIP exports into a temporary file and sends the download
+in chunks, so a long project does not require holding its entire archive in memory.
+Each ZIP is built from a snapshot of the files taken when the download starts, so
+a regeneration finishing mid-download cannot mix old and new audio.
 Each download is explicit and targets the selected language. Export errors retain
 all choices for retry. Native save filters match the encoded file format.
-Browser fixtures verify MP3/SRT downloads, query options and failed-export retry;
+Settings -> Performance -> Video export sets how video exports are encoded. The
+encoder is software (libx264) by default on every OS; "Hardware when available" is an
+opt-in that uses NVENC, Quick Sync, AMF or VideoToolbox when the bundled ffmpeg lists one,
+and retries the export with libx264 (logging why) if the hardware encode fails. "Maximum
+resolution" (Original, 2160p, 1440p, 1080p, 720p) only ever scales a video down, keeps its
+aspect ratio and even dimensions, and re-encodes instead of stream-copying when it applies.
+Live previews always use software encoding.
+Browser fixtures verify MP3/SRT/TXT downloads, UTF-8 transcript bytes, query options and failed-export retry;
 unit tests cover video/package parameters. Real rendered exports, batch presets
 and native save dialogs remain unverified or incomplete.
 
 Timing options now match Tauri: Concise, Smart Fit, Stretch Video and Lip sync.
 Voice matching offers per-line references or one consistent reference per speaker.
+Manually selected saved voices use their stored reference recording and transcript
+on every segment, including designed voices and clones with style instructions.
+A locked voice uses its locked take; legacy instruction-only voices still use
+their description and seed without a reference recording.
 These choices persist in working drafts and projects and are sent to generation;
 existing defaults remain Strict slot and Per line. Interrupted generation retains
 its submitted timing strategy. Completed output retains that strategy separately
@@ -311,7 +351,9 @@ NLLB resolves explicit FLORES language/script codes, unambiguous ISO-639-3 codes
 ### Speech integrity and timing
 
 A failed, empty or unreadable speech segment stops generation before a new track
-replaces the previous output. Partial regeneration repairs missing or corrupt
+replaces the previous output. When the failure identifies a segment, the notice
+shows its row number; select it to jump to that row in the transcript.
+Partial regeneration repairs missing or corrupt
 segment caches, including missing clips outside the requested changed-line list;
 it does not substitute silence and report completion. Auto speaker references
 exclude oversized clips when selecting a shared fallback, so short lines reuse a

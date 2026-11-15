@@ -1,33 +1,29 @@
 """Execute optional Vulkan build paths with hermetic compiler stand-ins."""
-import os
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from build_script_stubs import run_bash, stage_build_script
 
 REPO = Path(__file__).resolve().parents[1]
-BASH = (shutil.which("bash") if os.name != "nt" else
-        "C:/Program Files/Git/bin/bash.exe")
+SPIRV_COMMIT = "09913f088a1197aba4aefd300a876b2ebbaa3391"
+# `git clone` makes the destination; `git -C <dir> rev-parse HEAD` reports the
+# pinned SPIRV-Headers commit unless a test overrides FAKE_SPIRV_COMMIT.
+GIT_STUB = '''
+if [[ "${1:-}" == clone ]]; then for d in "$@"; do :; done; mkdir -p "$d"; fi
+if [[ "$*" == *rev-parse* ]]; then printf '%s\\n' "${FAKE_SPIRV_COMMIT:-@COMMIT@}"; fi
+'''.replace("@COMMIT@", SPIRV_COMMIT)
 
 
 @pytest.mark.parametrize("platform", ["windows-x86_64", "linux-x86_64", "linux-aarch64"])
 @pytest.mark.parametrize("mode", ["absent", "configure-fails", "build-fails", "success"])
 def test_vulkan_build_and_cpu_fallback(tmp_path, platform, mode):
-    if not BASH or not Path(BASH).is_file():
-        pytest.skip("POSIX bash required for the build script")
-    scripts = tmp_path / "scripts"
-    scripts.mkdir()
-    shutil.copy2(REPO / "scripts/build-omnivoice-tts.sh", scripts)
-    if (REPO / "scripts/lib").exists():
-        shutil.copytree(REPO / "scripts/lib", scripts / "lib")
-    fake = tmp_path / "fake-bin"
-    fake.mkdir()
+    stage_build_script(tmp_path)
     tools = {
-        "git": 'if [[ "${1:-}" == clone ]]; then for d in "$@"; do :; done; mkdir -p "$d"; fi',
+        "git": GIT_STUB,
         "c++": "exit 0",
         "cmake": '''
 printf '%s\\n' "$*" >> "$CMAKE_LOG"
+printf 'PREFIX_PATH=%s\\n' "${CMAKE_PREFIX_PATH:-}" >> "$CMAKE_LOG"
 # Match pinned ggml's default and its dynamic CPU backend configure constraint.
 if [[ "$*" == *-DGGML_BACKEND_DL=ON* && "$*" != *-DGGML_NATIVE=OFF* ]]; then
     echo 'GGML_NATIVE is not compatible with GGML_BACKEND_DL' >&2
@@ -40,6 +36,8 @@ if [[ "${1:-}" == --build ]]; then
     mkdir -p build/Release
     printf runtime > build/omnivoice-tts
     printf runtime > build/Release/omnivoice-tts.exe
+    printf server > build/tts-server
+    printf server > build/Release/tts-server.exe
     printf library > build/libggml-vulkan.so
     printf library > build/Release/ggml-vulkan.dll
 fi
@@ -47,14 +45,8 @@ fi
     }
     if mode != "absent":
         tools["glslc"] = "exit 0"
-    for name, body in tools.items():
-        tool = fake / name
-        tool.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body + "\n")
-        tool.chmod(0o755)
-    launcher = tmp_path / "run.sh"
-    launcher.write_text('''#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
+    script = (tmp_path / "run.sh")
+    script.write_bytes(b'''set -euo pipefail
 unset VULKAN_SDK
 # System utilities remain available; only the optional compiler probe is masked.
 command() {
@@ -64,7 +56,6 @@ command() {
     builtin command "$@"
 }
 export -f command
-export PATH="$PWD/fake-bin:/usr/bin:/bin"
 export CMAKE_LOG="$PWD/cmake.log" VULKAN_ATTEMPT="$PWD/vulkan-attempt" FAILED="$PWD/failed"
 bash scripts/build-omnivoice-tts.sh --platform "$PLATFORM" --commit-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ''')
@@ -72,13 +63,10 @@ bash scripts/build-omnivoice-tts.sh --platform "$PLATFORM" --commit-sha aaaaaaaa
     msvc.mkdir()
     for dll in ("msvcp140.dll", "vcruntime140.dll"):
         (msvc / dll).write_text("crt")
-    env = {**os.environ, "MODE": mode, "PLATFORM": platform,
-           "OMNIVOICE_MSVC_RUNTIME_DIR": msvc.as_posix()}
-    result = subprocess.run([BASH, launcher.as_posix()], env=env,
-                            capture_output=True, text=True, timeout=30,
-                            check=False)
+    result = run_bash(tmp_path, [script.name], tools=tools, timeout=30, env={
+        "MODE": mode, "PLATFORM": platform, "OMNIVOICE_MSVC_RUNTIME_DIR": msvc.as_posix()})
     assert result.returncode == 0, result.stdout + result.stderr
-    log = (tmp_path / "cmake.log").read_text()
+    log = (tmp_path / "cmake.log").read_text(encoding="utf-8")
     if mode == "absent":
         assert "GGML_VULKAN=ON" not in log
     elif mode == "success":
@@ -88,6 +76,11 @@ bash scripts/build-omnivoice-tts.sh --platform "$PLATFORM" --commit-sha aaaaaaaa
         assert "-DGGML_NATIVE=OFF" in log
         assert "-DGGML_CPU_ALL_VARIANTS=ON" in log
         assert log.count("-DCMAKE_BUILD_TYPE=Release") == 1, result.stdout + result.stderr
+        if platform.startswith("windows"):
+            # ggml's find_package(SPIRV-Headers CONFIG) needs a config the
+            # LunarG SDK lacks: it is installed and put on CMAKE_PREFIX_PATH.
+            assert "--install" in log
+            assert "PREFIX_PATH=" in log and "spirv-headers-prefix" in log
         suffix = ".dll" if platform.startswith("windows") else ".so"
         assert any((tmp_path / "bin").glob("*ggml-vulkan" + suffix))
     else:
@@ -101,3 +94,34 @@ def test_header_probe_cannot_lose_a_race_with_the_compiler():
     code = "\n".join(line for line in probe.splitlines() if not line.lstrip().startswith("#"))
     assert "| c++" not in code and "|\n            c++" not in code
     assert "c++ -fsyntax-only -x c++ -" in code and "<<<" in code
+
+
+def test_windows_vulkan_falls_back_to_cpu_when_spirv_headers_do_not_match_the_pin(tmp_path):
+    stage_build_script(tmp_path)
+    tools = {
+        "git": GIT_STUB,
+        "glslc": "exit 0",
+        "cmake": '''
+printf '%s\\n' "$*" >> "$CMAKE_LOG"
+if [[ "${1:-}" == --build ]]; then
+    mkdir -p build/Release
+    printf runtime > build/Release/omnivoice-tts.exe
+    printf server > build/Release/tts-server.exe
+fi
+''',
+    }
+    msvc = tmp_path / "msvc"
+    msvc.mkdir()
+    for dll in ("msvcp140.dll", "vcruntime140.dll"):
+        (msvc / dll).write_text("crt")
+    script = tmp_path / "run.sh"
+    script.write_bytes(b'''set -euo pipefail
+unset VULKAN_SDK
+export CMAKE_LOG="$PWD/cmake.log"
+bash scripts/build-omnivoice-tts.sh --platform windows-x86_64 --commit-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+''')
+    result = run_bash(tmp_path, [script.name], tools=tools, timeout=30, env={
+        "FAKE_SPIRV_COMMIT": "b" * 40, "OMNIVOICE_MSVC_RUNTIME_DIR": msvc.as_posix()})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "expected " + SPIRV_COMMIT in result.stderr
+    assert "GGML_VULKAN=ON" not in (tmp_path / "cmake.log").read_text(encoding="utf-8")

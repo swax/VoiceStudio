@@ -8,7 +8,9 @@ const h = vi.hoisted(() => ({
   dir: '',
   safeThrows: false,
   keyring: false,
+  keyringAsks: 0,
   setBackendOnlyEnv: vi.fn(),
+  bridgeFails: false,
   handlers: new Map<string, (...args: unknown[]) => unknown>(),
 }));
 vi.mock('electron', () => ({
@@ -16,10 +18,12 @@ vi.mock('electron', () => ({
     get isPackaged() {
       return h.packaged;
     },
+    getVersion: () => '1.2.3',
     getPath: () => h.dir,
   },
   safeStorage: {
     isEncryptionAvailable: () => {
+      h.keyringAsks += 1;
       if (h.safeThrows) throw new Error('keychain locked');
       return h.keyring;
     },
@@ -37,6 +41,14 @@ vi.mock('electron', () => ({
 }));
 vi.mock('../backend', () => ({ setBackendOnlyEnv: h.setBackendOnlyEnv }));
 vi.mock('../ipc', () => ({ assertTrustedMainFrame: vi.fn() }));
+vi.mock('./account-token-bridge', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./account-token-bridge')>();
+  return {
+    ...real,
+    startAccountTokenBridge: (...args: Parameters<typeof real.startAccountTokenBridge>) =>
+      h.bridgeFails ? Promise.reject(new Error('port in use')) : real.startAccountTokenBridge(...args),
+  };
+});
 
 import { startAccount } from './index';
 
@@ -49,7 +61,10 @@ afterEach(() => {
   h.packaged = false;
   h.safeThrows = false;
   h.keyring = false;
+  h.keyringAsks = 0;
+  h.bridgeFails = false;
   h.setBackendOnlyEnv.mockClear();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -65,6 +80,13 @@ it('hands the bridge to the backend spawn only, never to process.env', async () 
     VOICESTUDIO_ACCOUNT_BRIDGE_URL: undefined,
     VOICESTUDIO_ACCOUNT_BRIDGE_TOKEN: undefined,
   });
+});
+
+it('starts without asking the keyring when no account is saved (#3813)', async () => {
+  h.keyring = true;
+  h.dir = mkdtempSync(join(tmpdir(), 'vs-account-'));
+  (await startAccount(opts))();
+  expect(h.keyringAsks).toBe(0);
 });
 
 it('starts no bridge when the environment has no client to sign in with', async () => {
@@ -186,4 +208,17 @@ it('a cached photo does not outlive account features being off', async () => {
   );
   (await startAccount(opts))();
   expect(existsSync(photo)).toBe(false);
+});
+
+it('a failed account start leaves no app check-in running', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const { AccountApi } = await import('./account-api');
+  const appCheck = vi.spyOn(AccountApi.prototype, 'appCheck').mockResolvedValue(300);
+  h.dir = signedInDir();
+  h.bridgeFails = true;
+  const close = await startAccount(opts);
+  close();
+  await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+  expect(appCheck).not.toHaveBeenCalled();
+  appCheck.mockRestore();
 });

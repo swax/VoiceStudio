@@ -25,18 +25,22 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
 STEP = next(s for s in WORKFLOW["jobs"]["changes"]["steps"] if s.get("id") == "detect")
 SCRIPT = STEP["run"]
+# The jobs change detection may skip; every other job runs whenever runtime CI does.
+ELECTRON_JOBS = ("ui-crawler", "linux-native-package", "electron-ui", "test-electron", "electron-smokes",
+                 "release-smoke")
 HAS_GREP_P = subprocess.run(["grep", "-P", "x"], input=b"", capture_output=True).returncode != 2
 pytestmark = pytest.mark.skipif(not HAS_GREP_P, reason="needs GNU grep -P, as on the Actions runner")
 
 
-def _detect(tmp_path: Path, rows, *, event="pull_request", gh_exit=0, gh_output_then_fail=False, grep_exit=None):
+def _detect(tmp_path: Path, rows, *, event="pull_request", gh_exit=0, gh_output_then_fail=False, grep_exit=None,
+            base="a" * 40, head="b" * 40):
     """rows: iterable of (status, filename) as `gh api ... --jq` prints them (TSV)."""
     listing = "\n".join(f"{status}\t{name}" for status, name in rows)
     gh = tmp_path / "gh"
     if gh_exit:
         body = f"echo boom >&2; exit {gh_exit}"
     else:
-        body = f"cat <<'LIST'\n{listing}\nLIST" + ("\nexit 1" if gh_output_then_fail else "")
+        body = f"echo \"$*\" >> '{tmp_path}/gh-args'\ncat <<'LIST'\n{listing}\nLIST" + ("\nexit 1" if gh_output_then_fail else "")
     gh.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
     if grep_exit is not None:  # a grep that is broken on this runner (e.g. BSD grep without -P)
@@ -46,7 +50,7 @@ def _detect(tmp_path: Path, rows, *, event="pull_request", gh_exit=0, gh_output_
     out = tmp_path / "output"
     out.write_text("", encoding="utf-8")
     env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}", GITHUB_OUTPUT=str(out),
-               EVENT=event, PR="1", REPO="o/r", GH_TOKEN="x")
+               EVENT=event, PR="1", REPO="o/r", GH_TOKEN="x", BASE=base, HEAD=head)
     # `shell: bash` in Actions is: bash --noprofile --norc -eo pipefail {0}
     proc = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", SCRIPT],
                           env=env, capture_output=True, text=True)
@@ -65,7 +69,7 @@ def test_the_step_uses_the_pipefail_shell():
 @pytest.mark.parametrize("files", [
     ["backend/api/routers/dub_export.py", "tests/test_dub_export.py"],
     ["CHANGELOG.md", "docs/RELEASING.md", "README.md", "LICENSE-NOTICE.md"],   # edits only
-    ["omnivoice/utils/text.py", "uv.lock"],
+    ["omnivoice/utils/text.py", "backend/core/config.py"],
     ["scripts/release.py", "tests/backend/api/test_x.py"],
     ["mobile/android/app/build.gradle.kts", "mobile/contract/openapi.json"],
     [".github/ISSUE_TEMPLATE/bug.yml", "Makefile"],
@@ -82,6 +86,7 @@ def test_python_docs_and_mobile_edits_skip_the_electron_jobs(tmp_path, files):
     ["native/desktop-bridge/src/lib.rs"],
     ["package.json"], ["bun.lock"], ["config/app.json"], ["config/account.json"],
     ["pyproject.toml"],                                         # the contract parses its `readme =` key
+    ["uv.lock"], ["backend/x.py", "uv.lock"],                   # main bundles it; its tests read it
     ["tests/fixtures/longform_parser_cases.json"],              # shared with the JS suite
     ["tests/frontend/ssml.test.mjs"],
     [".github/workflows/ci.yml"], [".github/workflows/electron-release.yml"],
@@ -91,6 +96,30 @@ def test_python_docs_and_mobile_edits_skip_the_electron_jobs(tmp_path, files):
 ])
 def test_anything_else_runs_the_electron_jobs(tmp_path, files):
     assert _detect(tmp_path, _mod(*files))[0] == "electron=true"
+
+
+def _scripts_the_desktop_build_uses() -> set[str]:
+    """scripts/*.py named by the packaging code or the Electron/CI workflows."""
+    sources = [*(ROOT / "electron").glob("*.mjs"), *(ROOT / "electron/packaging").glob("*.mjs"),
+               ROOT / ".github/workflows/ci.yml", *(ROOT / ".github/workflows").glob("electron-*.yml")]
+    found = set()
+    for source in sources:
+        # Repository-root scripts/ only (../scripts/ from electron/, not .github/scripts/).
+        found |= {f"scripts/{name}" for name in
+                  re.findall(r"(?<![\w./-])(?:\.\./)?scripts/([A-Za-z0-9_]+\.py)", source.read_text(encoding="utf-8"))}
+    return found
+
+
+def test_scripts_the_desktop_build_runs_or_ships_run_the_electron_jobs(tmp_path):
+    # scripts/*.py is otherwise Python-only, so an edit to freeze_cli.py (which builds
+    # the bundled CLI) skipped the release smoke and the CLI bundle smoke.
+    scripts = _scripts_the_desktop_build_uses()
+    assert {"scripts/freeze_cli.py", "scripts/smoke_windows_rocm.py", "scripts/check_glibc_floor.py"} <= scripts
+    # The release job's own helpers run after packaging, on the release tag only.
+    scripts -= {"scripts/prepare_electron_release.py", "scripts/release_signing_notes.py",
+                "scripts/check_electron_release_assets.py"}
+    for script in sorted(scripts):
+        assert _detect(tmp_path, _mod(script))[0] == "electron=true", script
 
 
 # --- the three bypasses found in review -------------------------------------------
@@ -187,6 +216,25 @@ def test_legacy_electron_scope_remains_conservative_off_pull_requests(tmp_path, 
     assert _detect(tmp_path, _mod("docs/only.md"), event=event)[0] == "electron=true"
 
 
+def test_a_merge_group_is_compared_with_its_base(tmp_path):
+    assert _detect(tmp_path, _mod("backend/x.py", "docs/a.md"), event="merge_group")[0] == "electron=false"
+    assert (tmp_path / "gh-args").read_text(encoding="utf-8").split()[:2] == ["api", f"repos/o/r/compare/{'a' * 40}...{'b' * 40}"]
+    assert _detect(tmp_path, _mod("electron/src/main/updater.ts"), event="merge_group")[0] == "electron=true"
+    assert _detect(tmp_path, [("removed", "README.md")], event="merge_group")[0] == "electron=true"
+
+
+@pytest.mark.parametrize("base, head", [("", "b" * 40), ("a" * 40, "main"), ("a" * 40, "$(touch x)" + "b" * 31)])
+def test_a_merge_group_without_valid_shas_runs_everything(tmp_path, base, head):
+    assert _detect(tmp_path, _mod("docs/a.md"), event="merge_group", base=base, head=head)[0] == "electron=true"
+    assert not (tmp_path / "gh-args").exists()
+
+
+def test_300_files_is_the_compare_cap_so_a_merge_group_runs_everything(tmp_path):
+    rows = _mod(*[f"docs/page{i}.md" for i in range(300)])
+    assert _detect(tmp_path, rows, event="merge_group")[0] == "electron=true"
+    assert _detect(tmp_path, rows[:299], event="merge_group")[0] == "electron=false"
+
+
 def test_a_failed_partial_or_empty_lookup_runs_everything(tmp_path):
     assert _detect(tmp_path, [], gh_exit=1)[0] == "electron=true"
     assert _detect(tmp_path, [])[0] == "electron=true"
@@ -207,7 +255,7 @@ def test_the_jq_expression_emits_status_and_filename_for_renames_too(tmp_path):
 
 def test_the_electron_jobs_are_gated_on_the_detection_and_survive_its_failure():
     jobs = WORKFLOW["jobs"]
-    for name in ("ui-crawler", "linux-native-package", "electron-ui", "test-electron", "electron-smokes"):
+    for name in ELECTRON_JOBS:
         assert jobs[name]["needs"] == "changes", name
         condition = jobs[name]["if"]
         assert "!cancelled()" in condition and "outputs.electron != 'false'" in condition, name
@@ -217,14 +265,22 @@ def test_the_electron_jobs_are_gated_on_the_detection_and_survive_its_failure():
     python_condition = jobs["test-python"]["if"]
     assert "!cancelled()" in python_condition and "needs.changes.result != 'skipped'" in python_condition
     assert "needs.changes.outputs.runtime != 'false'" in python_condition
-    # `test` is the required check: it must wait for both halves and always report,
-    # and may accept a skipped Electron half only when detection said "false".
-    assert set(jobs["test"]["needs"]) == {"changes", "test-python", "test-electron", "electron-smokes"}
+    # `test` is the required check: it must wait for every other job and always report,
+    # and may accept a skipped Electron job only when detection said "false".
+    assert set(jobs["test"]["needs"]) == set(jobs) - {"test", "approve-external"}
     assert jobs["test"]["if"] == "${{ !cancelled() }}"
     gate = "\n".join(str(s.get("run", "")) for s in jobs["test"]["steps"])
-    assert '[ "$PYTHON" = success ]' in gate
+    env = jobs["test"]["env"]
     assert '"$result" = skipped' in gate and '"$ELECTRON_NEEDED" = false' in gate
-    assert '"$ELECTRON" "$SMOKES"' in gate
+    runtime_list = re.search(r"runtime_jobs=\(([^)]*)\)", gate).group(1)
+    electron_list = re.search(r"electron_jobs=\(([^)]*)\)", gate).group(1)
+    # Every job's result is read, and lands in exactly one list.
+    read = {re.search(r"needs\.([a-z-]+)\.result", value).group(1): name
+            for name, value in env.items() if value.endswith(".result }}") and name != "CHANGES_RESULT"}
+    assert set(read) == set(jobs["test"]["needs"]) - {"changes"}
+    for job, var in read.items():
+        expected, other = (electron_list, runtime_list) if job in ELECTRON_JOBS else (runtime_list, electron_list)
+        assert f'"${var}"' in expected and f'"${var}"' not in other, job
     electron_steps = {s["name"] for s in jobs["test-electron"]["steps"] if "name" in s}
     assert {
         "Frontend unit tests", "Electron typecheck, tests and production contract",

@@ -1,39 +1,25 @@
 # VoiceStudio for Dub Anything
 
-This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the public
-VoiceStudio fork used as the voice backend for
-[Dub Anything](https://github.com/swax/dub-anything). Dub Anything directs,
-renders and checks video dubs through this backend, and includes it as a Git
-submodule pinned to a tested commit.
+This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the backend
+fork pinned by [Dub Anything](https://github.com/swax/dub-anything).
 
-This fork integrates upstream commit `2e195d72d3794a88b7cb37f87a3e92a20193574e`
-and keeps these additional controls:
+Additional behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
 
-- **Transcription:** respect the selected source language when transcribing dub audio.
-- **Per-line direction:** accept voice references, emotion references and random seeds
-  for individual segments, forward seeds to IndexTTS, and invalidate cached takes
-  when these controls change.
-- **Audio effects:** add echo and public-address presets, with reverb tails that ring out.
-- **Shared media:** upload without separating the voices, attach stems the client
-  separated itself, and fork a job over the same media to render it in another voice.
-- **Legacy Windows AMD support:** retain the backend and IndexTTS compatibility
-  adjustments for the `2.9.1+rocm7.13.x` Torch build. Other runtimes keep upstream's
-  dispatch and precision policy.
-- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets.
+- **Per-line direction:** accept voice references and transcripts, emotion references
+  and strengths, and seed overrides for individual dub segments. Include these
+  controls in incremental fingerprints and private crash-recovery identities.
+- **Audio effects:** add echo and public-address presets with reverb tails.
+- **Shared media:** let uploads skip built-in separation, attach client-separated
+  stems, and fork jobs over hard-linked media for another voice. Stem attachment
+  and job forking require administrator access.
+- **Responsive watermarking:** mark fresh dub segments on the existing watermark
+  worker; recovered segments keep their existing mark.
+- **Legacy Windows AMD support:** retain compatibility adjustments for the
+  `2.9.1+rocm7.13.x` Torch build in the backend and IndexTTS sidecar.
+- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets
+  and generated mobile contracts.
 
-Upstream now supplies CPU float32 selection and IndexTTS speed control, so the
-original overrides were removed. The integration also keeps upstream's atomic
-cache publication: failed or cancelled renders cannot replace published takes.
-Reusing newly synthesized takes after a timing failure needs a separate design
-that preserves that safeguard.
-
-For installation, use [Dub Anything's setup guide](https://github.com/swax/dub-anything/blob/main/docs/setup.md).
-The former standalone patch is maintained here as commits. See
-[fork maintenance notes](../../DUB_ANYTHING.md) for the baseline and update workflow.
-VoiceStudio retains its [AGPL-3.0 license and notices](../../LICENSE-NOTICE.md);
-model weights retain their own licenses.
-
-The original project's README follows.
+[Setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md) · [Fork notes](https://github.com/swax/VoiceStudio/blob/main/DUB_ANYTHING.md)
 
 ---
 
@@ -188,6 +174,8 @@ The original project's README follows.
 
 अपना सिस्टम चुनें, फिर इंस्टॉलेशन विधि का विस्तार करें।
 
+नेटिव GGUF इंजन AMD, Intel और NVIDIA GPU पर इंजन-विशिष्ट Vulkan त्वरण का भी समर्थन करते हैं ([OmniVoice](../../docs/engines/omnivoice-gguf.md#vulkan-acceleration), [CosyVoice](../../docs/engines/cosyvoice-gguf.md))। OmniVoice GGUF, Windows और Linux पर GPU और मॉडल का आकार अपने आप चुनता है। छिपी हुई जाँच अटकने पर Vulkan पहचान नेटिव सारांश के साथ दोबारा प्रयास करती है; Windows और Linux डेस्कटॉप बिल्ड Vulkan मॉड्यूल के बिना चुपचाप जारी होने के बजाय विफल हो जाते हैं।
+
 <a id="install-macos"></a>
 
 <details>
@@ -243,6 +231,8 @@ curl -fsSL https://voicestudio.sh/install | sh
 
 <details>
 <summary><img src="../../docs/assets/platforms/windows.svg" alt="" width="20" height="20" /> <strong>Windows</strong> · PowerShell · EXE</summary>
+
+प्रयोगात्मक [Windows ROCm सेटअप](../../docs/install/windows-rocm.md) केवल `gfx1030`, `gfx1031` या `gfx1032` लक्ष्य वाले चुनिंदा RDNA 2 RX 6000 GPU का समर्थन करता है; RX 6500 XT (`gfx1034`) इसमें शामिल नहीं है। अलग से निश्चित संस्करण वाले CTranslate2 बिल्ड में RX 6700 XT पर ट्रांसक्रिप्शन के लिए मूल `gfx1031` कर्नेल शामिल हैं; सेटअप GPU पर उनका वास्तविक निष्पादन जाँचता है। RX 6700 XT के परीक्षणों में मूल Torch वाक् निर्माण और PyTorch Whisper भी शामिल हैं। ROCm 10 पर faster-whisper सुरक्षित CPU चयन और CPU पर वापसी के लिए अलग इन्फरेंस प्रक्रिया इस्तेमाल करता है। अन्य कार्ड और कार्यभार गाइड में दी गई सत्यापन सीमाओं के अधीन हैं। प्रदर्शन प्रीसेट बदले हुए इंजन चयन को सहेजने से पहले ऑफलाइन चाइल्ड प्रक्रिया में रनटाइम की तत्परता जाँचते हैं और स्थापित रनटाइम विफल होने पर वैकल्पिक विकल्प बनाए रखते हैं।
 
 <blockquote>
 
@@ -536,9 +526,9 @@ https://github.com/debpalash/VoiceStudio/blob/main/docs/install/agent.md
 | सेटअप सहायता | [समस्या निवारण](../../docs/install/troubleshooting.md) · [मॉडल डाउनलोड](../../docs/downloading-models.md) |
 | गाइड | [कई वक्ताओं की डबिंग](../../docs/dubbing/multi-speaker-guide.md) · [भावपूर्ण आवाज़](../../docs/expressive-speech.md) · [डब किए गए ऑडियो का निर्यात](../../docs/dubbing/export.md) |
 | मॉडल और गुणवत्ता | [इंजन गाइड](../../docs/engines/README.md) · [whisper.cpp ASR](../../docs/engines/whisper-cpp.md) · [बेंचमार्क](../../docs/benchmarks.md) |
-| एकीकरण | [स्थानीय एपीआई](../../docs/speech-platform.md) · [MCP](../../docs/mcp.md) · [उदाहरण](../../examples/README.md) |
+| एकीकरण | [CLI](../../docs/install/script.md#terminal-command) · [स्थानीय एपीआई](../../docs/speech-platform.md) · [MCP](../../docs/mcp.md) · [उदाहरण](../../examples/README.md) |
 | फ़ोन ऐप्स | [आईओएस और एंड्रॉइड](../../docs/mobile.md) |
-| विकास | [योगदान](../../.github/CONTRIBUTING.md) ([अपने पहले पीआर से पहले CLA पर हस्ताक्षर करें](../../.github/CONTRIBUTING.md#contribution-licensing)) · [Changelog](../../CHANGELOG.md) |
+| विकास | [योगदान](../../.github/CONTRIBUTING.md) ([अपने पहले पीआर से पहले CLA पर हस्ताक्षर करें](../../.github/CONTRIBUTING.md#contribution-licensing)) · [Changelog](../../CHANGELOG.md) · [कोड साइनिंग नीति](../code-signing-policy.md) |
 
 एजेंट स्किल: `npx skills add debpalash/VoiceStudio` (ऑडियो कार्य के लिए **voicestudio** और रिपॉजिटरी के लिए **voicestudio-maintainer**)।
 

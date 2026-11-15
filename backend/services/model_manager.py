@@ -217,6 +217,11 @@ def _pick_gpu_workers() -> int:
         except ValueError:
             logger.warning("OMNIVOICE_GPU_WORKERS=%r is not an integer; ignoring", override)
     try:
+        from core.device_caps import gpu_probe_skipped
+
+        # CPU was chosen: one worker, sized without touching a GPU driver (#4006).
+        if gpu_probe_skipped():
+            return 1
         torch = _lazy_torch()
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             free_bytes, _total = torch.cuda.mem_get_info()
@@ -587,6 +592,36 @@ class GpuPoolBusyError(TimeoutError):
         self.retry_after = max(1, int(round(retry_after)))
 
 
+BUSY_BACKOFF_S = (0.5, 1.0, 2.0, 4.0)
+
+
+async def await_free_engine(call, *, budget_s, is_cancelled=None, backoff=BUSY_BACKOFF_S,
+                            what="engine"):
+    """Await ``call()``; while the engine is busy (:class:`GpuPoolBusyError`: a
+    native stream holds it, or the pool queue is saturated), wait and retry with
+    backoff inside ``budget_s``, stopping as soon as ``is_cancelled()``.
+
+    The wait runs on the event loop, never inside a GPU worker. A busy engine
+    must never become a silent or missing piece of an assembled output: past the
+    budget (or once cancelled) the busy error propagates so the job fails
+    clearly. ``call`` must be safe to repeat (busy means no work was lost)."""
+    deadline = time.monotonic() + budget_s
+    attempt = 0
+    while True:
+        try:
+            return await call()
+        except GpuPoolBusyError as busy:
+            remaining = deadline - time.monotonic()
+            if (is_cancelled is not None and is_cancelled()) or remaining <= 0:
+                raise
+            delay = min(backoff[min(attempt, len(backoff) - 1)], remaining)
+            attempt += 1
+            logger.info("%s busy (%s); retrying in %.1fs", what, busy, delay)
+            await asyncio.sleep(delay)
+            if (is_cancelled is not None and is_cancelled()) or time.monotonic() >= deadline:
+                raise
+
+
 def _explicit_budget_flags() -> "tuple[bool, bool]":
     """(universal_explicit, cpu_explicit): is the accelerated / CPU budget set
     by the user (env, or changed at runtime)? The single definition shared by
@@ -672,7 +707,7 @@ def generate_timeout_s(
         # An explicit (env-set, or runtime-changed the same way tests do)
         # CPU budget is more specific than the universal override and always
         # wins for CPU dispatches — see the #1787 comment above.
-        if family == "cpu" and (cpu_explicit or not universal_override):
+        if family in ("cpu", "unknown") and (cpu_explicit or not universal_override):
             base = CPU_JOB_TIMEOUT_S
             explicit_budget = cpu_explicit
             cpu_auto_scaled = not cpu_explicit
@@ -1606,8 +1641,8 @@ def _rocm_arch_remedy(device_arch: str, arch_list) -> str:
 
     install = (
         f"Install a ROCm PyTorch build that lists {device_arch}: "
-        "OMNIVOICE_TORCH_VARIANT=rocm setup installs torch 2.8.0 from the "
-        "rocm6.4 index, which includes gfx1200/gfx1201 (RX 9000 series)."
+        "OMNIVOICE_TORCH_VARIANT=rocm setup installs torch 2.10.0 from the "
+        "rocm7.1 index, which includes gfx1200/gfx1201 (RX 9000 series)."
     )
     if "HSA_OVERRIDE_GFX_VERSION" in device_arch:
         return "Remove or correct HSA_OVERRIDE_GFX_VERSION, or " + install[0].lower() + install[1:]
@@ -1632,8 +1667,12 @@ def check_device_compatibility():
     ``core.device_caps.arch_unsupported()`` — shared with the probe, and
     CUDA/ROCm-aware (a ROCm build lists ``gfx…``, not ``sm_…`` — #1228).
     """
-    from core.device_caps import arch_unsupported
+    from core.device_caps import arch_unsupported, gpu_probe_skipped
 
+    # CPU was chosen: no GPU is used, and asking CUDA would initialise the
+    # driver that choice avoids (/system/notifications polls this, #4006).
+    if gpu_probe_skipped():
+        return True, None
     torch = _lazy_torch()
     if not torch.cuda.is_available():
         return True, None
@@ -1660,6 +1699,10 @@ def check_device_compatibility():
             f"PyTorch build. Supported architectures: {', '.join(arch_list)}. "
             + _rocm_arch_remedy(device_arch, arch_list)
         )
+    from core.device_caps import is_legacy_nvidia_arch, legacy_nvidia_advice
+
+    if is_legacy_nvidia_arch(device_arch):
+        return False, legacy_nvidia_advice(device_name, device_arch)
     return False, (
         f"{device_name} ({device_arch}) is not supported by this PyTorch build. "
         f"Supported architectures: {', '.join(arch_list)}. "
@@ -1684,8 +1727,15 @@ def get_best_device():
     """
     from core.device_caps import detect_host_caps
 
+    caps = detect_host_caps()
+    # An explicit CPU choice (Settings, OMNIVOICE_DEVICE=cpu, or the failure
+    # screen's Restart on CPU after a graphics driver crash) means CPU, decided
+    # before any GPU runtime is touched: on a DirectML host the branch below
+    # would otherwise land on the same driver again. The probe skipped GPUs too.
+    if getattr(caps, "requested_family", None) == "cpu":
+        return "cpu"
     torch = _lazy_torch()
-    family = detect_host_caps().family
+    family = caps.family
 
     # ── NVIDIA CUDA or AMD ROCm (both present through torch.cuda) ─────
     if family in ("cuda", "rocm"):
@@ -2467,7 +2517,15 @@ def resolve_omnivoice_checkpoint() -> str:
     and is not a valid model identifier listed on huggingface.co/models"* (#693).
     Fall back to the default rather than 500 on every launch.
     """
-    checkpoint = os.environ.get("OMNIVOICE_MODEL", _DEFAULT_OMNIVOICE_CHECKPOINT).strip()
+    checkpoint = os.environ.get("OMNIVOICE_MODEL", "").strip()
+    if not checkpoint:
+        from services.local_model_paths import get
+        local = get("tts", "omnivoice")
+        if local:
+            # Inventory must remain accessible to repair missing local folders.
+            # The actual load path validates before opening weights.
+            return local
+        checkpoint = _DEFAULT_OMNIVOICE_CHECKPOINT
     if not checkpoint:
         return _DEFAULT_OMNIVOICE_CHECKPOINT
     if checkpoint == "test":
@@ -2677,6 +2735,21 @@ def _load_model_sync():
         from omnivoice.utils.dtype import tts_dtype_name
 
         checkpoint = resolve_omnivoice_checkpoint()
+        # Recovery must identify resident bytes, not weights replaced on disk
+        # after loading. Keep this snapshot on the model that actually loaded.
+        resume_fingerprint = None
+        try:
+            from core.model_fingerprint import tree_fingerprint
+            if os.path.isabs(checkpoint) or os.path.isdir(checkpoint):
+                resume_fingerprint = tree_fingerprint(os.path.realpath(checkpoint))
+        except Exception as err:  # noqa: BLE001 - optional recovery proof
+            logger.debug("Recovery fingerprint unavailable: %s", type(err).__name__)
+        local_fingerprint = None
+        if not os.environ.get("OMNIVOICE_MODEL", "").strip():
+            from services.local_model_paths import get, loading_fingerprint, validate
+            if checkpoint == get("tts", "omnivoice"):
+                validate("tts", "omnivoice", checkpoint)
+                local_fingerprint = loading_fingerprint(checkpoint)
         _set_loading("loading_weights", f"Loading TTS weights on {device}…")
         logger.info("Loading VoiceStudio model on device: %s", device)
         preload_asr = should_preload_tts_asr()
@@ -2977,6 +3050,12 @@ def _load_model_sync():
         # caller timed out. Instance metadata keeps /model/status honest.
         try:
             setattr(_model, "_voicestudio_checkpoint", checkpoint)
+            if resume_fingerprint is not None:
+                # Native loading can read many files. A tree that changed
+                # during that interval cannot certify the resident bytes.
+                if tree_fingerprint(os.path.realpath(checkpoint)) != resume_fingerprint:
+                    resume_fingerprint = None
+            setattr(_model, "_voicestudio_weights_fingerprint", resume_fingerprint)
             setattr(
                 _model,
                 "_voicestudio_loaded_at",
@@ -2988,6 +3067,9 @@ def _load_model_sync():
             # back to the effective configured checkpoint below.
             logger.debug("Could not attach resident model identity", exc_info=True)
 
+        if local_fingerprint is not None:
+            from services.local_model_paths import note_loaded
+            note_loaded("tts", "omnivoice", checkpoint, local_fingerprint)
         _set_loading("ready", "Model ready", progress=100)
         logger.info("VoiceStudio model loaded successfully.")
         return _model
@@ -3387,8 +3469,16 @@ def _release_idle_tts_memory(stage):
             release_transcription_backend(0.0)
         except Exception:  # noqa: BLE001 -- best-effort, never blocks the caller
             logger.debug("capture-ASR pre-%s release failed", stage, exc_info=True)
-        release_tts_side_caches()
-        free_vram()
+        release_tts_side_caches(keep_passage_choices=stage == "generate")
+        if stage == "generate":
+            # Warm generates can overlap inference on other GPU-pool workers,
+            # so skip free_vram()'s cuBLAS workspace clear: it belongs on
+            # unload paths only and is not thread-safe on older torch builds.
+            import gc
+            gc.collect()
+            release_device_cache()
+        else:
+            free_vram()
     except Exception:  # noqa: BLE001 -- a cleanup failure must never break the caller
         logger.debug("pre-%s memory reclaim skipped", stage, exc_info=True)
 
@@ -3398,7 +3488,11 @@ def _should_make_room_for_generate():
 
     Modes (OMNIVOICE_FREE_VRAM_BEFORE_GENERATE):
       auto (default): free when free system RAM is below the unified headroom,
-        mirroring _make_room_before_tts_load. A roomy machine pays nothing.
+        mirroring _make_room_before_tts_load, or when a CUDA/ROCm GPU's free
+        VRAM is below the figure that logs "Low GPU memory". On a small
+        dedicated card a nearly full VRAM makes the driver spill the generate
+        into shared system memory, which runs several times slower even with
+        plenty of RAM. A roomy machine pays nothing.
       always: free before every generate (small per-call cost from gc.collect +
         cache drop).
       never: opt out.
@@ -3409,9 +3503,13 @@ def _should_make_room_for_generate():
     if mode == "always":
         return True
     try:
-        from services.memory_budget import available_memory
-        free_gb = (available_memory() or {}).get("ram_available_gb")
+        from services.memory_budget import _LOW_RAM_HEADROOM_GB, available_memory
+        mem = available_memory() or {}
+        free_gb = mem.get("ram_available_gb")
         if free_gb is not None and free_gb < _UNIFIED_OFFLOAD_HEADROOM_GB:
+            return True
+        vram_free_gb = mem.get("vram_free_gb")
+        if vram_free_gb is not None and vram_free_gb < _LOW_RAM_HEADROOM_GB:
             return True
     except Exception:  # noqa: BLE001 -- a probe failure must never block a generate
         logger.debug("make_room memory probe failed", exc_info=True)
@@ -3671,7 +3769,9 @@ async def run_release(fn, *args):
 def _release_idle_model() -> None:
     """Unload the idle shared model; a failure must not end the idle reaper."""
     try:
-        unload_shared_model()
+        # A native extension or library calling sys.exit() during the unload
+        # would otherwise end the whole backend silently (#3887).
+        contain_system_exit(unload_shared_model, "idle model unload")()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle model unload failed", exc_info=True)
 
@@ -3692,12 +3792,25 @@ def _release_idle_side_models(idle_timeout: float) -> None:
             release_transcription_backend,
         )
 
-        released = release_idle_capture_backend(idle_timeout)
-        # The warm transcription ASR gets the same idle bargain.
-        if release_transcription_backend(idle_timeout) or released:
-            free_vram()
+        def _release_asr():
+            released = release_idle_capture_backend(idle_timeout)
+            # The warm transcription ASR gets the same idle bargain.
+            if release_transcription_backend(idle_timeout) or released:
+                free_vram()
+
+        contain_system_exit(_release_asr, "idle capture-ASR release")()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle capture-ASR release failed", exc_info=True)
+    # Engines that keep a model server between requests (the opt-in OmniVoice
+    # GGUF resident server) hold VRAM in a child process the paths above never see.
+    try:
+        from services.tts_backend import release_idle_resident_servers
+
+        contain_system_exit(
+            lambda: release_idle_resident_servers(idle_timeout), "idle resident-server release"
+        )()
+    except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
+        logger.warning("idle resident-server release failed", exc_info=True)
     # Same bargain for the AudioSeal watermark models, which loaded on the
     # first embed and were never released. Deliberately only here and not
     # in the make-room paths: watermarking runs immediately *after* a
@@ -3705,7 +3818,9 @@ def _release_idle_side_models(idle_timeout: float) -> None:
     try:
         from services.watermark import release_idle_models
 
-        release_idle_models(idle_timeout)
+        contain_system_exit(
+            lambda: release_idle_models(idle_timeout), "idle watermark-model release"
+        )()
     except Exception:  # noqa: BLE001 — the reaper must never kill idle_worker
         logger.warning("idle watermark-model release failed", exc_info=True)
 
@@ -3727,7 +3842,7 @@ async def idle_worker():
                 await run_release(_release_idle_model)
         await run_release(_release_idle_side_models, idle_timeout)
 
-def release_tts_side_caches():
+def release_tts_side_caches(*, keep_passage_choices=False):
     """Drop caches keyed to the TTS model, for when the model itself is released.
 
     The voice-clone prompt cache (services.tts_backend) holds encoded reference
@@ -3754,7 +3869,7 @@ def release_tts_side_caches():
     if mod is None:
         return
     try:
-        mod.clear_clone_prompt_cache()
+        mod.clear_clone_prompt_cache(keep_passage_choices=keep_passage_choices)
     except Exception:  # noqa: BLE001
         logger.debug("clone-prompt cache clear failed during unload", exc_info=True)
 
@@ -3830,6 +3945,13 @@ def release_device_cache(*, device: str | None = None, raise_on_failure: bool = 
     ``free_vram()``'s original contract for unload callers that report a failed
     flush to the user.
     """
+    if device is None:
+        from core.device_caps import gpu_probe_skipped
+
+        # CPU was chosen: no accelerator holds a cache, and probing for one
+        # would initialise the driver that choice avoids (#4006).
+        if gpu_probe_skipped():
+            return
     torch = _lazy_torch()
     try:
         name = str(device).split(":", 1)[0] if device is not None else _active_accelerator_name(torch)
@@ -4715,10 +4837,9 @@ def unload_diarization_pipeline() -> bool:
 
 def _local_route_is_cpu(engine_id: "str | None" = None) -> bool:
     """Does a local /generate for this engine (default: the active one) end up
-    computing on the CPU? True for a CPU host AND for an accelerated host whose
-    engine is CPU-only or falls back to CPU — the same routing decision the
-    generate dispatch budgets from. A failed lookup falls back to the host
-    family, which is what an engine-less budget uses."""
+    computing on the CPU? True for CPU routes and unknown sidecar routes, so
+    an unverified runtime gets the conservative CPU timeout budget. A failed
+    lookup falls back to the host family, as for an engine-less budget."""
     from core.device_caps import detect_host_caps
 
     caps = detect_host_caps()
@@ -4727,7 +4848,7 @@ def _local_route_is_cpu(engine_id: "str | None" = None) -> bool:
         from services.tts_backend import active_backend_id, get_backend_class
 
         cls = get_backend_class(engine_id or active_backend_id())
-        return runtime_compute_profile(cls, caps)["effective_device"] == "cpu"
+        return runtime_compute_profile(cls, caps)["effective_device"] in ("cpu", "unknown")
     except Exception:  # noqa: BLE001 — routing lookup is advisory
         return caps.family == "cpu"
 

@@ -46,7 +46,7 @@ function ctl(over: Partial<ConstructorParameters<typeof AccountController>[0]> =
       avatar: async () => null,
       entitlements: async () => null,
     } as never,
-    remembered: true,
+    remembered: () => true,
     links: {
       profile: 'https://app.example/app/settings/profile',
       plan: 'https://app.example/app/settings/plan',
@@ -89,6 +89,17 @@ it('does not fetch the profile while account features are off', async () => {
   await c.setSwitches({ accountEnabled: false });
   await c.publicState();
   expect(get).not.toHaveBeenCalled();
+});
+
+it('asks the keyring whether sign-in is remembered only with account features on (#3813)', async () => {
+  const remembered = vi.fn(() => true);
+  const c = ctl({ remembered });
+  await c.setSwitches({ accountEnabled: false });
+  expect((await c.publicState()).remembered).toBe(false);
+  expect(remembered).not.toHaveBeenCalled();
+  await c.setSwitches({ accountEnabled: true });
+  expect((await c.publicState()).remembered).toBe(true);
+  expect(remembered).toHaveBeenCalled();
 });
 
 it('setSwitches validates input and always marks the prompt as answered', async () => {
@@ -378,4 +389,32 @@ it('validates signup options before invoking the browser session', async () => {
   ])
     expect(() => invoke({}, options)).toThrow('Invalid sign-in options');
   expect(signIn).toHaveBeenCalledTimes(2);
+});
+
+it('saves a new display name through the account API and refuses invalid names', async () => {
+  const patch = vi.fn(async (changes: { display_name: string }) => ({
+    email: 'ana@example.com',
+    displayName: changes.display_name,
+    avatarUrl: null,
+    organizations: [],
+  }));
+  const c = ctl({
+    api: {
+      get: async () => ({
+        email: 'ana@example.com',
+        displayName: 'Ana',
+        avatarUrl: null,
+        organizations: [],
+      }),
+      patch,
+      avatar: async () => null,
+      entitlements: async () => null,
+    } as never,
+  });
+  const s = await c.updateProfile({ display_name: 'Ana Souza' });
+  expect(patch).toHaveBeenCalledWith({ display_name: 'Ana Souza' });
+  expect(s.profile?.displayName).toBe('Ana Souza');
+  await expect(c.updateProfile({ display_name: 'x'.repeat(201) })).rejects.toThrow();
+  await expect(c.updateProfile({ display_name: 42 })).rejects.toThrow();
+  expect(patch).toHaveBeenCalledTimes(1);
 });

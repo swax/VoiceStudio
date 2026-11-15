@@ -14,6 +14,12 @@ app (MSI installers) is no longer maintained; if you still run it, follow the
 Python, FFmpeg, and model weights are bootstrapped by the app itself on first
 launch; no toolchain is needed for the installer.
 
+Windows installers are being moved to free SignPath Foundation code signing; the
+release notes' **Download** table says whether your download is signed.
+See the [code signing policy](../code-signing-policy.md). It signs the installer,
+not the third-party Python files setup downloads, so Smart App Control can still
+block those (see [troubleshooting](troubleshooting.md)).
+
 ## Keep engine environments off `C:`
 
 Engine environments (IndexTTS, CosyVoice, MOSS-TTS and other sidecars, plus the
@@ -44,6 +50,17 @@ The setup wizard installs for the current user by default (no administrator
 rights needed) and lets you choose the installation folder. Compare the download with the
 release's `SHA256SUMS.txt` before running it.
 
+Current installers add the bundled CLI's directory to PATH for their installation
+scope and remove that entry on uninstall. Open a new terminal afterwards:
+`voicestudio` opens the desktop app; `voicestudio --help` shows terminal commands.
+The CLI includes its own Python runtime and works before backend setup. Commands
+that need the backend start VoiceStudio in the background when it is not running.
+See [Terminal command](script.md#terminal-command).
+
+The uninstaller asks whether to also delete the downloaded runtime and models
+(default No; your voices and projects are always kept). See
+[Uninstalling](uninstall.md#windows-uninstaller-keep-or-delete-the-downloads).
+
 During an update, the installer closes processes running inside the selected
 installation folder. Processes in similarly named sibling folders and the
 installer itself are excluded. If an older installer leaves a running copy
@@ -51,6 +68,18 @@ open, exit that copy before retrying. If it keeps saying VoiceStudio
 cannot be closed when the app is stopped, run the installer from a different
 folder (for example Downloads) and retry; keep your existing runtime, model
 cache and data folders.
+
+Installer process checks run PowerShell without user startup profiles or
+interactive prompts. This prevents a custom profile that waits for input or
+runs a long command from stopping the Windows installation wizard.
+
+If the native Windows installer still stops progressing, record its exact
+filename and version, your Windows version and architecture, whether this is
+a fresh install or an update, and how long it has waited. Include the last
+installer detail line if available, and note whether Task Manager shows the
+installer or a PowerShell child using CPU or disk. This screen runs before the
+app's Python setup, so the app's download log cannot diagnose it. Keep the
+existing runtime, models, voices and projects while collecting this evidence.
 
 Or, from a regular (non-admin) PowerShell, let the
 [install script](script.md) pick the right installer, verify it, and open the
@@ -161,6 +190,9 @@ Use this for development or to run current `main`. The install script's
 `main` mode (`$env:VOICESTUDIO_INSTALL_MODE='main'; irm https://voicestudio.sh/install.ps1 | iex`)
 builds and installs a desktop package from `main` without a checkout; see
 [the install script guide](script.md).
+The script uses a short, temporary checkout name to keep native dependency
+paths within MSVC's path limit. If your `TEMP` directory has a long path,
+choose a shorter temporary directory before starting a source build.
 
 Prerequisites:
 
@@ -252,5 +284,12 @@ See [docs/setup/huggingface-token.md](../setup/huggingface-token.md).
 ## Troubleshooting
 
 Hit a wall? See [docs/install/troubleshooting.md](troubleshooting.md).
+
+If the engine stops with a Windows exit code, the failure screen names it:
+
+- **`spawn UNKNOWN`, `EPERM` or `EACCES`**: Windows or security software refused to start `python.exe`. The screen names the program and says when Smart App Control is on. See [`EXEC_REFUSED`](troubleshooting.md#exec_refused) and [`WINDOWS_APP_CONTROL_BLOCKED`](troubleshooting.md#windows_app_control_blocked).
+- **`0xC0000005`, `0xC000001D`, `0xC0000374` and other native faults**: a library crashed below Python. The in-app report names the library from the Windows event log. When it is the graphics driver, update the driver or press **Restart on CPU** on the failure screen; switch back later in Settings → Performance & Device. See [`NATIVE_ACCESS_VIOLATION`](troubleshooting.md#native_access_violation).
+- **`0xC0000006`**: Windows could not read part of a file mapped into memory, usually a model file. A disk or paging-file read error is the most common cause: keep models on an internal drive and check it for errors. See [`NATIVE_IN_PAGE_ERROR`](troubleshooting.md#native_in_page_error).
+- **`4294967295` (`-1`)**: the engine exited with `-1`. With no traceback, the likely cause is something outside the app ending it, often security software, but the engine can also exit with `-1` itself.
 
 Migration configuration is kept ASCII so Alembic can read it under Windows locale code pages as well as UTF-8. This applies to source installs and direct Alembic commands.

@@ -12,6 +12,7 @@ import {
   OMNIVOICE_TTS_RESOURCE_DIR,
   manifestMismatches,
   omnivoiceTtsBinaryName,
+  omnivoiceTtsServerName,
   omnivoiceTtsSlug,
   readManifest,
 } from '../omnivoice-tts-bundle.mjs';
@@ -35,6 +36,7 @@ const distributionIdentityTest = spawnSync(
     '--test',
     resolve(root, 'tests/distribution-identity.test.mjs'),
     resolve(root, 'tests/mas-runtime-bundle.test.mjs'),
+    resolve(root, 'tests/dmg-window.test.mjs'),
   ],
   { encoding: 'utf8' },
 );
@@ -211,6 +213,7 @@ for (const resource of [
   'backend',
   'omnivoice',
   'config/app.json',
+  'config/analytics.json',
 ]) {
   const entry = config.extraResources.find((item) => item.to === resource);
   assert(entry && existsSync(resolve(root, entry.from)), 'Required resource: ' + resource);
@@ -261,6 +264,9 @@ if (DISTRIBUTION_TARGET === 'mac-app-store') {
 if (artifactRequested && bundledUvSource) {
   assert(existsSync(resolve(artifactResources, bundledUvSource.to)), 'Packaged uv executable');
 }
+// Diagnostics from external tools can carry the builder's home directory.
+const redactHome = (text) =>
+  String(text ?? '').replace(/(?:\/Users\/|\/home\/|[A-Za-z]:\\Users\\)[^/\\\s'"]+/g, '<home>');
 // #2780: release and rehearsal builds ship the OmniVoice GGUF runtime where
 // the backend looks for it (resources/bin/omnivoice-tts-<slug>). The workflow
 // names the slug it staged; it must be the one this target's backend resolves.
@@ -274,6 +280,7 @@ if (omnivoiceTtsPlatform) {
   const runtime = config.extraResources.find((item) => item.to === OMNIVOICE_TTS_RESOURCE_DIR);
   assert(runtime, 'Release builds package the OmniVoice GGUF runtime');
   const binary = omnivoiceTtsBinaryName(omnivoiceTtsPlatform);
+  const server = omnivoiceTtsServerName(omnivoiceTtsPlatform);
   const dirs = [['Staged', runtime.from]];
   if (artifactRequested) {
     dirs.push(['Packaged', resolve(artifactResources, OMNIVOICE_TTS_RESOURCE_DIR)]);
@@ -281,20 +288,31 @@ if (omnivoiceTtsPlatform) {
   for (const [label, dir] of dirs) {
     const file = resolve(dir, binary);
     assert(existsSync(file) && statSync(file).size > 0, `${label} GGUF runtime: ${binary}`);
+    const serverFile = resolve(dir, server);
     assert(
-      readManifest(resolve(dir, OMNIVOICE_TTS_MANIFEST)).has(binary),
-      `${label} ${OMNIVOICE_TTS_MANIFEST} covers ${binary}`,
+      existsSync(serverFile) && statSync(serverFile).size > 0,
+      `${label} GGUF resident server: ${server}`,
     );
+    for (const name of [binary, server]) {
+      assert(
+        readManifest(resolve(dir, OMNIVOICE_TTS_MANIFEST)).has(name),
+        `${label} ${OMNIVOICE_TTS_MANIFEST} covers ${name}`,
+      );
+    }
     assert.deepEqual(manifestMismatches(dir), [], `${label} GGUF runtime matches its manifest`);
   }
   if (artifactRequested && process.platform !== 'win32') {
-    const packaged = resolve(artifactResources, OMNIVOICE_TTS_RESOURCE_DIR, binary);
-    assert(statSync(packaged).mode & 0o111, 'Packaged GGUF runtime is executable');
+    for (const name of [binary, server]) {
+      const packaged = resolve(artifactResources, OMNIVOICE_TTS_RESOURCE_DIR, name);
+      assert(statSync(packaged).mode & 0o111, `Packaged ${name} is executable`);
+    }
   }
   if (artifactRequested && process.platform === 'darwin') {
-    const packaged = resolve(artifactResources, OMNIVOICE_TTS_RESOURCE_DIR, binary);
-    const verify = spawnSync('codesign', ['--verify', '--strict', packaged], { encoding: 'utf8' });
-    assert.equal(verify.status, 0, `Packaged GGUF runtime is signed: ${verify.stderr}`);
+    for (const name of [binary, server]) {
+      const packaged = resolve(artifactResources, OMNIVOICE_TTS_RESOURCE_DIR, name);
+      const verify = spawnSync('codesign', ['--verify', '--strict', packaged], { encoding: 'utf8' });
+      assert.equal(verify.status, 0, `Packaged ${name} is signed: ${redactHome(verify.stderr)}`);
+    }
   }
 }
 assert.equal(
@@ -339,6 +357,14 @@ for (const platform of ['win', 'mac', 'linux']) {
   }
 }
 if (artifactRequested) {
+  const cliCommand = resolve(artifactResources, 'cli',
+    'voicestudio' + (process.platform === 'win32' ? '.exe' : ''));
+  assert(existsSync(cliCommand), 'Packaged unified command with its own interpreter');
+  const cliVersion = spawnSync(cliCommand, ['version', '--json'], { encoding: 'utf8' });
+  assert.equal(cliVersion.status, 0, cliVersion.stderr);
+  assert.equal(JSON.parse(cliVersion.stdout).version, config.extraMetadata.version);
+  const cliHelp = spawnSync(cliCommand, ['--help'], { encoding: 'utf8' });
+  assert.equal(cliHelp.status, 0, cliHelp.stderr);
   if (process.platform === 'linux') {
     await verifyLinuxLibraries(resolve(artifactResources, 'native/voicestudio-desktop-bridge'));
   }

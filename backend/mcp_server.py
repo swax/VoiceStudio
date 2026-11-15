@@ -36,6 +36,7 @@ import argparse
 import base64
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -81,6 +82,173 @@ def _sniff_audio_ext(raw: bytes) -> str:
         # extension is a storage nicety, not a correctness gate (CR, #1198).
         return ".m4a"
     return ".wav"
+
+
+# ── Backend errors ───────────────────────────────────────────────────────
+# A failed backend call usually explains itself in the response body (a
+# licence to accept, a model to download, a duplicate name). httpx's own
+# raise_for_status() message keeps only the status line and URL — and the
+# in-process transport's URL has no port — so agents were told "403 Forbidden
+# for url http://127.0.0.1/transcribe" instead of what to do about it.
+
+
+# Error text goes to an LLM agent, which may be a hosted model: strip secrets
+# and home paths the backend echoed, and cap a proxy's HTML error page.
+_ERROR_DETAIL_MAX_CHARS = 1000
+
+
+def _scrubbed(value):
+    """``value`` with every string in it, keys included, passed through ``scrub_text``.
+
+    Structured values must be scrubbed *before* JSON encoding: ``json.dumps``
+    doubles each backslash, and a Windows home path written as
+    ``C:\\\\Users\\\\alice`` no longer matches the scrubber's patterns."""
+    from core.scrub import scrub_text
+
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, list):
+        return [_scrubbed(item) for item in value]
+    if isinstance(value, dict):
+        return {_scrubbed(key): _scrubbed(item) for key, item in value.items()}
+    return value
+
+
+def _public_error_text(text: object) -> str:
+    """``text`` with credentials and home paths redacted, length-capped.
+
+    A JSON body (a plain-text fallback that is really JSON) is scrubbed value
+    by value and re-encoded, for the same backslash reason as ``_scrubbed``."""
+    from core.scrub import scrub_text
+
+    text = str(text)
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        text = json.dumps(_scrubbed(parsed))
+    cleaned = scrub_text(text).strip()
+    if len(cleaned) > _ERROR_DETAIL_MAX_CHARS:
+        cleaned = cleaned[:_ERROR_DETAIL_MAX_CHARS].rstrip() + "…"
+    return cleaned
+
+
+def _backend_error_detail(response) -> "str | None":
+    """The backend's own explanation of a failed response, or None.
+
+    FastAPI errors carry ``detail`` as a string, a structured object (typed
+    errors such as ``model_licence_required`` put the readable text in
+    ``message``) or a list of validation errors (each with a ``msg``). Only a
+    non-empty string counts as readable text; any other shape is rendered as
+    JSON rather than a Python repr. The value came from ``response.json()``,
+    so ``json.dumps`` always accepts it."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not detail:
+        return None
+    if isinstance(detail, str):
+        text = detail
+    elif isinstance(detail, list):
+        text = "; ".join(_readable(item, "msg") for item in detail)
+    else:
+        text = _readable(detail, "message")
+    return _public_error_text(text) or None
+
+
+def _readable(value, text_key: str) -> str:
+    """``value[text_key]`` when it is a non-empty string, else ``value`` as JSON."""
+    text = value.get(text_key) if isinstance(value, dict) else value
+    if isinstance(text, str) and text:
+        return text
+    return json.dumps(_scrubbed(value))
+
+
+def _raise_for_backend_status(response) -> None:
+    """``response.raise_for_status()``, keeping the backend's explanation.
+
+    Raises the same ``httpx.HTTPStatusError`` (with ``.response`` intact) so
+    callers that already catch it keep working; only the message changes.
+    Anything but a 2xx is still refused: the clients do not follow redirects,
+    so a 3xx (a proxy bouncing to HTTPS or a login page) is a failed request,
+    not an empty success."""
+    if response.is_success:
+        return
+    import httpx
+    detail = _backend_error_detail(response) if response.is_error else None
+    if not detail:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            # Legacy query authentication remains a URL channel. Never let a
+            # proxy/redirect error copy that credential into an agent result.
+            # Build the status text without request queries or Location, so
+            # even short or encoded keys never depend on scrubber heuristics.
+            from http import HTTPStatus
+            try:
+                phrase = HTTPStatus(response.status_code).phrase
+            except ValueError:
+                phrase = ""
+            raise httpx.HTTPStatusError(
+                _public_error_text(
+                    f"VoiceStudio returned HTTP {response.status_code} {phrase} for "
+                    f"{response.request.method} {response.request.url.path}"
+                ), request=error.request, response=error.response,
+            ) from None
+
+    raise httpx.HTTPStatusError(
+        f"VoiceStudio returned HTTP {response.status_code} for "
+        f"{response.request.method} {response.request.url.path}: {detail}",
+        request=response.request,
+        response=response,
+    )
+
+
+# A JSON error detail is a few hundred bytes; anything past this is a proxy
+# or HTML error page, not worth holding in the agent process.
+_MAX_ERROR_BODY_BYTES = 64 * 1024
+
+
+async def _buffered_error_response(response):
+    """A buffered copy of a failed *streamed* response, safe to read ``detail`` from.
+
+    Reads at most ``_MAX_ERROR_BODY_BYTES`` of the body. A larger body is
+    dropped (the copy is empty), so ``_raise_for_backend_status`` falls back to
+    the plain status message instead of buffering an unbounded error page.
+    Only the content type is carried over: the chunks are already decoded, so
+    the original Content-Encoding/Length would no longer describe them."""
+    import httpx
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body += chunk
+        if len(body) > _MAX_ERROR_BODY_BYTES:
+            body.clear()
+            break
+    headers = {}
+    if content_type := response.headers.get("content-type"):
+        headers["content-type"] = content_type
+    return httpx.Response(
+        response.status_code,
+        headers=headers,
+        content=bytes(body),
+        request=response.request,
+    )
+
+
+async def _raise_for_streamed_status(response) -> None:
+    """``_raise_for_backend_status`` for a *streamed* response.
+
+    Only a 4xx/5xx body can hold a ``detail``, so only those are buffered
+    (bounded). Anything else that is not a 2xx, such as a redirect, is raised
+    on the original response without touching its body, so a slow body
+    cannot stall the call and the ``Location`` header stays available."""
+    if response.is_error:
+        _raise_for_backend_status(await _buffered_error_response(response))
+    _raise_for_backend_status(response)
 
 
 # ── Output mode + the base path boundary ─────────────────────────────────
@@ -298,10 +466,10 @@ def _env_seconds(name: str, default: float) -> float:
     except ValueError:
         logger.warning("%s=%r is not a number; using %g", name, raw, default)
         return default
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
-def _backend_budget_s(kind: str, text: str = "") -> float | None:
+def _backend_budget_s(kind: str, text: str = "", *, duration_s: float | None = None) -> float | None:
     """The backend's own execution budget for this kind of request, read from
     the environment variables and defaults the backend itself uses.
 
@@ -312,7 +480,8 @@ def _backend_budget_s(kind: str, text: str = "") -> float | None:
     if kind == "transcribe":
         # run_transcribe_guarded starts this clock when the job is submitted,
         # so time spent queued in the pool already counts against it.
-        return _env_seconds("OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S", 300.0)
+        from core.asr_budget import transcribe_budget_s
+        return transcribe_budget_s(duration_s)
     if kind == "generate":
         base = max(
             _env_seconds("OMNIVOICE_GENERATE_TIMEOUT_S", 300.0),
@@ -354,7 +523,7 @@ def _backend_budget_s(kind: str, text: str = "") -> float | None:
     return None
 
 
-def _post_timeout_s(kind: str = "", text: str = "") -> float:
+def _post_timeout_s(kind: str = "", text: str = "", *, duration_s: float | None = None) -> float:
     """Seconds a tool waits on a backend POST.
 
     An explicit OMNIVOICE_MCP_TIMEOUT_S wins. Otherwise the tool waits for the
@@ -364,8 +533,23 @@ def _post_timeout_s(kind: str = "", text: str = "") -> float:
     """
     if os.environ.get("OMNIVOICE_MCP_TIMEOUT_S", "").strip():
         return _env_seconds("OMNIVOICE_MCP_TIMEOUT_S", 120.0)
-    budget = _backend_budget_s(kind, text)
+    budget = _backend_budget_s(kind, text, duration_s=duration_s)
     return 120.0 if budget is None else max(120.0, budget + _BACKEND_GRACE_S)
+
+
+def _uploaded_audio_duration(raw: bytes) -> float | None:
+    """Probe the exact upload, including the base64 lane, outside the event loop."""
+    import tempfile
+    from services.ffmpeg_utils import probe_audio_duration
+
+    from pathlib import Path
+    try:
+        with tempfile.TemporaryDirectory(prefix="voice-mcp-asr-") as scratch:
+            path = Path(scratch) / ("audio" + _sniff_audio_ext(raw))
+            path.write_bytes(raw)
+            return probe_audio_duration(str(path))
+    except OSError:
+        return None
 
 
 def _maybe_number(value):
@@ -425,20 +609,184 @@ def _ensure_mcp():
         msg = (
             f"MCP SDK import failed ({e}). The `mcp` package ships with the "
             "app environment — the launcher's Clean & Retry (or `uv sync`) "
-            "reinstalls it. For a standalone run: pip install 'mcp[cli]'."
+            "reinstalls it. For a standalone run: pip install \"mcp[cli]\"."
         )
         logger.error(msg)
         raise ImportError(msg) from e
+
+
+_DELEGATED_CALLER_HEADER = "X-OmniVoice-Delegated"
+_UNAVAILABLE_CALLER = object()
+
+
+def _current_http_request(server):
+    """The live MCP HTTP request for ``server``, or None on the stdio transport.
+
+    ``server`` is the FastMCP instance the caller was built from, passed in
+    rather than read from a module global: this accessor runs outside
+    ``create_mcp_server``, where the instance only exists as a local name, so a
+    global lookup would raise, get swallowed below, and silently report "no HTTP
+    request" for every HTTP caller. That would drop the delegated marker and
+    hand the caller the loopback tier, which is the bug this whole check exists
+    to prevent, so the binding is pinned by a test.
+
+    Only a successfully read context whose request is None proves the local
+    stdio transport. Missing/broken SDK context is an unresolved caller, never
+    evidence of local privilege.
+    """
+    try:
+        return server.get_context().request_context.request
+    except Exception:
+        logger.debug("MCP request context unavailable", exc_info=True)
+        return _UNAVAILABLE_CALLER
+
+
+def mcp_caller_is_privileged(request) -> bool:
+    """Whether the caller behind ``request`` proved an admin credential.
+
+    ``request is None`` means there is no HTTP request at all — the stdio
+    transport, i.e. a local MCP client — and keeps its existing privileged
+    position. Anything else must prove the master API key or an admin session
+    through a channel the backend itself honours (``Authorization: Bearer``,
+    ``?api_key=``, the ``ov_session`` cookie, or the legacy ``ov_key`` cookie),
+    which is what :func:`core.auth.credential_principal` decides. Cookie-based
+    tool calls also require the inbound Origin and CSRF proof. The share
+    PIN does not count: it is a 6-digit consumption credential (#4128), so a
+    PIN-holding LAN guest lands in the delegated tier below instead of
+    inheriting the loopback tier.
+
+    Never invent a credential channel here. A caller this function wrongly
+    calls privileged is not marked, so an HTTP loopback caller could gain
+    local administrator access. A wrong "yes" escalates privilege; a wrong
+    "no" only refuses.
+    """
+    if request is None:
+        return True
+    if request is _UNAVAILABLE_CALLER:
+        return False
+    try:
+        from core.auth import CredentialTransport, credential_principal
+        from core.csrf import cookie_csrf_allowed
+
+        principal = credential_principal(request)
+        if principal is None:
+            return False
+        if principal.transport in {CredentialTransport.COOKIE, CredentialTransport.LEGACY_COOKIE}:
+            # tools/call is an HTTP POST that can mutate the backend. Never
+            # turn an ambient cookie into the bridge's local operator tier.
+            return cookie_csrf_allowed(request)
+        return True
+    except Exception:
+        # Never let the privilege probe raise inside a tool call — and never
+        # fail open: an unresolved caller is delegated, not privileged.
+        logger.debug("MCP caller privilege probe failed", exc_info=True)
+        return False
+
+
+def _delegated_request_headers(request) -> dict[str, str]:
+    """Extra headers for the in-process backend request behind one tool call.
+
+    Only a caller that could NOT prove an admin credential is marked: the
+    backend then stops treating an HTTP loopback caller as the local operator
+    and asks for a credential like any other remote client. A caller that did
+    prove one retains its actual peer and forwarded credential; the backend's
+    desktop/server-mode rules still apply. The stdio
+    transport has no HTTP request at all and is a local client, so it is never
+    marked.
+    """
+    if mcp_caller_is_privileged(request):
+        return {}
+    try:
+        from api.dependencies import DELEGATED_CALLER_HEADER
+
+        header_name = DELEGATED_CALLER_HEADER
+    except Exception:  # pragma: no cover — the constant is part of the module
+        header_name = _DELEGATED_CALLER_HEADER
+    return {header_name: "1"}
+
+
+def _http_backend_params(request) -> dict[str, str]:
+    """Keep the legacy query channel master-only; do not promote it to Bearer.
+
+    The caller already selected URL authentication. Native clients should use
+    Authorization instead, avoiding keys in request/access-log URLs.
+    """
+    if request is None or request is _UNAVAILABLE_CALLER:
+        return {}
+    key = request.query_params.get("api_key", "").strip()
+    return {"api_key": key} if key else {}
+
+
+def _http_backend_headers(request, base_url: str) -> dict[str, str]:
+    """Forward an HTTP caller's own auth, never the MCP process's operator key.
+
+    A confirmed stdio session is the only caller allowed to use the configured
+    backend key. The marker follows every HTTP caller to a loopback
+    backend, where losing it would turn the bridge back into an administrator.
+    Only recognized credential channels are forwarded; unrelated cookies and
+    headers belong to the inbound request and must not leak to another backend.
+    """
+    from http.cookies import SimpleCookie
+    import ipaddress
+    from urllib.parse import urlsplit
+    from core.auth import (
+        DELEGATED_CONSUMER_HEADER, authorization_credential_present,
+        authorization_header, is_loopback,
+    )
+
+    if request is None:
+        from services.network_share import backend_auth_headers
+        return backend_auth_headers(base_url)
+    # An explicit HTTP backend can be a different installation, even when it
+    # is reached through loopback. Its own credential check is authoritative;
+    # proving this MCP host's key must never borrow that backend's local tier.
+    result = {_DELEGATED_CALLER_HEADER: "1"}
+    if (request is _UNAVAILABLE_CALLER or request.client is None
+            or not is_loopback(request.client.host)):
+        result[DELEGATED_CONSUMER_HEADER] = "1"
+    if request is _UNAVAILABLE_CALLER:
+        return result
+    query = request.query_params
+    cookies = SimpleCookie()
+    for name in ("ov_session", "ov_key", "ov_pin"):
+        value = request.cookies.get(name)
+        if value:
+            cookies[name] = value
+    if authorization_credential_present(request):
+        result["Authorization"] = authorization_header(request)
+    if cookies:
+        result["Cookie"] = cookies.output(header="", sep=";").strip()
+    pin = request.headers.get("x-omnivoice-pin", "").strip() or query.get("pin", "").strip()
+    if pin:
+        result["X-OmniVoice-Pin"] = pin
+    csrf = request.headers.get("x-voicestudio-csrf")
+    if csrf:
+        result["X-VoiceStudio-CSRF"] = csrf
+    origin = request.headers.get("origin")
+    if origin:
+        # Preserve browser proof, without inventing an approved origin or a
+        # CSRF marker for a native caller. The destination validates both.
+        result["Origin"] = origin
+    if any(name in result for name in ("Authorization", "Cookie", "X-OmniVoice-Pin")) or _http_backend_params(request):
+        target = urlsplit(base_url)
+        host = (target.hostname or "").strip("[]")
+        try:
+            loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if target.scheme != "https" and not (target.scheme == "http" and loopback):
+            raise ValueError("Remote MCP backend credentials require HTTPS")
+    return result
 
 
 def create_mcp_server(app=None):
     """Build and return the FastMCP server instance.
 
     ``app`` is the backend ASGI app this server is mounted on. When given,
-    tool calls reach the API in-process as a loopback caller — independent of
-    the bind host/port and never challenged by the share-PIN / API-key gates
-    (which a concrete LAN ``OMNIVOICE_BIND_HOST`` would otherwise trigger).
-    Standalone runs (no app) call the backend over HTTP.
+    tool calls reach the API in-process, preserving the caller's tier rather
+    than borrowing the transport's loopback privilege. Standalone runs (no
+    app), and explicit API URL overrides, reach the backend over HTTP with the
+    caller's own credentials. Confirmed stdio sessions remain local operators.
     """
     FastMCP = _ensure_mcp()
     mcp = FastMCP(
@@ -485,25 +833,55 @@ def create_mcp_server(app=None):
         from services.network_share import backend_self_url
         return backend_self_url()
 
-    def _client(timeout: float):
+    def _client(timeout: float) -> "httpx.AsyncClient":
         import httpx
+        request = _current_http_request(mcp)
         # OMNIVOICE_API_URL is an explicit "send tool calls there" override.
         if app is not None and not os.environ.get("OMNIVOICE_API_URL", "").strip():
-            return httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 0)),
-                base_url="http://127.0.0.1",
-                timeout=timeout,
+            # HTTP re-entry must preserve the real peer and credentials for
+            # consumer gates too; an admin-only marker cannot stop a forged
+            # loopback peer from bypassing require_consumer. Only confirmed
+            # stdio is a local process. Missing SDK context has no trusted peer.
+            peer = None
+            base = "http://127.0.0.1"
+            if request is None:
+                peer = ("127.0.0.1", 0)
+            elif request is not _UNAVAILABLE_CALLER and request.client is not None:
+                peer = (request.client.host, request.client.port)
+            if request is not None and request is not _UNAVAILABLE_CALLER:
+                # Origin/CSRF checks must see the original destination too,
+                # including a nondefault port. No network uses this URL.
+                from core.csrf import effective_scheme
+                base = str(request.url.replace(
+                    scheme=effective_scheme(request), path="/", query="", fragment="",
+                ))
+            from core.auth import DELEGATED_CONSUMER_HEADER
+
+            headers = (
+                _http_backend_headers(request, "http://127.0.0.1")
+                if request is not None else {}
             )
-        from services.network_share import backend_auth_headers
+            # Here the socket peer already represents the original caller.
+            headers.pop(DELEGATED_CONSUMER_HEADER, None)
+            headers.pop(_DELEGATED_CALLER_HEADER, None)
+            headers.update(_delegated_request_headers(request))
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, client=peer),
+                base_url=base,
+                timeout=timeout,
+                headers=headers,
+                params=_http_backend_params(request),
+            )
         base = _api_base()
         return httpx.AsyncClient(
-            base_url=base, timeout=timeout, headers=backend_auth_headers(base)
+            base_url=base, timeout=timeout, headers=_http_backend_headers(request, base),
+            params=_http_backend_params(request),
         )
 
     async def _api_get(path: str):
         async with _client(30) as c:
             r = await c.get(path)
-            r.raise_for_status()
+            _raise_for_backend_status(r)
             return r.json()
 
     async def _api_post_form(
@@ -512,14 +890,14 @@ def create_mcp_server(app=None):
         wait = _post_timeout_s() if timeout is None else timeout
         async with _client(wait) as c:
             r = await c.post(path, data=data, files=files or {})
-            r.raise_for_status()
+            _raise_for_backend_status(r)
             return r
 
     async def _submit_json(path: str, body: dict):
         timeout = _post_timeout_s()
         async with _client(timeout) as client:
             response = await client.post(path, json=body)
-            response.raise_for_status()
+            _raise_for_backend_status(response)
             decoded = response.json()
         return decoded
 
@@ -535,12 +913,12 @@ def create_mcp_server(app=None):
         Streamable-HTTP transport; stdio clients (and any version where the
         accessor differs) simply resolve to None and use the backend's
         default voice."""
-        try:
-            req = mcp.get_context().request_context.request
-            if req is not None:
-                return req.headers.get("x-omnivoice-client-id")
-        except Exception:
-            pass
+        request = _current_http_request(mcp)
+        if request is not None:
+            try:
+                return request.headers.get("x-omnivoice-client-id")
+            except Exception:
+                pass
         return None
 
     @mcp.tool()
@@ -621,7 +999,7 @@ def create_mcp_server(app=None):
             # buffering another full audio copy in the agent process.
             async with _client(300) as c:
                 async with c.stream("GET", f"/audio/{audio_id}.{format}") as encoded:
-                    encoded.raise_for_status()
+                    await _raise_for_streamed_status(encoded)
 
         return json.dumps(await _speech_result(
             audio_id, gen_time, duration, r.content, _api_base(), format
@@ -692,11 +1070,15 @@ def create_mcp_server(app=None):
         data = {}
         if language:
             data["language"] = language
+        import asyncio
+        duration_s = None
+        if not os.environ.get("OMNIVOICE_MCP_TIMEOUT_S", "").strip():
+            duration_s = await asyncio.to_thread(_uploaded_audio_duration, raw)
         r = await _api_post_form(
             "/transcribe", data=data,
             files={"audio": (f"audio{_sniff_audio_ext(raw)}", raw,
                              "application/octet-stream")},
-            timeout=_post_timeout_s("transcribe"),
+            timeout=_post_timeout_s("transcribe", duration_s=duration_s),
         )
         return json.dumps(r.json())
 
@@ -780,12 +1162,10 @@ def create_mcp_server(app=None):
             # Cloning commonly fails validation (duplicate name, audio too
             # short, quality gate) — surface the backend's own detail as the
             # structured error the agent expects, not a framework traceback.
-            try:
-                detail = exc.response.json().get("detail")
-            except ValueError:
-                detail = None
-            return json.dumps({"error": str(detail or exc.response.text
-                                             or f"HTTP {exc.response.status_code}")})
+            detail = _backend_error_detail(exc.response)
+            return json.dumps({"error": detail
+                                        or _public_error_text(exc.response.text)
+                                        or f"HTTP {exc.response.status_code}"})
         except (httpx.HTTPError, ValueError) as exc:
             # Transport failures + non-JSON success bodies (proxy error page).
             return json.dumps({"error": f"backend request failed: {exc}"})
@@ -860,16 +1240,12 @@ def create_mcp_server(app=None):
                 timeout=_post_timeout_s("generate"),
             )
         except httpx.HTTPStatusError as status_error:
-            try:
-                backend_detail = status_error.response.json().get("detail")
-            except ValueError:
-                backend_detail = None
             explanation = (
-                backend_detail
-                or status_error.response.text
+                _backend_error_detail(status_error.response)
+                or _public_error_text(status_error.response.text)
                 or f"HTTP {status_error.response.status_code}"
             )
-            return json.dumps({"error": str(explanation)})
+            return json.dumps({"error": explanation})
         except httpx.HTTPError as request_error:
             return _request_failure(request_error)
 
@@ -973,7 +1349,9 @@ def main():
 
     if args.sse:
         logger.info("Starting MCP server on SSE transport, port %d", args.port)
-        mcp.run(transport="sse", port=args.port)
+        # FastMCP.run() takes no port: the SSE server listens on settings.port.
+        mcp.settings.port = args.port
+        mcp.run(transport="sse")
     else:
         logger.info("Starting MCP server on stdio transport")
         mcp.run(transport="stdio")

@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { composeBugReportUrl } from '@shared/utils/bugReportDocument';
 import { formatBreadcrumbs } from '@shared/utils/breadcrumbs';
 import { contactAge, lastBackendContact } from '@shared/utils/backendContact';
-import { clampCrashTail } from '@shared/utils/crashReport';
+import { clampCrashTail, nativeCrashExcerpt } from '@shared/utils/crashReport';
 import { scrubText } from '@shared/utils/scrub';
 import { formatHostSnapshot, withDeadline } from '@shared/utils/hostSnapshot';
 import { collapseRepeatedLines, formatFailureFacts } from '@shared/utils/installFailure';
@@ -79,7 +79,16 @@ function reachabilitySection(
   return lines;
 }
 
-export function ReportBug({ error, setup = false }: { error?: Error | string; setup?: boolean }) {
+export function ReportBug({
+  error,
+  setup = false,
+  variant = 'outline',
+}: {
+  error?: Error | string;
+  setup?: boolean;
+  /** `ghost` when it sits in a row of plain help links. */
+  variant?: 'outline' | 'ghost';
+}) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -220,6 +229,7 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
       if (engines.status === 'fulfilled' && engines.value.asr?.active)
         context.push('ASR: ' + scrubText(String(engines.value.asr.active)));
       const failure = backend && ['failed', 'crashed', 'port_in_use'].includes(backend.stage);
+      const nativeFailureFacts: string[] = [];
       const crashSection = failure
         ? [
             '## Current backend failure',
@@ -227,7 +237,7 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
             'Stage: ' + backend.stage,
             'Managed: ' + backend.managed,
             ...(backend.exitCode != null
-              ? ['Exit code: ' + describeExitCode(backend.exitCode)]
+              ? ['Exit code: ' + describeExitCode(backend.exitCode, undefined, backend.logTail)]
               : []),
             ...(backend.exitSignal ? ['Signal: ' + backend.exitSignal] : []),
             ...(isNativeFaultExit({
@@ -246,12 +256,13 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
         : [];
       if (backend?.lastCrash) {
         const crash = backend.lastCrash;
-        crashSection.push(
+        const dump = scrubText(crash.logTail.join('\n'));
+        const section = [
           '## Last native backend exit',
           '',
           'Detected: ' + new Date(crash.timestamp).toISOString(),
           'Version: ' + crash.version,
-          'Exit code: ' + describeExitCode(crash.exitCode, t('common.unknown')),
+          'Exit code: ' + describeExitCode(crash.exitCode, t('common.unknown'), crash.logTail),
           'Signal: ' + (crash.signal ?? '—'),
           ...(isNativeFaultExit({ exitCode: crash.exitCode, signal: crash.signal })
             ? [t('reportBug.native_fault_cause')]
@@ -259,10 +270,20 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
           'Uptime (seconds): ' + Math.round(crash.uptimeMs / 1000),
           ...formatCrashContext(crash.context),
           '```',
-          clampCrashTail(scrubText(crash.logTail.join('\n'))),
+          clampCrashTail(dump),
           '```',
           '',
-        );
+        ];
+        // The journal already leads with the faulting thread. Keep that
+        // bounded evidence ahead of verbose status/error tails when it belongs
+        // to this native exit, rather than losing it to the report URL cap.
+        const currentNativeExit =
+          failure &&
+          (backend.exitCode ?? null) === crash.exitCode &&
+          (backend.exitSignal ?? null) === (crash.signal ?? null) &&
+          isNativeFaultExit({ exitCode: crash.exitCode, signal: crash.signal });
+        if (currentNativeExit && nativeCrashExcerpt(dump)) nativeFailureFacts.push(...section);
+        else crashSection.push(...section);
       }
       if (previous.status === 'fulfilled' && previous.value.record) {
         const marker = _adaptLastRunCrash(previous.value.record, previous.value.acknowledged);
@@ -295,9 +316,12 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
           ? `[Install] ${installFailure.code}: ${shortSummary}`
           : `[Bug] ${shortSummary}`,
         labels: installFailure ? 'bug,install' : 'bug',
-        factsSection: installFailure
-          ? formatFailureFacts(installFailure).map((line) => scrubText(line))
-          : [],
+        factsSection: [
+          ...(installFailure
+            ? formatFailureFacts(installFailure).map((line) => scrubText(line))
+            : []),
+          ...nativeFailureFacts,
+        ],
         error,
         ctx: context.join('\n'),
         crashSection,
@@ -319,7 +343,7 @@ export function ReportBug({ error, setup = false }: { error?: Error | string; se
     <>
       <div className="space-y-2">
         <Button
-          variant="outline"
+          variant={variant}
           size="sm"
           disabled={busy}
           title={t('reportBug.title')}

@@ -29,6 +29,26 @@ const mocks = vi.hoisted(() => ({
   hosts: vi.fn(async () => new Map<string, string>()),
 }));
 vi.mock('electron', () => ({ app: { isPackaged: true, getPath: () => '/private/voicestudio' } }));
+// The setup screen's hardware line follows the torch choice in the environment.
+// Probes stay pending until a test settles them, so a race can be ordered.
+const hardwareProbes = vi.hoisted(
+  () => [] as { variant: string | undefined; resolve: (value: unknown) => void }[],
+);
+vi.mock('./setup-hardware', () => ({
+  detectSetupHardware: () =>
+    new Promise((resolve) =>
+      hardwareProbes.push({ variant: process.env.OMNIVOICE_TORCH_VARIANT, resolve }),
+    ),
+}));
+/** Settles pending probes newest first, so an older (stale) result lands last. */
+function settleHardwareProbes() {
+  for (const probe of hardwareProbes.splice(0).reverse())
+    probe.resolve(
+      probe.variant === 'cpu'
+        ? { build: 'cpu', reason: 'explicit' }
+        : { gpu: 'NVIDIA Test GPU', build: 'cuda' },
+    );
+}
 vi.mock('node:child_process', () => ({ spawn: mocks.spawn, spawnSync: vi.fn() }));
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
@@ -66,7 +86,8 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 vi.mock('node:fs/promises', () => ({ rm: mocks.rm }));
-vi.mock('./runtime-project', () => ({
+vi.mock('./runtime-project', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./runtime-project')>()),
   MISSING_SYSTEM_LIBRARY_CODE: 'MISSING_SYSTEM_LIBRARY',
   OUTDATED_SYSTEM_LIBRARY_CODE: 'OUTDATED_SYSTEM_LIBRARY',
   RUNTIME_FILES_LOCKED_CODE: 'RUNTIME_FILES_LOCKED',
@@ -97,6 +118,7 @@ vi.mock('./setup-downloads', async (importOriginal) => ({
 }));
 import {
   BackendSupervisor,
+  bundledGgufBinPath,
   bundledUvPath,
   bundledWebUiPath,
   isExpectedPipeClose,
@@ -177,6 +199,61 @@ it('reports a resumable runtime when startup finds an interrupted install marker
   await supervisor.shutdown();
 });
 
+it('keeps setup status readable for Windows ARM64 with an unsupported ROCm override', async () => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+  vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64');
+  vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'rocm');
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('no backend');
+    }),
+  );
+  const supervisor = new BackendSupervisor();
+  try {
+    await supervisor.start();
+    expect(supervisor.status.stage).toBe('setup_required');
+    expect(supervisor.status.setupRequiredGib).toBe(9);
+    expect(mocks.install).not.toHaveBeenCalled();
+  } finally {
+    await supervisor.shutdown();
+  }
+});
+
+it('waits for a terminal-owned backend during startup without spawning or staging', async () => {
+  vi.useFakeTimers();
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  let ready = false;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ status: ready ? 'ok' : 'starting', version: 'test' }), {
+          status: ready ? 200 : 503,
+          headers: { 'x-omnivoice-backend': 'test' },
+        }),
+    ),
+  );
+  const supervisor = new BackendSupervisor();
+  try {
+    await supervisor.start();
+    expect(supervisor.status.stage).toBe('attaching');
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(mocks.stage).not.toHaveBeenCalled();
+    ready = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(supervisor.status.stage).toBe('ready');
+    expect(supervisor.status.managed).toBe(false);
+    await supervisor.shutdown();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  } finally {
+    await supervisor.shutdown();
+    vi.useRealTimers();
+  }
+});
+
 it('publishes packaged startup preflight failures instead of rejecting startup', async () => {
   vi.stubGlobal(
     'fetch',
@@ -210,12 +287,24 @@ it('passes a live nested-operation drain descriptor to POSIX managed backends', 
   expect(windows.env.OMNIVOICE_DESKTOP_DRAIN_FD).toBeUndefined();
 });
 
-it('passes the packaged analytics destination to its managed backend', () => {
-  vi.stubGlobal('__POSTHOG_PROJECT_TOKEN__', 'publishable-test-key');
-  vi.stubGlobal('__POSTHOG_HOST__', 'https://us.i.posthog.com');
-  const { env } = managedBackendSpawnOptions(3900);
-  expect(env.POSTHOG_PROJECT_TOKEN).toBe('publishable-test-key');
-  expect(env.POSTHOG_HOST).toBe('https://us.i.posthog.com');
+it('leaves the serial weight-load default to the backend so .env can override it', () => {
+  const saved = process.env.HF_DEACTIVATE_ASYNC_LOAD;
+  try {
+    delete process.env.HF_DEACTIVATE_ASYNC_LOAD;
+    for (const platform of ['win32', 'linux', 'darwin'] as const) {
+      const env = managedBackendSpawnOptions(3900, 'auto', platform).env;
+      expect(env.HF_DEACTIVATE_ASYNC_LOAD).toBeUndefined();
+    }
+    // An inherited value passes through once, never duplicated under another casing.
+    process.env.HF_DEACTIVATE_ASYNC_LOAD = '0';
+    const env = managedBackendSpawnOptions(3900, 'auto', 'win32').env;
+    const keys = Object.keys(env).filter((k) => k.toUpperCase() === 'HF_DEACTIVATE_ASYNC_LOAD');
+    expect(keys).toHaveLength(1);
+    expect(env.HF_DEACTIVATE_ASYNC_LOAD).toBe('0');
+  } finally {
+    if (saved === undefined) delete process.env.HF_DEACTIVATE_ASYNC_LOAD;
+    else process.env.HF_DEACTIVATE_ASYNC_LOAD = saved;
+  }
 });
 
 it('recognizes only expected child-pipe close errors', () => {
@@ -954,6 +1043,24 @@ it('keeps a web UI directory the user pinned themselves', () => {
   expect(managedBackendSpawnOptions(3900).env.OMNIVOICE_FRONTEND_DIST).toBe('/custom/web');
 });
 
+it('points the GGUF engine at the runtime packaged with this app version', () => {
+  // #4051: the backend runs from a staged copy of backend/ that has no bin/.
+  vi.stubEnv('OMNIVOICE_GGUF_BIN_DIR', '');
+  stubResourcesPath(join('/opt', 'VoiceStudio', 'resources'));
+
+  const { env } = managedBackendSpawnOptions(3900);
+
+  expect(env.OMNIVOICE_GGUF_BIN_DIR).toBe(join('/opt', 'VoiceStudio', 'resources', 'bin'));
+  expect(bundledGgufBinPath()).toBe(env.OMNIVOICE_GGUF_BIN_DIR);
+});
+
+it('keeps a GGUF runtime directory the user pinned themselves', () => {
+  vi.stubEnv('OMNIVOICE_GGUF_BIN_DIR', '/custom/bin');
+  stubResourcesPath(join('/opt', 'VoiceStudio', 'resources'));
+
+  expect(managedBackendSpawnOptions(3900).env.OMNIVOICE_GGUF_BIN_DIR).toBe('/custom/bin');
+});
+
 it('exposes the current process signal separately from the durable crash journal', async () => {
   vi.useFakeTimers();
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
@@ -1093,6 +1200,11 @@ describe('falling back to the CPU build', () => {
 
     expect(variants.at(-1)).toBe('cpu');
     expect(mocks.saveTorchVariant).toHaveBeenCalledWith('cpu');
+    // The CPU attempt failed too; the next retry installs CPU, so say so, even
+    // when the probe started for the CUDA attempt finishes after the switch.
+    void supervisor.status;
+    settleHardwareProbes();
+    await vi.waitFor(() => expect(supervisor.status.setupHardware?.build).toBe('cpu'));
   });
 
   it('stops a stuck download first, so the CPU install can start', async () => {
@@ -1197,9 +1309,7 @@ describe('falling back to the CPU build', () => {
       }),
     );
     let finish = () => {};
-    mocks.install.mockImplementation(
-      () => new Promise<void>((resolve) => (finish = resolve)),
-    );
+    mocks.install.mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
     const supervisor = new BackendSupervisor();
     onTestFinished(() => supervisor.shutdown());
     await supervisor.start();
@@ -1357,6 +1467,78 @@ describe('falling back to the CPU build', () => {
   });
 });
 
+it('reports the failed dependency host instead of the earlier large Torch download', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('no backend')));
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  mocks.hosts.mockResolvedValue(new Map([['torch', 'download-r2.pytorch.org']]));
+  let supervisor: BackendSupervisor;
+  mocks.install.mockImplementation(async () => {
+    const internal = supervisor as unknown as {
+      pushLog(stream: 'out' | 'err', line: string, fromChild?: boolean): void;
+    };
+    internal.pushLog('err', 'Downloading torch (3.2 GiB)', true);
+    internal.pushLog('err', 'torch 3.0 GiB/3.2 GiB', true);
+    internal.pushLog('err', 'Failed to fetch:', true);
+    internal.pushLog(
+      'err',
+      '  `https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz`',
+      true,
+    );
+    internal.pushLog(
+      'err',
+      'error sending request for url (https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz)',
+      true,
+    );
+    internal.pushLog('err', 'dns error: No such host is known. (os error 11001)', true);
+    throw new Error(
+      'A download server returned a temporary error (Runtime setup exited with code 1).',
+      {
+        cause: Object.assign(new Error('Runtime setup exited with code 1'), {
+          stderr:
+            'error sending request for url (https://files.pythonhosted.org/packages/hash/antlr4-python3-runtime-4.9.3.tar.gz)\ndns error',
+        }),
+      },
+    );
+  });
+  supervisor = new BackendSupervisor();
+  onTestFinished(() => supervisor.shutdown());
+  await supervisor.start();
+  await supervisor.setupRuntime();
+  expect(supervisor.status.failure?.downloadHost).toBe('files.pythonhosted.org');
+  expect(supervisor.status.failure?.downloadedBytes).toBeUndefined();
+});
+
+it('reports a later mirror stall using its current host rather than an earlier failure', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('no backend')));
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+  mocks.hosts.mockResolvedValue(new Map([['scipy', 'mirrors.aliyun.com']]));
+  let supervisor: BackendSupervisor;
+  mocks.install.mockImplementation(async () => {
+    const internal = supervisor as unknown as {
+      pushLog(stream: 'out' | 'err', line: string, fromChild?: boolean): void;
+    };
+    internal.pushLog(
+      'err',
+      'error sending request for url (https://files.pythonhosted.org/packages/first.whl)',
+      true,
+    );
+    internal.pushLog('err', 'Downloading scipy (10 MiB)', true);
+    internal.pushLog('err', 'scipy 5 MiB/10 MiB', true);
+    throw Object.assign(
+      new Error('Download timed out: no data for 120 s from mirrors.aliyun.com'),
+      { code: 'DOWNLOAD_STALLED' },
+    );
+  });
+  supervisor = new BackendSupervisor();
+  onTestFinished(() => supervisor.shutdown());
+  await supervisor.start();
+  await supervisor.setupRuntime();
+  expect(supervisor.status.failure?.downloadHost).toBe('mirrors.aliyun.com');
+  expect(supervisor.status.failure?.downloadedBytes).toBe(5 * 1024 ** 2);
+});
+
 it('does not take crash context from a backend process that was replaced', async () => {
   const { PassThrough } = await import('node:stream');
   const supervisor = new BackendSupervisor();
@@ -1378,3 +1560,27 @@ it('does not take crash context from a backend process that was replaced', async
 
   expect(capture).toHaveBeenCalledOnce();
 });
+
+// The requirement must be available before any install attempt, not just ENOSPC.
+it.each(['darwin', 'win32', 'linux'] as const)(
+  'publishes the CPU runtime disk requirement on %s before installation',
+  async (platform) => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue(platform);
+    vi.spyOn(process, 'arch', 'get').mockReturnValue(platform === 'darwin' ? 'arm64' : 'x64');
+    vi.stubEnv('OMNIVOICE_TORCH_VARIANT', 'cpu');
+    vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+    vi.stubEnv('VOICESTUDIO_SKIP_BACKEND', '');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('no backend');
+      }),
+    );
+    const supervisor = new BackendSupervisor();
+    await supervisor.start();
+    expect(supervisor.status.stage).toBe('setup_required');
+    expect(supervisor.status.setupRequiredGib).toBe(5);
+    expect(mocks.install).not.toHaveBeenCalled();
+    await supervisor.shutdown();
+  },
+);

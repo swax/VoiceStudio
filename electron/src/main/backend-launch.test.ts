@@ -9,6 +9,15 @@ const state = vi.hoisted(() => ({
   checkout: true,
   bundledOnly: false,
   bundledManifestMissing: false,
+  selected: null as string | null,
+}));
+const validateSelected = vi.hoisted(() =>
+  vi.fn(async (pythonPath: string, _cwd: string) => ({ ok: true, pythonPath })),
+);
+vi.mock('./runtime-python-selection', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./runtime-python-selection')>()),
+  selectedPythonPath: () => state.selected,
+  validatePythonRuntime: validateSelected,
 }));
 vi.mock('./distribution', () => ({
   runtimeSetupSupported: () => !state.bundledOnly,
@@ -51,6 +60,8 @@ vi.mock('./runtime-project', async (importOriginal) => ({
     return state.ready;
   }),
 }));
+const healPth = vi.hoisted(() => vi.fn(async (_venv: string): Promise<string[]> => []));
+vi.mock('./pth-ascii', () => ({ asciiSafePthFiles: healPth }));
 vi.mock('./legacy-storage', () => ({
   legacyStorageEnv: () => ({
     OMNIVOICE_DATA_DIR: '/legacy/data',
@@ -78,6 +89,10 @@ afterEach(() => {
   state.checkout = true;
   state.bundledOnly = false;
   state.bundledManifestMissing = false;
+  state.selected = null;
+  validateSelected.mockClear();
+  healPth.mockReset();
+  healPth.mockResolvedValue([]);
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
@@ -134,6 +149,20 @@ it('keeps host diagnostics available when a store package has no local interpret
   expect(facts.ramGb).toBeGreaterThan(0);
   expect(facts.runtime.pythonPresent).toBeNull();
 });
+it('runs a selected interpreter against bundled resources, never the absent managed project', async () => {
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  state.packaged = true;
+  state.selected = '/existing/bin/python';
+  const original = process.resourcesPath;
+  Object.defineProperty(process, 'resourcesPath', { configurable: true, value: '/packaged/resources' });
+  try {
+    const plan = await resolveSpawnPlan(3912, '/missing/managed/project');
+    expect(plan).toMatchObject({ cwd: '/packaged/resources' });
+    expect(validateSelected).toHaveBeenCalledWith('/existing/bin/python', '/packaged/resources');
+  } finally {
+    Object.defineProperty(process, 'resourcesPath', { configurable: true, value: original });
+  }
+});
 it.each(['darwin', 'win32', 'linux'] as const)(
   'leaves China downloads eligible for automatic failover on %s',
   (platform) => {
@@ -160,6 +189,19 @@ it('launches the prepared source interpreter without syncing or downloading depe
   );
   expect(plan.argv.slice(1, 3)).toEqual(['-m', 'uvicorn']);
   expect(plan.argv.slice(-2)).toEqual(['--port', '3912']);
+});
+it('heals a source checkout .venv before probing it, and tolerates a failed heal (#1783)', async () => {
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
+  const { runtimeDependenciesReady } = await import('./runtime-project');
+  const probe = vi.mocked(runtimeDependenciesReady);
+  probe.mockClear();
+  await resolveSpawnPlan(3912);
+  expect(healPth).toHaveBeenCalledWith(join(resolve('/repo'), '.venv'));
+  if (probe.mock.calls.length) {
+    expect(healPth.mock.invocationCallOrder[0]).toBeLessThan(probe.mock.invocationCallOrder[0]);
+  }
+  healPth.mockRejectedValueOnce(new Error('read-only'));
+  expect(await resolveSpawnPlan(3912)).toHaveProperty('argv');
 });
 it('requires explicit source setup when no environment exists, even with uv installed', async () => {
   vi.stubEnv('OMNIVOICE_BACKEND_CMD', '');
@@ -242,6 +284,50 @@ it('sends an Intel Mac checkout to a remote backend instead of setup:api (#3584)
   // An explicit backend command still wins on any host.
   vi.stubEnv('OMNIVOICE_BACKEND_CMD', '["custom-python"]');
   expect(await resolveSpawnPlan(3900, undefined, 'unsupported_platform')).toHaveProperty('argv');
+});
+
+it('restarts a crashed engine on CPU through the stored Settings choice', async () => {
+  const { BackendSupervisor, backendDataDir } = await import('./backend');
+  const { mkdtempSync, readFileSync } = await vi.importActual<typeof import('node:fs')>('node:fs');
+  const data = mkdtempSync(join(tmpdir(), 'voice-cpu-'));
+  const supervisor = new BackendSupervisor();
+  const internals = supervisor as unknown as {
+    stage: string;
+    managed: boolean;
+    launchLog: { env: NodeJS.ProcessEnv; cwd: string; startedAt: number } | null;
+  };
+  const restart = vi.spyOn(supervisor, 'restart').mockResolvedValue(undefined);
+  internals.stage = 'crashed';
+  internals.managed = true;
+  internals.launchLog = { env: { OMNIVOICE_DATA_DIR: data }, cwd: data, startedAt: 1 };
+  expect(backendDataDir(internals.launchLog)).toBe(resolve(data));
+  expect(supervisor.status.cpuRestartAvailable).toBe(true);
+
+  await supervisor.restartOnCpu();
+  expect(JSON.parse(readFileSync(join(data, 'prefs.json'), 'utf8'))).toEqual({
+    compute_device: 'cpu',
+  });
+  expect(restart).toHaveBeenCalledTimes(1);
+
+  // OMNIVOICE_DEVICE overrides Settings, so writing them could not help.
+  internals.launchLog = {
+    env: { OMNIVOICE_DATA_DIR: data, OMNIVOICE_DEVICE: 'cuda' },
+    cwd: data,
+    startedAt: 1,
+  };
+  expect(supervisor.status.cpuRestartAvailable).toBeUndefined();
+  await expect(supervisor.restartOnCpu()).rejects.toThrow();
+  // A custom backend command may not read VoiceStudio's settings.
+  internals.launchLog = { env: { OMNIVOICE_DATA_DIR: data }, cwd: data, startedAt: 1 };
+  vi.stubEnv('OMNIVOICE_BACKEND_CMD', '["custom-python", "server.py"]');
+  expect(supervisor.status.cpuRestartAvailable).toBeUndefined();
+  await expect(supervisor.restartOnCpu()).rejects.toThrow();
+  vi.unstubAllEnvs();
+  expect(supervisor.status.cpuRestartAvailable).toBe(true);
+  // Only after a crash of our own engine.
+  internals.stage = 'failed';
+  expect(supervisor.status.cpuRestartAvailable).toBeUndefined();
+  expect(restart).toHaveBeenCalledTimes(1);
 });
 
 it('keeps native fault frames when the production log ring overflows', async () => {

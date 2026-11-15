@@ -88,7 +88,11 @@ The `context` values must match the check names shown on a pull request:
   the current base SHA; synchronize the PR with `main` to obtain a fresh run.
 - `CLA gate`: the native job in `.github/workflows/cla.yml`, required from
   GitHub Actions. Pull-request events run this job even when an API call fails,
-  so rejected status writes cannot leave the merge gate green.
+  so rejected status writes cannot leave the merge gate green. It also holds a
+  pull request whose opener has not signed: it converts it to a draft and, once
+  they sign, marks it ready and re-runs the CI that skipped. Its `GITHUB_TOKEN`
+  does this with `pull-requests: write` and `actions: write`; no setting or
+  extra token is needed.
 - `CLA`: the commit status that `.github/scripts/cla_check.py` sets on the
   pull request's head commit. It checks signature eligibility; the native job
   alone can succeed while contributors still need to sign. Require both.
@@ -196,10 +200,9 @@ gh api --method PATCH repos/debpalash/VoiceStudio --input - <<'JSON'
 JSON
 ```
 
-The PostHog project token committed in `backend/core/analytics.py` and
-`electron/src/shared/utils/analytics.ts` is a publishable write-only token by
-design (see `tests/test_no_committed_analytics_token.py`). If an alert flags it,
-close the alert as "used in tests" or "false positive". Do not remove the token.
+The Supermetry site id in `config/analytics.json` is public by design and is not
+a credential (see `tests/test_no_committed_analytics_token.py`, which bans any
+dashboard or API key). If an alert flags it, close it as "false positive".
 
 ## Private vulnerability reporting
 

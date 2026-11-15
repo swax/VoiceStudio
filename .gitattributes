@@ -6,6 +6,11 @@ mobile/android/app/src/main/assets/licenses/*.txt text eol=lf
 # Bundled model text assets are byte-pinned in mobile/contract/models.source.json.
 mobile/contract/tts/*.txt text eol=lf
 
+# Bun's generated mobile contracts are checked byte-for-byte on every platform.
+mobile/contract/*.json text eol=lf
+mobile/ios/VoiceStudioKit/Sources/VoiceStudioKit/Theme/Tokens.generated.swift text eol=lf
+mobile/android/core/designsystem/src/main/kotlin/com/voicestudio/mobile/designsystem/Tokens.generated.kt text eol=lf
+
 # Windows batch files break goto/labels with LF endings.
 *.bat text eol=crlf
 

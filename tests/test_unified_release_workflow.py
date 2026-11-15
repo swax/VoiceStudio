@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def workflow(name):
-    data = yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
+    data = yaml.safe_load((ROOT / '.github/workflows' / name).read_text(encoding="utf-8"))
     data['on'] = data.pop(True, data.get('on'))
     return data
 
@@ -16,7 +16,7 @@ def test_release_waits_for_both_phones_at_the_same_tag():
     assert 'mobile' in jobs['release']['needs']
     mobile = jobs['mobile']
     assert mobile['uses'] == './.github/workflows/mobile-release.yml'
-    assert mobile['with']['release_ref'] == '${{ inputs.release_tag || github.ref_name }}'
+    assert mobile['with']['release_ref'] == '${{ inputs.rehearsal && github.sha || inputs.release_tag || github.ref_name }}'
     called = workflow('mobile-release.yml')
     assert 'workflow_call' in called['on']
     for platform in ('android', 'ios'):

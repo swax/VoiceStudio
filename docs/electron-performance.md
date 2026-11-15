@@ -25,6 +25,8 @@ During synthesis, the fixed-width primary action polls the existing model-status
 
 The backend publishes explicit model lifecycle transitions to the renderer event stream. Engine Ready refreshes immediately from those events and keeps one-second polling only while work is active; idle model, worker, batch, performance-profile and diarisation checks back off to bounded 15–30 second recovery intervals.
 
+Idle CPU: a hidden or minimised window skips interval polling and on-screen clocks. Query polling is pinned to `refetchIntervalInBackground: false` in the shared query client, and elapsed-time clocks and the cloud-sync pull use `useVisibleInterval` / `startVisibleInterval` (`lib/visible-interval.ts`), which clear their timers while hidden and refresh once on show. Deliberately unchanged, so they still run while hidden: job progress while a job runs, recording and streaming timers, the update-check schedule, folder watching, and the idle-shutdown timer.
+
 `electron/tests/performance-settings-smoke.mjs` checks saved/active separation, failed saves, environment pinning, unavailable devices, the platform guard, budget validation and external overrides with mocked contracts. Live read-only checks verified the compute, compile and hardware response schemas. Tests did not change the user's device, optimization or timeout preferences. Native hardware behavior on macOS/Linux still requires platform verification.
 
 ## Speed and quality presets
@@ -61,3 +63,7 @@ Reference mode fails closed if local installation cannot be verified, including 
 
 When dedicated GPU capacity is unavailable, the planner still considers installed
 CPU-only candidates within the RAM budget. It does not assume GPU models fit.
+
+## Long lists
+
+Lists that grow without a bound mount only the rows in view once they pass 100 items: Recent takes and saved voices (Clone), the Projects list and grid views, dub projects and the Transcribe history. They share `components/virtual-list.tsx`, which keeps real `ul`/`li` semantics, measures rows so inline confirmations keep their height, and scrolls the active row into view. Shorter lists render every row. `VirtualGrid` (same module) does the same for the Projects grid: it measures its width, derives the column count with the CSS grid's rule (280 px minimum card, 12 px gap), and virtualises whole rows. The gallery and community catalogues (paged 60 and 100 at a time) and the batch job list (capped at 100) stay fully rendered.

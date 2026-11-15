@@ -6,12 +6,14 @@ import os
 import re
 import uuid
 import weakref
+import tempfile
 import time
 import shutil
 import threading
 from datetime import datetime, timezone
 from typing import Literal, Optional
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, HTTPException
+from api.dependencies import consumer_generation, require_consumer_reads_admin_writes, require_admin_media_action
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -24,11 +26,12 @@ from omnivoice.utils.voice_design import heal_design_instruct, sanitize_instruct
 from core.media_types import media_upload_suffix
 from core.path_security import UnsafePath, resolve_within
 from services.reference_transcript import take_reference_transcript
+from services.reference_wav import prune_reference_copies
 from core.profile_images import MAX_IMAGE_BYTES, normalize_portrait
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from core.path_security import upload_suffix
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_consumer_reads_admin_writes)])
 logger = logging.getLogger("omnivoice.profiles")
 
 
@@ -121,6 +124,7 @@ _DESIGN_SEED = 42  # deterministic sample render, same as archetype previews
 
 
 @router.post("/profiles")
+@consumer_generation
 async def create_profile(
     name: str = Form(...),
     ref_audio: Optional[UploadFile] = File(None),
@@ -231,8 +235,15 @@ async def create_profile(
         audio_path = os.path.join(VOICES_DIR, audio_filename)
         # Storage can be removed after startup; recover before persisting uploads.
         os.makedirs(VOICES_DIR, exist_ok=True)
-        with open(audio_path, "wb") as f:
-            f.write(await ref_audio.read())
+        # Stream with the same cap the replace-audio route enforces: this
+        # route is open to PIN-paired consumers, so an unbounded read would
+        # let one request exhaust memory/disk.
+        try:
+            await _save_upload(ref_audio, audio_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(audio_path)
+            raise
         # A clone needs speech to copy: refuse a reference with no audio
         # stream (a silent screen recording, a video-only WebM) at save time
         # instead of failing every later generation with it.
@@ -593,6 +604,8 @@ def sweep_retired_voice_files(grace_s: float = _RETIRED_GRACE_S) -> int:
                     continue
             with contextlib.suppress(OSError):
                 os.remove(marker.path)
+    if removed:
+        prune_reference_copies()
     return removed
 
 
@@ -618,6 +631,8 @@ def _remove_voice_file(filename: Optional[str], *, keep: str) -> None:
             os.remove(path)
         except OSError as exc:
             logger.warning("could not remove superseded voice file: %s", exc)
+        else:
+            prune_reference_copies()
 
 
 def _replacement_fields(
@@ -836,7 +851,7 @@ _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 @router.get("/profiles/{profile_id}/audio")
-async def get_profile_audio(profile_id: str):
+async def get_profile_audio(profile_id: str, request: Request):
     """Serve a saved voice sample or lazily render a pending designed voice.
 
     Profile IDs and stored filenames are confined to VOICES_DIR; concurrent
@@ -855,9 +870,11 @@ async def get_profile_audio(profile_id: str):
         return Response("Profile not found", status_code=404)
     audio_file = row["locked_audio_path"] or row["ref_audio_path"]
     if not audio_file:
-        # A design profile saved before the engine was ready (issue #476) has no
-        # identity sample yet. Render it lazily now — the sample is deterministic
-        # for the stored seed, so a deferred render matches a save-time one.
+        # Rendering a pending design sample synthesizes and persists audio, so
+        # it is an admin action even though the GET route itself is read-only
+        # for consumers. Media elements cannot carry the CSRF marker header,
+        # hence the media-action variant instead of require_admin_action.
+        require_admin_media_action(request)
         rendered = await _materialize_design_sample(profile_id, row)
         if rendered is None:
             return Response("No audio available", status_code=404)
@@ -1218,10 +1235,6 @@ async def unlock_profile(profile_id: str):
 
 _MIN_CONSENT_AUDIO_BYTES = 1000  # same floor as the frontend recorder
 
-# Upload filename extension whitelist — anything else falls back to .wav so a
-# crafted filename can never influence the on-disk path (py/path-injection).
-_CONSENT_EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
-
 
 def _voices_path(filename: str) -> Optional[str]:
     """Resolve a DB-stored audio filename strictly inside VOICES_DIR.
@@ -1258,9 +1271,17 @@ async def record_consent(
     if not row:
         raise HTTPException(status_code=404, detail="Profile not found")
 
+    # The file is served back from /voice_audio, so it must be audio under an
+    # audio extension: a client-chosen ".html" became a stored page there.
     ext = upload_suffix(consent_audio.filename)
-    if not ext or not _CONSENT_EXT_RE.fullmatch(ext):
+    if not ext:
         ext = ".wav"
+    ext = ext.lower()
+    if ext not in _REF_AUDIO_EXTS:
+        raise HTTPException(
+            status_code=415,
+            detail="Choose a supported audio file: WAV, MP3, M4A, FLAC, OGG, Opus, AAC, or WebM.",
+        )
     audio_filename = f"{profile_id}_consent{ext}"
     audio_path = _voices_path(audio_filename)
     if audio_path is None:  # profile_id is server-generated; this is belt+braces
@@ -1270,6 +1291,21 @@ async def record_consent(
     # so consent metadata and audio never disagree.
     recorded_at = time.time()
     staged_path = f"{audio_path}.part"
+    # Check the content is audio before taking the (thread) lock, which must
+    # not be held across an await.
+    fd, probe_path = tempfile.mkstemp(prefix="consent-", suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        decodable = await _is_decodable_audio(probe_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(probe_path)
+    if not decodable:
+        raise HTTPException(
+            status_code=422,
+            detail="That file could not be read as audio. Choose another recording.",
+        )
     with _voice_file_lock:
         with db_conn() as conn:
             current = conn.execute(
@@ -1384,6 +1420,7 @@ def delete_profile(profile_id: str):
             "UPDATE generation_history SET profile_id=NULL WHERE profile_id=?",
             (profile_id,),
         )
+        conn.execute("DELETE FROM pronunciation_entries WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM voice_profiles WHERE id=?", (profile_id,))
     failed_assets = []
     for path in dict.fromkeys(paths):
@@ -1401,6 +1438,8 @@ def delete_profile(profile_id: str):
             except (UnsafePath, OSError, ValueError):
                 failed_assets.append("asset location unavailable (consult local backend log)")
             logger.warning("Deleted profile asset cleanup failed: %s", scrub_text(path))
+    # Converted copies sent to engine sidecars are this voice too (#3688).
+    prune_reference_copies()
     event_bus.emit("profiles", {"action": "deleted", "id": profile_id})
     if failed_assets:
         raise HTTPException(status_code=500, detail=(

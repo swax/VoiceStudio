@@ -1,26 +1,44 @@
 /**
  * Splits the crawler's routes across CI shards by cost, not by position.
  *
- * Crawl time is dominated by a few routes: measured locally in fixture mode, /pro took 28s,
- * /settings/account and /settings/appearance about 20s each and /settings/performance 15s, while
- * most routes take under 6s. Dealing every n-th route in sorted order left one shard at 11
- * minutes and another at 5. Heaviest routes go first, each to the currently lightest shard
- * (ties to the lowest number), so every shard computes the same split without coordinating.
+ * Crawl time is dominated by a few routes. Heaviest routes go first, each to the currently
+ * lightest shard (ties to the lowest number), so every shard computes the same split without
+ * coordinating.
+ *
+ * One weight is about 3 s of crawling (all four fault modes run concurrently). Measured
+ * 2026-11-11 as the median of three main CI runs' shards (ubuntu-24.04). The crawler prints the
+ * per-route seconds at the end of every run ("Route seconds: ..."), so
+ * re-measure from a CI log or a local run when a shard drifts. Weights under 2 are left out.
  *
  * A route missing from ROUTE_WEIGHTS counts as 1, so a new route is still crawled by exactly one
  * shard; add it here when a crawl shows it is slow.
  */
 export const ROUTE_WEIGHTS = {
+  '/stories': 49,
+  '/audiobook': 48,
+  '/dub': 46,
+  '/batch': 40,
+  '/design': 34,
+  '/workflows': 23,
+  '/projects': 22,
+  '/clone': 19,
+  '/gallery': 19,
+  '/integrations': 19,
+  '/calls': 18,
+  '/personas': 17,
+  '/transcriptions': 16,
+  '/tools': 15,
   '/pro': 14,
-  '/settings/account': 10,
+  '/settings/performance': 13,
   '/settings/appearance': 10,
-  '/settings/performance': 7,
+  '/settings/sharing': 9,
+  '/settings/openapi': 7,
   '/settings/storage': 5,
-  '/settings/credentials': 3,
-  '/settings/sharing': 3,
+  '/settings/media': 4,
   '/settings/pronunciation': 3,
-  '/settings/media': 2,
-  '/settings/support': 2,
+  '/settings/support': 3,
+  '/settings/credentials': 2,
+  '/settings/models': 2,
 };
 
 /** The routes shard `shard` (1-based) of `shards` crawls, in a stable order. */

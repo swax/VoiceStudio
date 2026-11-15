@@ -27,6 +27,7 @@ import asyncio
 import inspect
 import ipaddress
 import logging
+import math
 import os
 import re
 import contextlib
@@ -35,7 +36,9 @@ import threading
 import time
 import weakref
 from urllib.parse import urlsplit
+from core import import_probe
 from utils.containment import contain_system_exit
+from core.asr_budget import transcribe_budget_s
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -50,13 +53,13 @@ logger = logging.getLogger("omnivoice.asr")
 # where the resident TTS model contends for memory — hung the request *and* tied
 # up a GPU-pool worker, surfacing in the UI as the misleading "can't reach the
 # local backend" (TamKieu / Vietnam report). Bound them so a hang becomes a fast,
-# actionable error instead. Generous default (whole-file large-v3 on CPU is slow
-# but valid); override with the env var for very long single files.
-ASR_TRANSCRIBE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S", "300.0"))
+# actionable error instead. Whole-file callers supply local duration or a path;
+# the shared budget grows with recording length while this remains its floor.
+ASR_TRANSCRIBE_TIMEOUT_S = transcribe_budget_s()
 
 
 class ASRTimeoutError(TimeoutError):
-    """Raised when a whole-file transcribe exceeds ASR_TRANSCRIBE_TIMEOUT_S.
+    """Raised when a transcription exhausts its finite execution deadline.
 
     Carries a user-actionable message: the backend is alive (this is not a
     connection failure) — the ASR model is too heavy for the available compute.
@@ -66,12 +69,9 @@ class ASRTimeoutError(TimeoutError):
 def reset_pool_after_wedge(executor, *, what: str = "ASR") -> bool:
     """Abandon a GPU pool whose worker is wedged on a timed-out transcribe (#730).
 
-    Python can't kill the stuck thread, but dropping the poisoned pool means the
-    next submit (a retry, the next chunk, or a concurrent TTS generate) gets a
-    fresh worker instead of queueing behind the wedged one. This is the ONE
-    recovery mechanism shared by every transcribe path — the whole-file guards
-    (via :func:`run_transcribe_guarded`) and the chunked dub stream both route
-    through it, so the semantics can't drift between them again.
+    This is opt-in recovery for a caller whose backing process can be safely
+    terminated. In-process inference keeps its worker accounted for until the
+    native call exits; whole-file and chunk guards retain that default (#1669).
 
     Best-effort: an executor without ``reset()`` (a plain ThreadPoolExecutor in
     tests) is a no-op, and a failing reset never raises — this runs on the very
@@ -148,14 +148,74 @@ def _isolated_engine_hint(streak: int) -> str:
     )
 
 
+def file_transcribe_deadline(path: str, *, floor_s: float | None = None,
+                             started_at: float | None = None) -> float:
+    from services.asr_timing import transcribe_deadline
+    from services.ffmpeg_utils import probe_audio_duration
+
+    return transcribe_deadline(
+        lambda: transcribe_budget_s(probe_audio_duration(path), floor_s=floor_s),
+        started_at=started_at,
+    )
+
+
+async def probe_transcribe_deadline(path: str, *, on_abandon=None) -> float:
+    """Keep the input owned until the physical metadata reader has stopped."""
+    from services.model_manager import _cpu_pool
+
+    concurrent_probe = _cpu_pool.submit(file_transcribe_deadline, path, started_at=time.monotonic())
+    probe = asyncio.wrap_future(concurrent_probe)
+    probe_budget = transcribe_budget_s()
+    try:
+        return await asyncio.wait_for(asyncio.shield(probe), timeout=probe_budget)
+    except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
+        # cancel() succeeds only before the reader starts. A running reader's
+        # concurrent Future completes only after it has closed the input.
+        cancelled_before_start = concurrent_probe.cancel()
+
+        def consume_result(done):
+            if not done.cancelled():
+                done.exception()
+
+        probe.add_done_callback(consume_result)
+        if on_abandon is not None:
+            def release_input(_done):
+                try:
+                    on_abandon()
+                except Exception:
+                    logger.exception("ASR probe abandon cleanup failed")
+
+            concurrent_probe.add_done_callback(release_input)
+        elif not cancelled_before_start:
+            # A caller retaining cleanup needs us to drain before it deletes
+            # the file. Repeated cancellation must not cut that drain short.
+            while not concurrent_probe.done():
+                try:
+                    await asyncio.shield(probe)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise ASRTimeoutError(f"ASR duration probe exceeded {probe_budget:g}s") from None
+
+
 async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
-                                 timeout: float = ASR_TRANSCRIBE_TIMEOUT_S,
+                                 timeout: float | None = None,
+                                 audio_path: str | None = None,
+                                 duration_s: float | None = None,
+                                 deadline: float | None = None,
                                  timeout_env: str = "OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S",
                                  reset_on_timeout: bool = False,
                                  on_abandon=None):
     """Run a blocking transcribe ``fn`` in ``executor`` with a hard wall-clock
     bound. On timeout, raise :class:`ASRTimeoutError` with guidance instead of
     letting the request hang forever.
+
+    Whole-file paths/durations scale the default floor with recording length.
+    Explicit chunk timeouts stay fixed. The deadline starts before submission,
+    so queueing and the engine's own child-process wait cannot renew it.
 
     A future cannot cancel the underlying thread, so a timed-out
     in-process CTranslate2/whisperx call still owns its model and device. The
@@ -170,11 +230,8 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
     completion leaves cleanup with the caller.
     """
     from services.inference_cancellation import InferenceCancellation
-    cancellation = InferenceCancellation()
-    loop = asyncio.get_running_loop()
-    # Same SystemExit containment as the TTS pool (#1133 class): an ASR
-    # dependency written as a CLI must not be able to shut the backend down.
-    inner = contain_system_exit(fn, what)
+    from services.asr_timing import remaining_s
+
     abandon_lock = threading.Lock()
     abandon_state = {
         "requested": False,
@@ -194,9 +251,29 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
         except Exception:  # noqa: BLE001 — cleanup cannot hide the ASR result
             logger.exception("%s abandon cleanup failed", what)
 
+    if deadline is not None and timeout is not None:
+        deadline = min(deadline, time.monotonic() + timeout)
+    if deadline is None:
+        if timeout is None and audio_path:
+            deadline = await probe_transcribe_deadline(
+                audio_path, on_abandon=_fire_abandon_callback if on_abandon is not None else None,
+            )
+        else:
+            if timeout is None:
+                timeout = transcribe_budget_s(duration_s)
+            deadline = time.monotonic() + timeout
+    timeout = remaining_s(deadline)
+    cancellation = InferenceCancellation(deadline=deadline)
+    loop = asyncio.get_running_loop()
+    # Same SystemExit containment as the TTS pool (#1133 class): an ASR
+    # dependency written as a CLI must not be able to shut the backend down.
+    inner = contain_system_exit(fn, what)
+
     def _job():
         try:
             with cancellation.activate():
+                if remaining_s(deadline) <= 0:
+                    raise ASRTimeoutError("ASR deadline expired before execution")
                 return inner()
         finally:
             with abandon_lock:
@@ -221,7 +298,7 @@ async def run_transcribe_guarded(executor, fn, *, what: str = "ASR",
     try:
         # Shield the wrapper so timeout does not discard our ability to tell a
         # queued cancellation from a native thread that is still running.
-        result = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        result = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining_s(deadline))
     except asyncio.CancelledError:
         _abandon()
         raise
@@ -432,6 +509,36 @@ def whisper_checkpoint_translates(model_name: str | None) -> bool:
     return not ("turbo" in name or name.endswith(".en") or "distil" in name)
 
 
+def has_recognition_timestamps(result: dict, *, segments=None) -> bool:
+    """Whether every spoken cue has ASR timing, rather than a guessed clip span.
+
+    Text-only adapters must opt out even when they retain rough numeric bounds
+    for dubbing compatibility. Validate both raw and rendered segments so a
+    missing bound or rounding cannot manufacture a usable subtitle interval.
+    """
+    if "timestamps_available" in result and result["timestamps_available"] is not True:
+        return False
+
+    def valid(items):
+        if not isinstance(items, (list, tuple)):
+            return False
+        spoken = False
+        for segment in items:
+            if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+                return False
+            if not segment["text"].strip():
+                continue
+            start, end = segment.get("start"), segment.get("end")
+            if not all(type(value) in (int, float) and math.isfinite(value) for value in (start, end)):
+                return False
+            if start < 0 or end <= start:
+                return False
+            spoken = True
+        return spoken
+
+    return valid(result.get("segments")) and (segments is None or valid(segments))
+
+
 class ASRBackend(ABC):
     id: str = "base"
     display_name: str = "Base ASR"
@@ -445,6 +552,8 @@ class ASRBackend(ABC):
     # conservative default is CPU-only; installed native runtimes may narrow
     # or extend their metadata through runtime_gpu_compat().
     gpu_compat: tuple[str, ...] = ("cpu",)
+    # Explicit loader policy, not inferred from imports or accelerator support.
+    gpu_self_test_policy = "independent"
 
     @classmethod
     def runtime_gpu_compat(cls):
@@ -683,6 +792,7 @@ class WhisperXBackend(ASRBackend):
     # Windows HIP heavy pipelines remain gated pending MIOpen validation.
     # CPU execution remains available independently of basic HIP CT2 support.
     gpu_compat = ("cuda", "cpu")
+    gpu_self_test_policy = "fallback"  # _pick_device always honors failure_warning()
 
     def __init__(self):
         self._model_name = os.environ.get("ASR_MODEL_WHISPERX", "large-v3")
@@ -773,7 +883,8 @@ class WhisperXBackend(ASRBackend):
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
-        from core.windows_rocm.pipelines import pipeline_error, prepare_audio_imports
+        """Report WhisperX import and native-library readiness without raising."""
+        from core.windows_rocm.pipelines import whisperx_error as pipeline_error, prepare_audio_imports
 
         if reason := pipeline_error():
             return False, reason
@@ -782,7 +893,9 @@ class WhisperXBackend(ASRBackend):
             return False, f"whisperx cannot load CTranslate2: {detail}"
         try:
             prepare_audio_imports()
-            import whisperx  # noqa: F401
+            import_probe.ensure_importable(
+                "whisperx", prepare="core.windows_rocm.pipelines:prepare_audio_imports"
+            )
         except ImportError as e:
             return False, f"whisperx not installed: {e}"
         except Exception as e:  # noqa: BLE001
@@ -802,12 +915,19 @@ class WhisperXBackend(ASRBackend):
         self._ensure_asr()
 
     def _ensure_asr(self):
-        from core.windows_rocm.pipelines import PipelineCompatibilityError, pipeline_error, prepare_audio_imports
+        """Lazily load WhisperX after compatibility checks and available-VRAM selection."""
+        from core.windows_rocm.pipelines import PipelineCompatibilityError, whisperx_error as pipeline_error, prepare_audio_imports
 
         if reason := pipeline_error(self._device):
             raise PipelineCompatibilityError(reason)
         if self._asr is not None:
             return
+        # Construction can precede completion of the background GPU test.
+        # Recheck at the actual load boundary; alignment uses this same device.
+        from core.gpu_self_test import failure_warning
+
+        if self._device == "cuda" and failure_warning():
+            self._device, self._compute_type = "cpu", "int8"
         # Patch speechbrain's lazy-import guard BEFORE whisperx pulls in pyannote
         # → speechbrain, or a stray k2_fsa redirect import aborts ASR on Windows
         # (#630/#611/#647). No-op on macOS/Linux and when speechbrain is absent.
@@ -1148,6 +1268,13 @@ class FasterWhisperBackend(ASRBackend):
     gpu_compat = ("cuda", "cpu")
 
     @classmethod
+    def runtime_runs_out_of_process(cls):
+        """Report automatic Windows ROCm 10 inference containment."""
+        from core.windows_rocm.asr_isolation import isolation_required
+
+        return isolation_required()
+
+    @classmethod
     def runtime_gpu_compat(cls):
         from core.windows_rocm.ct2 import gpu_compatible
 
@@ -1168,6 +1295,11 @@ class FasterWhisperBackend(ASRBackend):
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
+        """Report isolated or in-process faster-whisper readiness without raising."""
+        from core.windows_rocm.asr_isolation import availability_status as isolated_status
+
+        if (status := isolated_status()) is not None:
+            return status
         from core.windows_rocm.ct2 import availability_status
 
         if (status := availability_status()) is not None:
@@ -1179,7 +1311,9 @@ class FasterWhisperBackend(ASRBackend):
             from core.windows_rocm.ct2 import prepare_import
 
             prepare_import()
-            import faster_whisper  # noqa: F401
+            import_probe.ensure_importable(
+                "faster_whisper", prepare="core.windows_rocm.ct2:prepare_import"
+            )
         except ImportError as e:
             return False, f"faster-whisper not installed: {e}"
         except Exception as e:  # noqa: BLE001
@@ -1190,6 +1324,11 @@ class FasterWhisperBackend(ASRBackend):
         return _ctranslate2_cudnn_ok()
 
     def _ensure_model(self):
+        """Lazily initialize isolated or local faster-whisper with device fallback."""
+        from core.windows_rocm.asr_isolation import ensure_isolated
+
+        if ensure_isolated(self):
+            return
         if self._model is not None:
             return
         ok, detail = _ctranslate2_execstack_ok()
@@ -1274,7 +1413,14 @@ class FasterWhisperBackend(ASRBackend):
                    language: str | None = None, initial_prompt: str | None = None,
                    temperature: float | None = None,
                    task: str = "transcribe") -> dict:
+        """Transcribe through the active worker or local model and normalize segments."""
         self._ensure_model()
+        if getattr(self, "_rocm_asr_proxy", None) is not None:
+            from core.windows_rocm.asr_isolation import transcribe_isolated
+
+            return transcribe_isolated(
+                self, audio_path, word_timestamps=word_timestamps, language=language,
+                initial_prompt=initial_prompt, temperature=temperature, task=task)
         logger.info(
             "faster-whisper transcribing %s (word_timestamps=%s)",
             audio_path, word_timestamps,
@@ -1334,6 +1480,11 @@ class FasterWhisperBackend(ASRBackend):
         # never assigns — so the actual model in self._model was never freed and
         # a warm faster-whisper stayed resident for the life of the process.
         # Clear the real handle so the model is released.
+        """Release the isolated worker or local model and reclaim cached GPU memory."""
+        from core.windows_rocm.asr_isolation import unload_isolated
+
+        if unload_isolated(self):
+            return
         self._model = None
         self._asr = None  # harmless if a subclass ever used it; keeps idempotence
         import gc
@@ -1344,6 +1495,14 @@ class FasterWhisperBackend(ASRBackend):
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+    def execution_evidence_loaded(self) -> bool:
+        """Check the live delegate when this instance uses isolated inference."""
+        from core.windows_rocm.asr_isolation import isolation_required, evidence_loaded
+
+        if isolation_required() or getattr(self, "_rocm_asr_proxy", None) is not None:
+            return evidence_loaded(self)
+        return super().execution_evidence_loaded()
 
 
 # ── MLX Whisper (Apple Silicon optional) ────────────────────────────────────
@@ -1376,7 +1535,7 @@ class MLXWhisperBackend(ASRBackend):
         if not ok:
             return False, why
         try:
-            import mlx_whisper  # noqa: F401
+            import_probe.ensure_importable("mlx_whisper")
             return True, "ready"
         # Catch OSError/RuntimeError too, not just ImportError: in a
         # PyInstaller bundle mlx's native dylib/metallib can fail to load
@@ -1469,15 +1628,36 @@ class MLXWhisperBackend(ASRBackend):
 
 
 class PyTorchWhisperBackend(ASRBackend):
+    gpu_self_test_policy = "forceable"  # _pick_device uses get_best_device()
     id = "pytorch-whisper"
     display_name = "PyTorch Whisper (CUDA / CPU via transformers pipeline)"
-    # Pure transformers pipeline → runs wherever torch does (CUDA, MPS, CPU).
-    # ROCm-via-HIP would also work but is left unclaimed pending verification.
-    gpu_compat = ("cuda", "mps", "cpu")
+    # Pure transformers pipeline → runs wherever torch does. A ROCm (HIP)
+    # torch answers torch.cuda, so get_best_device() hands it the AMD GPU;
+    # _auto_detect already prefers this engine on ROCm hosts.
+    gpu_compat = ("cuda", "rocm", "mps", "cpu")
+
+    @classmethod
+    def runtime_gpu_compat(cls):
+        """Include only the qualified opt-in Windows HIP runtime in GPU claims."""
+        from core.windows_rocm.torch_asr import gpu_compatible
+
+        return gpu_compatible(cls.gpu_compat)
 
     def __init__(self, asr_pipe=None):
         # Reuses the `_asr_pipe` attached to the TTS model when available.
         self._pipe = asr_pipe
+
+    @property
+    def execution_device(self):
+        """Read the loaded pipeline's execution device rather than its intent."""
+        device = getattr(self._pipe, "device", None)
+        return str(device) if device is not None else None
+
+    @property
+    def dtype(self):
+        """Read actual model parameter precision for execution diagnostics."""
+        dtype = getattr(getattr(self._pipe, "model", None), "dtype", None)
+        return str(dtype) if dtype is not None else None
 
     # Free VRAM needed on CUDA, where _ensure_pipe loads fp16 weights: the
     # weights (parameters x 2 bytes), the batch-16 decode workspace, and
@@ -1530,11 +1710,9 @@ class PyTorchWhisperBackend(ASRBackend):
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
-        try:
-            import transformers  # noqa: F401
-            return True, "ready"
-        except ImportError as e:
-            return False, f"transformers not installed: {e}"
+        from services.pytorch_whisper_options import dependency_status
+
+        return dependency_status()
 
     @classmethod
     def _pick_device(cls, model_name: str | None = None) -> str:
@@ -1575,6 +1753,7 @@ class PyTorchWhisperBackend(ASRBackend):
         self._ensure_pipe()
 
     def _ensure_pipe(self):
+        """Lazily create the standalone PyTorch Whisper pipeline on the chosen device."""
         if self._pipe is not None:
             return
         # Build a standalone transformers Whisper pipeline on demand. This runs
@@ -1585,7 +1764,12 @@ class PyTorchWhisperBackend(ASRBackend):
         # When the TTS model already has an ASR head, dub_core passes it via the
         # constructor and this path is skipped.
         import torch
-        from transformers import pipeline as hf_pipeline
+        try:
+            from transformers import pipeline as hf_pipeline
+        except ImportError as exc:
+            # Keep ImportError for deep-load fallback, but do not relabel an
+            # installed package's broken transitive import as an absent package.
+            raise ImportError(f"PyTorch Whisper could not load Transformers pipeline: {exc}") from exc
         model_name = self._model_name()
         device = self._pick_device(model_name)
         asr_dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
@@ -1706,16 +1890,25 @@ class PyTorchWhisperBackend(ASRBackend):
     def supports_translation(self) -> bool:
         # A reused TTS-model ASR head may differ from the env default: ask the
         # loaded pipeline first.
+        """Check the loaded or configured checkpoint for multilingual translation support."""
+        from services.pytorch_whisper_options import english_only
+
+        if english_only(self._pipe):
+            return False
         loaded = getattr(getattr(self._pipe, "model", None), "name_or_path", None)
         return whisper_checkpoint_translates(loaded or self._model_name())
 
     def transcribe(self, audio_path: str, *, word_timestamps: bool = True,
                    language: str | None = None, task: str = "transcribe") -> dict:
+        """Decode audio and normalize PyTorch Whisper output with safe generation options."""
         import soundfile as sf
         self._ensure_pipe()
         # transformers' Whisper generate() takes language/task; a prompt needs
         # tokenizer-specific prompt_ids, so it is not advertised here.
         generate_kwargs = whisper_request_options(language, None, None, task)
+        from services.pytorch_whisper_options import generation_options
+
+        generate_kwargs = generation_options(self._pipe, generate_kwargs)
         # #2039: libsndfile cannot open MP4/M4A (AAC), which /transcribe and
         # the MCP tool both accept. Those decode through the validated ffmpeg
         # path, which resamples to 16 kHz properly. Anything soundfile can
@@ -1756,7 +1949,9 @@ class NeMoASRBackend(ASRBackend):
     int8 on the same host, so the old hard CUDA gate was a false claim.
     """
     id = "nemo-parakeet"
-    gpu_compat = ("cuda", "cpu")
+    # Linux HIP Torch exposes AMD devices through torch.cuda; Windows ROCm
+    # is not claimed without validation of the NeMo runtime.
+    gpu_compat = ("cuda", "cpu") if os.name == "nt" else ("cuda", "rocm", "cpu")
     display_name = "Parakeet TDT (NVIDIA NeMo — 25 langs, CUDA/CPU)"
 
     def __init__(self):
@@ -1775,10 +1970,12 @@ class NeMoASRBackend(ASRBackend):
         except ImportError:
             return False, "PyTorch not installed"
         try:
-            import nemo.collections.asr  # noqa: F401
+            import_probe.ensure_importable("nemo.collections.asr")
             return True, "ready"
         except ImportError as e:
             return False, f"nemo_toolkit[asr] not installed: {e}"
+        except Exception as e:  # noqa: BLE001 - native load failure / probe crash
+            return False, f"nemo_toolkit[asr] failed to load ({type(e).__name__}): {e}"
 
     def _ensure_model(self):
         if self._model is not None:
@@ -1894,7 +2091,7 @@ class ParakeetMLXBackend(ASRBackend):
         if not ok:
             return False, why
         try:
-            import parakeet_mlx  # noqa: F401
+            import_probe.ensure_importable("parakeet_mlx")
             return True, "ready"
         # OSError/RuntimeError too, not just ImportError: in a PyInstaller
         # bundle mlx's native dylib/metallib can fail to load even when the
@@ -2072,6 +2269,7 @@ class MoonshineASRBackend(ASRBackend):
             "chunks": chunks,
             "segments": segments_out,
             "language": "en",
+            "timestamps_available": False,
         }
 
     def unload(self) -> None:
@@ -2233,7 +2431,8 @@ def _sherpa_result(text: str, samples, sr) -> dict:
     if text:
         segments.append({"text": text, "start": 0.0, "end": duration, "words": []})
     chunks = [{"text": s["text"], "timestamp": (s["start"], s["end"])} for s in segments]
-    return {"chunks": chunks, "segments": segments, "language": "auto", "text": text}
+    return {"chunks": chunks, "segments": segments, "language": "auto", "text": text,
+            "timestamps_available": False}
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
@@ -2304,7 +2503,9 @@ class FunASRBackend(ASRBackend):
     #182); WhisperX remains the cross-platform default.
     """
     id = "funasr"
-    gpu_compat = ("cuda", "cpu")  # FunASR: CUDA or CPU
+    # Linux HIP Torch exposes AMD devices through torch.cuda; Windows ROCm
+    # is not claimed without validation of the FunASR runtime.
+    gpu_compat = ("cuda", "cpu") if os.name == "nt" else ("cuda", "rocm", "cpu")
     display_name = "FunASR (SenseVoice — 50+ languages, all-in-one)"
 
     def __init__(self):
@@ -2323,10 +2524,12 @@ class FunASRBackend(ASRBackend):
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
         try:
-            import funasr  # noqa: F401
+            import_probe.ensure_importable("funasr")
             return True, "ready"
         except ImportError:
             return False, "funasr not installed. Install with: uv pip install funasr"
+        except Exception as e:  # noqa: BLE001 - native load failure / probe crash
+            return False, f"funasr failed to load ({type(e).__name__}): {e}"
 
     def _ensure_model(self):
         if self._model is not None:
@@ -2633,6 +2836,8 @@ class OpenAICompatASRBackend(ASRBackend):
                    language: str | None = None, initial_prompt: str | None = None,
                    temperature: float | None = None,
                    task: str = "transcribe") -> dict:
+        from services.asr_timing import remaining_s
+        deadline = file_transcribe_deadline(audio_path)
         logger.info(
             "OpenAI-compat ASR transcribing %s (base_url=%s, model=%s)",
             audio_path, self._base_url, self._model,
@@ -2654,6 +2859,7 @@ class OpenAICompatASRBackend(ASRBackend):
                 try:
                     resp = endpoint.create(
                         file=f, model=self._model, response_format="verbose_json",
+                        timeout=remaining_s(deadline),
                         **extra,
                     )
                 except Exception:
@@ -2662,9 +2868,14 @@ class OpenAICompatASRBackend(ASRBackend):
                     # failure. Re-open: the SDK may have partially consumed
                     # the file handle on the first attempt.
                     f.seek(0)
+                    if remaining_s(deadline) <= 0:
+                        raise ASRTimeoutError("Remote ASR transcription deadline expired") from None
                     resp = endpoint.create(
-                        file=f, model=self._model, response_format="json", **extra,
+                        file=f, model=self._model, response_format="json",
+                        timeout=remaining_s(deadline), **extra,
                     )
+        except ASRTimeoutError:
+            raise
         except Exception as exc:
             # Never leak a raw SDK/httpx exception object (auth headers,
             # connection internals) straight into a user-facing message —
@@ -2889,7 +3100,8 @@ def list_backends() -> list[dict]:
             _LAST_ERRORS.pop(bid, None)
         else:
             _LAST_ERRORS[bid] = scrub_text(msg)
-        isolation = "subprocess" if getattr(cls, "_is_subprocess_isolated", False) else "in-process"
+        implicit_isolation = bool(getattr(cls, "runtime_runs_out_of_process", lambda: False)())
+        isolation = "subprocess" if getattr(cls, "_is_subprocess_isolated", False) or implicit_isolation else "in-process"
         routing = runtime_compute_profile(cls, caps)
         gpu_compat = routing["gpu_compat"]
         routing["routing_reason"] = scrub_text(routing["routing_reason"]) if routing["routing_reason"] else None
@@ -2898,7 +3110,7 @@ def list_backends() -> list[dict]:
         # cannot leave ghost GPU/provider evidence in diagnostics.
         instance = (
             _ISOLATED_INSTANCES.get(bid)
-            if isolation == "subprocess"
+            if isolation == "subprocess" and not implicit_isolation
             else _RUNTIME_INSTANCES.get(bid)
         )
         execution_evidence = execution_snapshot(
@@ -2938,6 +3150,10 @@ def _probe_available(cls) -> bool:
     lib that refuses to load — CTranslate2's exec-stack rejection, #692) means the
     engine is unusable on this host, so treat it as unavailable and fall through
     to the next candidate rather than crash engine selection."""
+    from services.performance_readiness import inventory_active, asr_installed
+
+    if inventory_active():
+        return asr_installed(cls, _DEEP_IMPORT_BROKEN)
     if getattr(cls, "id", None) in _DEEP_IMPORT_BROKEN:
         # A previous load proved this backend's deep import chain is broken
         # (#1185) — the shallow probe would succeed, so consult the record

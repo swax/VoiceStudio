@@ -11,6 +11,7 @@ import {
   usePlaybackSeek,
 } from '@/lib/audio/playback-clock';
 import { cn } from '@/lib/utils';
+import { formatClock } from './media-clock';
 import {
   StudioMediaPlayer,
   audioSource,
@@ -34,10 +35,6 @@ export interface WaveformPlayerProps {
   onCanPlay?: MediaPlayerProps['onCanPlay'];
   playerRef?: React.RefObject<MediaPlayerInstance | null>;
   className?: string;
-}
-export function formatClock(seconds: number): string {
-  const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-  return Math.floor(safe / 60) + ':' + String(Math.floor(safe % 60)).padStart(2, '0');
 }
 export function waveColors(el: HTMLElement): { waveColor: string; progressColor: string } {
   const probe = document.createElement('span');
@@ -235,7 +232,7 @@ function WaveformControls({
       </Button>
       {error ? (
         <p role="status" className="flex-1 text-xs text-muted-foreground">
-          {t('player.missing')}
+          {t('player.unavailable')}
         </p>
       ) : (
         <div className="relative min-w-0 flex-1" style={{ height }}>

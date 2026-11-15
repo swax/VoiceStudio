@@ -17,7 +17,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('electron', () => ({ app: { isPackaged: true, getPath: () => '/private/voicestudio' } }));
 vi.mock('node:child_process', () => ({ spawn: mocks.spawn, spawnSync: vi.fn() }));
 vi.mock('node:fs/promises', () => ({ rm: vi.fn() }));
-vi.mock('./runtime-project', () => ({
+vi.mock('./runtime-project', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./runtime-project')>()),
   resolveTorchVariant: () => ({ variant: 'cpu', explicit: false }),
   cpuTorchApplies: () => false,
   runtimeDependenciesReady: mocks.dependencies,
@@ -247,4 +248,151 @@ it('names a Windows load block instead of rebuilding a runtime that cannot help 
   expect(supervisor.status.message).toContain("Windows refused to load one of the engine's files");
   expect(supervisor.status.message).toContain('application control policy');
   await supervisor.shutdown();
+});
+
+it('quotes a bounded stderr tail, not only the last line, on an unexpected exit (#3887)', async () => {
+  const supervisor = new BackendSupervisor();
+  const { child, internal } = launch(supervisor);
+  for (let i = 0; i < 60; i++) internal.pushLog('err', `trace line ${i} ${'x'.repeat(500)}`, true);
+
+  child.emit('exit', 1, null);
+  await vi.advanceTimersByTimeAsync(11_000);
+
+  const message = supervisor.status.message ?? '';
+  expect(supervisor.status.stage).toBe('crashed');
+  expect(message).toContain('exit code 1');
+  expect(message).toContain('trace line 59');
+  expect(message).toContain('trace line 55');
+  expect(message).not.toContain('trace line 30 ');
+  expect(message.length).toBeLessThan(4000);
+  await supervisor.shutdown();
+});
+
+/** macOS posix_spawn can time out while it checks the executable; Node throws a bare `spawn ETIMEDOUT` (#4035). */
+function timedOutSpawn() {
+  return Object.assign(new Error('spawn ETIMEDOUT'), { code: 'ETIMEDOUT', syscall: 'spawn' });
+}
+
+it('retries a launch the OS timed out, then starts the backend (#4035)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals;
+  const child = deadChild();
+  mocks.spawn.mockReset();
+  mocks.spawn
+    .mockImplementationOnce(() => {
+      throw timedOutSpawn();
+    })
+    .mockReturnValueOnce(child);
+  const waitUntilReady = vi
+    .spyOn(supervisor as unknown as { waitUntilReady: () => Promise<void> }, 'waitUntilReady')
+    .mockResolvedValue();
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['python'], cwd: '/project' }, 1);
+  expect(supervisor.status.stage).not.toBe('failed');
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  expect(supervisor.status.stage).toBe('starting');
+  // start() skipped readiness after the first failure; the retry starts it (#4039 review).
+  expect(waitUntilReady).toHaveBeenCalledWith(1, expect.any(Number));
+});
+
+it('says what to do when every launch attempt times out (#4035)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals;
+  mocks.spawn.mockReset();
+  mocks.spawn.mockImplementation(() => {
+    throw timedOutSpawn();
+  });
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['/rt/.venv/bin/python'], cwd: '/project' }, 1);
+  await vi.advanceTimersByTimeAsync(7_000);
+  expect(mocks.spawn).toHaveBeenCalledTimes(3);
+  expect(supervisor.status.stage).toBe('failed');
+  expect(supervisor.status.message).toContain(
+    'Could not start /rt/.venv/bin/python: spawn ETIMEDOUT',
+  );
+  expect(supervisor.status.message).toContain('restarting the computer');
+});
+
+it('drops a pending retry once a newer launch has started (#4035)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals;
+  mocks.spawn.mockReset();
+  mocks.spawn.mockImplementationOnce(() => {
+    throw timedOutSpawn();
+  });
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['python'], cwd: '/project' }, 1);
+  internal.generation = 2;
+  await vi.advanceTimersByTimeAsync(7_000);
+  expect(mocks.spawn).toHaveBeenCalledTimes(1);
+});
+
+it('retries an EAGAIN that Node reports through the error event (#4039 review)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals;
+  const refused = deadChild() as unknown as EventEmitter & { pid?: number };
+  refused.pid = undefined;
+  const child = deadChild();
+  mocks.spawn.mockReset();
+  mocks.spawn.mockReturnValueOnce(refused).mockReturnValueOnce(child);
+  const waitUntilReady = vi
+    .spyOn(supervisor as unknown as { waitUntilReady: () => Promise<void> }, 'waitUntilReady')
+    .mockResolvedValue();
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['python'], cwd: '/project' }, 1);
+  refused.emit('error', Object.assign(new Error('spawn python EAGAIN'), { code: 'EAGAIN' }));
+  expect(supervisor.status.stage).toBe('starting');
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  expect(supervisor.status.stage).toBe('starting');
+  // start()'s readiness wait is still running for this launch; no second one.
+  expect(waitUntilReady).not.toHaveBeenCalled();
+});
+
+it('drops a pending retry when a backend answered during the delay (#4039 review)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals & {
+    setStage(stage: string, patch: object): void;
+  };
+  const refused = deadChild() as unknown as EventEmitter & { pid?: number };
+  refused.pid = undefined;
+  mocks.spawn.mockReset();
+  mocks.spawn.mockReturnValueOnce(refused);
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['python'], cwd: '/project' }, 1);
+  refused.emit('error', Object.assign(new Error('spawn python EAGAIN'), { code: 'EAGAIN' }));
+  internal.setStage('ready', { managed: false });
+  await vi.advanceTimersByTimeAsync(7_000);
+  expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  expect(supervisor.status.stage).toBe('ready');
+});
+
+it('counts the startup budget from the retried launch, not the failed one (#4039 review)', async () => {
+  const supervisor = new BackendSupervisor();
+  const internal = supervisor as unknown as SupervisorInternals & {
+    waitUntilReady(gen: number, budgetMs: number): Promise<void>;
+  };
+  const refused = () => {
+    const child = deadChild() as unknown as EventEmitter & { pid?: number };
+    child.pid = undefined;
+    return child;
+  };
+  const first = refused();
+  const second = refused();
+  mocks.spawn.mockReset();
+  mocks.spawn
+    .mockReturnValueOnce(first)
+    .mockReturnValueOnce(second)
+    .mockReturnValueOnce(deadChild());
+  internal.generation = 1;
+  internal.spawnChild({ argv: ['python'], cwd: '/project' }, 1);
+  void internal.waitUntilReady(1, 5_000); // what start() runs after a spawn
+  first.emit('error', Object.assign(new Error('spawn python EAGAIN'), { code: 'EAGAIN' }));
+  await vi.advanceTimersByTimeAsync(2_000);
+  second.emit('error', Object.assign(new Error('spawn python EAGAIN'), { code: 'EAGAIN' }));
+  await vi.advanceTimersByTimeAsync(5_500);
+  // Both delays (7 s) outlast the 5 s budget; the third launch still gets its own.
+  expect(mocks.spawn).toHaveBeenCalledTimes(3);
+  expect(supervisor.status.stage).toBe('starting');
 });

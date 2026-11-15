@@ -23,11 +23,54 @@ byte ranges in flight, caps each range at 16 MB, and records every completed
 range in a resume manifest. After a dropped connection, only unfinished ranges
 are fetched again: the install retries the accelerator and resumes that
 manifest. An origin without range support remains a single stream within the
-accelerator. A non-transient failure or the final attempt disables acceleration
+accelerator. Before publishing the file, the accelerator checks its size and
+supported content digest: Git blob SHA-1 for 40-character ETags (including the
+Git object header), or SHA-256 for 64-character LFS ETags. A checksum mismatch
+leaves any previously installed destination untouched and invalidates the
+completed-range manifest, so a later retry fetches all ranges again rather than
+trusting the rejected bytes. Ordinary connection failures and cancellation keep
+valid completed ranges for resume; cancellation is checked during verification
+and before publication too. A checksum mismatch stops the install with a failure
+instead of switching to an unverified plain transfer; retrying the install can
+fetch the rejected ranges again. Other non-transient failures or the final attempt disable acceleration
 for the rest of that install and lets plain `snapshot_download` take over. Adding a
 free Hugging Face token (first-run setup, or Settings → Credentials) makes this
 faster still — authenticated downloads get higher rate limits and fewer stalls.
 To force the old single-stream path, set `OMNIVOICE_SEGMENTED_DOWNLOAD=0`.
+
+The segmented downloader checks the initial destination and every redirect,
+then pins each HEAD, body and range request to a validated public address.
+Redirects returned only by GET or range requests use the same checks and
+pinned transport; public hops retain range validation and content verification,
+while a refused hop stops the install before any legacy-transfer fallback.
+Changed DNS answers cannot turn a previously checked hostname into a private
+network fetch, including when a connection pool or proxy is used. HTTPS keeps
+the original hostname for certificate verification and SNI, and requests keep
+their original Host header. System HTTP/HTTPS/SOCKS proxies and `NO_PROXY`
+continue to apply to the original hostname; a configured local proxy remains
+usable. Hugging Face redirects to public CDNs remain supported, without
+forwarding the Hub token to those CDNs. Injected HTTP clients also keep their
+default authentication and cookies on the original origin (including a secure
+HTTP-to-HTTPS upgrade on default ports); an explicit Hub token remains authoritative on trusted Hugging Face HTTPS hosts.
+
+DNS validation uses a finite connection-timeout budget (30 seconds by default),
+including waiting for bounded resolver capacity. Cancellation does not wait for
+a stalled operating-system resolver. An interrupted, timed-out or unavailable
+destination check stops the install, including when another range fails first;
+its unresolved result cannot enable a plain-transfer fallback.
+
+A destination-policy refusal stops the install instead of switching to a
+plain transfer. For an intentionally private model mirror, the existing
+`OMNIVOICE_ALLOW_PRIVATE_URL_IMPORTS=1` opt-in permits private destinations;
+that setting also permits private URL imports elsewhere in the app. Leave it
+off for public model hosts. This policy is scoped to the segmented downloader
+and does not block the app's unrelated local backend connections.
+Hub metadata and plain Hugging Face transfers use the Hub client's transport;
+the address-pinning guarantee applies to accelerated transfers. Ordinary
+transfer failures after destination validation retain the documented plain-transfer
+fallback. Within an
+accelerated transfer, a working address is preferred only while fresh validated
+DNS answers still contain it, avoiding repeated dead-family timeouts per range.
 
 State is reported at **Settings → About** / `GET /system/info`:
 
@@ -91,9 +134,10 @@ official endpoint unless the mirror is decisively faster, and remembers the
 winner. The decision is re-tested only on the first-run system check, after a
 network-classified download failure (the failed download retries once on the
 new winner), when it's more than 7 days old, or when you press **Test again**
-in **Settings → Models → Hugging Face mirror**. Mirror integrity is a
-non-issue: `huggingface_hub` verifies every download by checksum regardless
-of endpoint. Opt out with `OMNIVOICE_HF_ENDPOINT_MODE=manual`.
+in **Settings → Models → Hugging Face mirror**. Use an endpoint you trust:
+size and digest checks detect damaged transfers against the metadata supplied
+by that endpoint; they do not independently authenticate its publisher or make
+an untrusted mirror safe. Opt out with `OMNIVOICE_HF_ENDPOINT_MODE=manual`.
 
 This retry also applies to the model weights fetched by one-click engine
 installation. It retries once only when a network failure selects a different

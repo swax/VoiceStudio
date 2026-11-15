@@ -193,7 +193,11 @@ export interface CloneGenerateInput {
   emoText?: string;
   emoAlpha?: number;
   emoVector?: number[];
-  steps: number;
+  /** Sampling steps; null = the active engine's best quality. Clamped to its range. */
+  steps: number | null;
+  /** Render on this TTS engine instead of the one selected in Settings (`/generate`'s
+   *  `engine` override). Queued takes pin the engine they were requested on. */
+  engine?: string;
   cfg: number;
   speed: number;
   tShift: number;

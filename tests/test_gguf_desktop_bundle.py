@@ -9,17 +9,15 @@ the packaged layout matches the backend's lookup.
 """
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
+import json
 from pathlib import Path
 
 import pytest
 import yaml
+from build_script_stubs import run_build
 
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
-BASH = shutil.which("bash") if os.name != "nt" else "C:/Program Files/Git/bin/bash.exe"
 
 # What backend/engines/omnivoice_gguf/backend.py::_platform_slug() returns on
 # each installer target. Windows on ARM runs the emulated x64 Python runtime.
@@ -83,11 +81,12 @@ def test_release_builds_the_runtime_from_the_release_ref():
     assert "release_tag" in build["with"]["ref"]
 
 
-def test_packaged_layout_matches_the_backend_lookup():
-    # The packaged backend runs from resources/, so `<root>/bin` is
-    # resources/bin — exactly where the installer puts the runtime.
+def test_packaged_layout_matches_the_backend_lookup(monkeypatch):
+    # Without OMNIVOICE_GGUF_BIN_DIR the lookup is `<root>/bin`: resources/bin
+    # for a backend that runs from resources/ (store builds, a selected Python).
     from engines.omnivoice_gguf import backend
 
+    monkeypatch.delenv(backend.BIN_DIR_ENV, raising=False)
     assert (backend._REPO_ROOT / "backend" / "engines" / "omnivoice_gguf").resolve() == \
         backend._PKG_DIR
     assert backend._binary_path("windows-x86_64") == backend._REPO_ROOT / "bin" / \
@@ -96,46 +95,36 @@ def test_packaged_layout_matches_the_backend_lookup():
     assert "from: '../backend',\n      to: 'backend'" in config
     bundle = (REPO / "electron" / "omnivoice-tts-bundle.mjs").read_text(encoding="utf-8")
     assert "OMNIVOICE_TTS_RESOURCE_DIR = 'bin'" in bundle
+    # The managed runtime runs a copy of backend/ staged outside resources/,
+    # with no bin/ beside it, so the app names resources/bin explicitly (#4051).
+    main = (REPO / "electron" / "src" / "main" / "backend.ts").read_text(encoding="utf-8")
+    assert f"env.{backend.BIN_DIR_ENV} = bundledGgufBinPath()" in main
+    assert "return join(backendRoot(), 'bin');" in main
 
 
 def _run_windows_build(tmp_path: Path, runtime: dict[str, str]):
-    scripts = tmp_path / "scripts"
-    shutil.copytree(REPO / "scripts/lib", scripts / "lib")
-    shutil.copy2(REPO / "scripts/build-omnivoice-tts.sh", scripts)
-    fake = tmp_path / "fake-bin"
-    fake.mkdir()
     tools = {
         "git": 'if [[ "$1" == clone ]]; then for d in "$@"; do :; done; mkdir -p "$d"; fi',
         "cmake": 'if [[ "$1" == --build ]]; then mkdir -p build/Release;'
                  ' printf rt > build/Release/omnivoice-tts.exe;'
+                 ' printf srv > build/Release/tts-server.exe;'
                  ' printf lib > build/Release/ggml-cpu-haswell.dll; fi',
     }
-    for name, body in tools.items():
-        (fake / name).write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body + "\n")
-        (fake / name).chmod(0o755)
     msvc = tmp_path / "msvc"
     msvc.mkdir()
     for dll, body in runtime.items():
         (msvc / dll).write_text(body)
-    env = {**os.environ, "PATH": f"{fake}:/usr/bin:/bin",
-           "OMNIVOICE_MSVC_RUNTIME_DIR": msvc.as_posix()}
-    env.pop("VULKAN_SDK", None)
-    return subprocess.run(
-        [BASH, str(scripts / "build-omnivoice-tts.sh"), "--platform", "windows-x86_64",
-         "--commit-sha", "a" * 40],
-        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60, check=False,
-    )
+    return run_build(tmp_path, "windows-x86_64", tools=tools,
+                     env={"OMNIVOICE_MSVC_RUNTIME_DIR": msvc.as_posix()})
 
 
 def test_windows_build_ships_its_cpp_runtime_with_checksums(tmp_path):
-    if not BASH or not Path(BASH).is_file():
-        pytest.skip("POSIX bash required for the build script")
     result = _run_windows_build(tmp_path, {
         "msvcp140.dll": "msvcp", "vcruntime140.dll": "vcrt",
         "vcruntime140_1.dll": "vcrt1", "vcomp140.dll": "omp",
     })
     assert result.returncode == 0, result.stdout + result.stderr
-    manifest = (tmp_path / "bin" / "checksums.sha256").read_text()
+    manifest = (tmp_path / "bin" / "checksums.sha256").read_text(encoding="utf-8")
     for name in ("omnivoice-tts-windows-x86_64.exe", "ggml-cpu-haswell.dll", "msvcp140.dll",
                  "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll"):
         assert (tmp_path / "bin" / name).is_file(), name
@@ -143,8 +132,6 @@ def test_windows_build_ships_its_cpp_runtime_with_checksums(tmp_path):
 
 
 def test_windows_build_fails_without_the_cpp_runtime(tmp_path):
-    if not BASH or not Path(BASH).is_file():
-        pytest.skip("POSIX bash required for the build script")
     result = _run_windows_build(tmp_path, {"vcruntime140.dll": "vcrt"})
     assert result.returncode != 0
     assert "Visual C++ runtime DLLs not found" in result.stderr
@@ -161,3 +148,38 @@ def test_every_parallel_build_is_bounded():
             assert '-j "$BUILD_JOBS"' in line, f"{rel}: {line.strip()}"
     script = (REPO / "scripts/build-omnivoice-tts.sh").read_text(encoding="utf-8")
     assert script.index("BUILD_JOBS=") < script.index('source "$REPO_ROOT/scripts/lib/omnivoice-vulkan.sh"')
+
+
+# ── resident tts-server ships beside the CLI (#3654) ───────────────────────
+
+def test_windows_build_ships_and_checksums_the_resident_server(tmp_path):
+    result = _run_windows_build(tmp_path, {"msvcp140.dll": "m", "vcruntime140.dll": "v"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "bin" / "tts-server-windows-x86_64.exe").read_text(encoding="utf-8") == "srv"
+    manifest = (tmp_path / "bin" / "checksums.sha256").read_text(encoding="utf-8")
+    assert "  tts-server-windows-x86_64.exe\n" in manifest
+
+
+def test_build_fails_when_the_pin_has_no_resident_server(tmp_path):
+    # A pin older than omnivoice.cpp 040c8b3 builds no tts-server; shipping that
+    # would leave resident mode silently inactive in every installer.
+    tools = {
+        "git": 'if [[ "$1" == clone ]]; then for d in "$@"; do :; done; mkdir -p "$d"; fi',
+        "cmake": 'if [[ "$1" == --build ]]; then mkdir -p build/Release;'
+                 ' printf rt > build/Release/omnivoice-tts.exe; fi',
+    }
+    result = run_build(tmp_path, "windows-x86_64", tools=tools)
+    assert result.returncode != 0
+    assert "tts-server.exe not found" in result.stderr
+
+
+def test_build_workflow_uploads_and_checks_the_resident_server():
+    wf = _workflow("build-omnivoice-tts.yml")
+    job = wf["jobs"]["build-omnivoice-tts"]
+    upload = next(s for s in job["steps"] if s.get("name") == "Upload binary artifact")
+    assert "bin/tts-server-${{ matrix.platform }}*" in upload["with"]["path"]
+    check = next(s for s in job["steps"] if s.get("name") == "Check the resident server was built and checksummed")
+    assert "tts-server-$PLATFORM" in check["run"] and "checksums.sha256" in check["run"]
+    # The resident server needs a pin that builds it (voice registry, 040c8b3).
+    pin = json.loads((REPO / "backend/engines/omnivoice_gguf/quant_map.json").read_text(encoding="utf-8"))
+    assert pin["_meta"]["runtime_commit_sha"] == "040c8b344d8c670ce1475194751d119b5ef82c78"

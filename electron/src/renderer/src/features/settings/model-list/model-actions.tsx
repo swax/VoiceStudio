@@ -6,13 +6,13 @@ import {
   MemoryStickIcon,
   RefreshCwIcon,
   Trash2Icon,
-  TriangleAlertIcon,
   WrenchIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { InstallProgress } from '@/components/model-install-progress';
 import { fmtBytes, fmtGb } from '@shared/components/settings/models/format';
 import type { CatalogueModel } from '../model-catalogue-query';
+import { ModelLicense } from '../model-license';
 import type { ModelOps } from './model-ops';
 import type { JobInfo } from './model-job';
 
@@ -94,12 +94,20 @@ export function ModelActions({
         <DownloadProgress model={model} ops={ops} info={info} />
       ) : model.installed ? (
         <>
-          {model.license_acceptance?.required && !model.license_acceptance.accepted ? (
-            // Downloaded but unusable until its licence is accepted.
-            <span className="flex items-center gap-1 rounded-full bg-warning/10 px-2 py-0.5 text-xs text-warning">
-              <TriangleAlertIcon className="size-3.5" />
-              {t('modelLicense.acceptNeeded')}
-            </span>
+          {(model.license_acceptance?.required && !model.license_acceptance.accepted) ||
+          model.license_dependencies_complete === false ||
+          (model.license_dependencies ?? []).some(
+            (dependency) => dependency.required && !dependency.accepted,
+          ) ? (
+            // Downloaded but unusable until every licence its engine needs is accepted (#3855).
+            <ModelLicense
+              repoId={model.repo_id}
+              label={model.label}
+              info={model.license_info}
+              acceptance={model.license_acceptance}
+              dependencies={model.license_dependencies}
+              triggerLabel={t('modelLicense.acceptNeeded')}
+            />
           ) : (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <CheckIcon className="size-3.5 text-primary" />
