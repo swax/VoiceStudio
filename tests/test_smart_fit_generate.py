@@ -25,6 +25,7 @@ os.environ.setdefault("OMNIVOICE_DISABLE_FILE_LOG", "1")
 
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -85,7 +86,6 @@ async def _fake_stretch(wav, target_samples, sr):
 @pytest.fixture
 def patched_generate(monkeypatch, tmp_path):
     import api.routers.dub_generate as dg
-    from services import audio_io
 
     model = _FakeModel()
 
@@ -105,11 +105,13 @@ def patched_generate(monkeypatch, tmp_path):
     monkeypatch.setattr(dg, "_save_job", lambda job_id, j: None)
     monkeypatch.setattr(dg, "DUB_DIR", str(tmp_path))
     monkeypatch.setattr(
-        dg, "dub_seg_path",
+        dg,
+        "dub_seg_path",
         lambda job_id, seg_id: str(job_dir / f"seg_{seg_id}.wav"),
     )
     monkeypatch.setattr(dg, "rvc_is_enabled", lambda: False)
     monkeypatch.setattr(dg, "mark_synthetic", lambda wav, sr, **kw: wav)
+    monkeypatch.setattr(dg, "mark_synthetic_async", AsyncMock(side_effect=lambda wav, sr, **kw: wav))
     monkeypatch.setattr(dg, "apply_mastering", lambda a, sample_rate=None: a)
     monkeypatch.setattr(dg, "get_effect_chain", lambda preset: None)
     monkeypatch.setattr(dg, "apply_effects_chain", lambda a, **k: a)
@@ -284,10 +286,10 @@ def test_fresh_speech_is_watermarked_exactly_once(patched_generate, monkeypatch)
 
     def _fake_detect(waveform, sample_rate):
         found = bool((waveform < -0.5).any())
-        return {"is_watermarked": found, "confidence": 1.0 if found else 0.0,
-                "message_bits": "", "is_omnivoice": found}
+        return {"is_watermarked": found, "confidence": 1.0 if found else 0.0, "message_bits": "", "is_omnivoice": found}
 
-    monkeypatch.setattr(dg, "mark_synthetic", _fake_mark)
+    mark_async = AsyncMock(side_effect=_fake_mark)
+    monkeypatch.setattr(dg, "mark_synthetic_async", mark_async)
     monkeypatch.setattr(watermark, "detect_watermark", _fake_detect)
 
     done = _done(run(_body(
@@ -306,6 +308,7 @@ def test_fresh_speech_is_watermarked_exactly_once(patched_generate, monkeypatch)
     assert watermark.detect_watermark(seg, seg_sr)["is_watermarked"]
 
     # One mark call, on the 33 s fresh segment: the 35 s track is not re-marked.
+    mark_async.assert_awaited_once()
     assert mark_lengths == [int(33.0 * SR)]
 
 
@@ -619,7 +622,6 @@ def test_natural_cache_decode_failure_blocks_export(
     segs = [{"start": 0.0, "end": 1.0, "text": "0.8:uno"}]
     run(_body(segs, timing_strategy="concise"))
 
-    import api.routers.dub_generate as dg
     from services import audio_io
 
     original_load = audio_io.torchaudio.load
@@ -646,7 +648,6 @@ def test_rvc_keeps_natural_rate_audio_outside_strict_slot(
     """RVC output obeys the same timing-mode cache invariant as plain TTS."""
     run, _model, job, job_dir = patched_generate
     import api.routers.dub_generate as dg
-    from services import audio_io
     import torchaudio
 
     monkeypatch.setattr(dg, "rvc_is_enabled", lambda: True)
