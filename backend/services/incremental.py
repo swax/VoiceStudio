@@ -21,6 +21,7 @@ import json
 
 
 _GEN_INPUT_FIELDS = ("text", "target_lang", "profile_id", "instruct", "speed", "direction", "effect_preset")
+_OPTIONAL_GEN_INPUT_FIELDS = ("ref_audio", "ref_text", "emo_audio", "emo_alpha", "seed")
 
 # Pydantic fills `effect_preset` with this default when the client omits it,
 # while the client-side recompute (/tools/incremental) sends nothing. Both
@@ -84,6 +85,12 @@ def segment_fingerprint(
     value and per_line stays byte-identical to the pre-toggle behaviour.
     """
     payload = {k: _canon_value(k, seg.get(k)) for k in _GEN_INPUT_FIELDS}
+    # Preserve old fingerprints when these optional controls are absent, but
+    # invalidate a take when its conditioning or deterministic seed changes.
+    for key in _OPTIONAL_GEN_INPUT_FIELDS:
+        value = seg.get(key)
+        if value is not None and value != "":
+            payload[key] = _canon_value(key, value)
     if track_lang:
         payload["track_lang"] = str(track_lang)
     if voice_match and voice_match != "per_line":

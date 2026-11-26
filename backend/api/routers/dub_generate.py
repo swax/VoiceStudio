@@ -1026,6 +1026,29 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
         _checkpoint_hits: set[str] = set()
 
         seg_ids = req.segment_ids or []
+        # Per-segment emotion references, by segment id; only engines that
+        # declare supports_emotion (IndexTTS 2) receive them.
+        _seg_emo = {
+            (seg_ids[k] if k < len(seg_ids) else f"seg_{k}"): {
+                "emo_audio": s.emo_audio,
+                **({"emo_alpha": s.emo_alpha} if s.emo_alpha is not None else {}),
+            }
+            for k, s in enumerate(req.segments)
+            if s.emo_audio
+        }
+        # Per-segment voice references (audio + its exact transcript), which
+        # replace the profile's reference for that segment.
+        _seg_ref = {
+            (seg_ids[k] if k < len(seg_ids) else f"seg_{k}"): (s.ref_audio, s.ref_text)
+            for k, s in enumerate(req.segments)
+            if s.ref_audio and s.ref_text
+        }
+        # Per-line seeds override a saved voice's seed independently of emotion support.
+        _seg_seeds = {
+            (seg_ids[k] if k < len(seg_ids) else f"seg_{k}"): s.seed
+            for k, s in enumerate(req.segments)
+            if s.seed is not None
+        }
         subtitle_only = bool(job.get("subtitle_only"))
         strategy = (req.timing_strategy or "concise").lower()
         # Fixed SRT windows with pitch-preserving compression: always for the
@@ -1176,6 +1199,12 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
             ref_hash = dub_resume.hash_reference_file(ref_audio, _ref_hash_memo)
             if ref_audio and ref_hash is None:
                 return None
+            emotion_identity = {}
+            if prepared.get("emo_audio"):
+                emotion_hash = dub_resume.hash_reference_file(prepared["emo_audio"], _ref_hash_memo)
+                if emotion_hash is None:
+                    return None
+                emotion_identity = {"emo_sha256": emotion_hash, "emo_alpha": prepared.get("emo_alpha")}
             identity = getattr(backend, "model_identity", None)
             return dub_resume.build_key({
                 "engine": engine_id,
@@ -1195,6 +1224,7 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                     get_effect_chain(prepared.get("effect_preset") or "broadcast"),
                 ],
                 "model_folder": folder_fp,
+                **emotion_identity,
                 **{
                     field: prepared.get(field)
                     for field in (
@@ -1299,6 +1329,11 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                 "instruct": segment.instruct,
                 "speed": segment.speed,
                 "direction": segment.direction,
+                "ref_audio": segment.ref_audio,
+                "ref_text": segment.ref_text,
+                "emo_audio": segment.emo_audio,
+                "emo_alpha": segment.emo_alpha,
+                "seed": segment.seed,
                 "effect_preset": segment.effect_preset,
             }, track_lang=lang_code, voice_match=voice_match)
 
@@ -1579,8 +1614,16 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                                 _vd = None
                             instruct_str = heal_design_instruct(row["instruct"], _vd)
 
+                used_seed = _seg_seeds.get(effective_seg_id, used_seed)
                 if used_seed is not None and not prepare_only:
                     torch.manual_seed(used_seed)
+
+                # A per-segment reference (e.g. the voice's clips plus this
+                # line's own original) replaces the profile's; it's used once,
+                # so keep it out of the prompt cache.
+                if effective_seg_id in _seg_ref:
+                    ref_audio, ref_text = _seg_ref[effective_seg_id]
+                    ref_single_use = True
 
                 # Last gate before the engine: every resolution branch above
                 # produces a PATH, and none of them can know it still exists.
@@ -1588,22 +1631,24 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                     ref_audio, job_id=job_id, seg_id=effective_seg_id, where="dub render",
                 ))
 
+                emo_kw = _seg_emo.get(effective_seg_id, {}) if getattr(backend, "supports_emotion", False) else {}
                 prepared = {
-                        "text": text,
-                        "language": lang if lang != "Auto" else None,
-                        "ref_audio": ref_audio,
-                        "ref_text": ref_text,
-                        "cache_ref": not ref_single_use,
-                        "instruct": instruct_str if instruct_str else None,
-                        "duration": dur_s,
-                        "num_step": nstep,
-                        "guidance_scale": cfg,
-                        "speed": spd,
-                        "denoise": True,
-                        "postprocess_output": _job_postprocess,
-                        "effect_preset": effect_preset or "broadcast",
-                        "seed": used_seed,
-                    }
+                    "text": text,
+                    "language": lang if lang != "Auto" else None,
+                    "ref_audio": ref_audio,
+                    "ref_text": ref_text,
+                    "cache_ref": not ref_single_use,
+                    "instruct": instruct_str if instruct_str else None,
+                    "duration": dur_s,
+                    "num_step": nstep,
+                    "guidance_scale": cfg,
+                    "speed": spd,
+                    "denoise": True,
+                    "postprocess_output": _job_postprocess,
+                    "effect_preset": effect_preset or "broadcast",
+                    "seed": used_seed,
+                    **emo_kw,
+                }
                 if prepare_only:
                     return prepared
                 if reuse_checkpoints and str(effective_seg_id) not in forced_speech_ids:
@@ -1627,6 +1672,7 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                         instruct=instruct_str if instruct_str else None,
                         duration=dur_s, num_step=nstep, guidance_scale=cfg,
                         speed=spd, denoise=True, postprocess_output=_job_postprocess,
+                        **emo_kw,
                         **seed_engine_call(used_seed, backend),
                     )
                     sr = backend.sample_rate
@@ -1674,6 +1720,7 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                             instruct=instruct_str if instruct_str else None,
                             duration=dur_s, num_step=retry_steps, guidance_scale=cfg,
                             speed=spd, denoise=True, postprocess_output=_job_postprocess,
+                            **emo_kw,
                             **seed_engine_call(used_seed, backend),
                         )
                         sr = backend.sample_rate
@@ -1790,9 +1837,10 @@ async def _run_dub(requested_job_id: str, req: DubRequest, *, planning: bool = F
                                 continue
                         except Exception as err:  # noqa: BLE001
                             logger.debug("dub resume lookup skipped: %s", type(err).__name__)
-                    # Fixed-seed profiles deliberately keep their established
-                    # one-row deterministic RNG contract.
-                    if prepared["seed"] is not None:
+                    # Keep seeded rows deterministic. Emotion references also
+                    # use scalar generation: native batches have no per-row
+                    # emotion-audio contract.
+                    if prepared["seed"] is not None or prepared.get("emo_audio"):
                         if candidate_index == first_index:
                             return
                         break

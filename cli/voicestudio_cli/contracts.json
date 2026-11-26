@@ -769,6 +769,7 @@
     "fields": [
       "input_type",
       "job_id",
+      "separate",
       "separate_background",
       "source_lang",
       "video"

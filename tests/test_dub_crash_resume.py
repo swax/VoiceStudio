@@ -84,9 +84,47 @@ def dub(monkeypatch, tmp_path):
 
     journal = path / ".resume" / "en"
     return SimpleNamespace(
-        run=run, run_async=run_async, job=job, path=path, generated=generated,
-        state=state, journal=journal, dg=dg,
+        run=run,
+        run_async=run_async,
+        job=job,
+        path=path,
+        generated=generated,
+        state=state,
+        journal=journal,
+        dg=dg,
+        backend=backend,
     )
+
+
+@pytest.mark.parametrize("change", ["seed", "reference", "emotion", "alpha"])
+def test_changed_per_line_controls_do_not_recover_stale_speech(dub, tmp_path, change):
+    import soundfile as sf
+
+    reference = tmp_path / "reference.wav"
+    emotion = tmp_path / "emotion.wav"
+    sf.write(reference, torch.ones(24000).numpy() * 0.1, 24000)
+    sf.write(emotion, torch.ones(24000).numpy() * 0.2, 24000)
+    dub.backend.supports_emotion = True
+    dub.backend.supports_generation_seed = True
+    segments = [
+        dict(row, ref_audio=str(reference), ref_text="Reference words.", emo_audio=str(emotion), emo_alpha=0.5, seed=0)
+        for row in SEGMENTS
+    ]
+    dub.state["fail_on_call"] = 3
+    events = dub.run(segments=segments)
+    assert any(event["type"] == "error" for event in events)
+    dub.state["fail_on_call"] = None
+    if change == "seed":
+        segments[0]["seed"] = 7
+    elif change == "reference":
+        sf.write(reference, torch.ones(24000).numpy() * 0.3, 24000)
+    elif change == "emotion":
+        sf.write(emotion, torch.ones(24000).numpy() * 0.4, 24000)
+    else:
+        segments[0]["emo_alpha"] = 0.8
+    events = dub.run(segments=segments)
+    assert any(event["type"] == "done" for event in events)
+    assert len(dub.generated) == (4 if change in {"reference", "emotion"} else 3)
 
 
 def _crash_after(dub, finished):

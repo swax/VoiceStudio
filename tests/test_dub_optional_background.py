@@ -9,8 +9,10 @@ import pytest
 import soundfile as sf
 
 
-@pytest.mark.parametrize('separate,failure', [(False, False), (True, False), (True, True)])
-def test_ingest_respects_background_choice(monkeypatch, tmp_path, separate, failure):
+@pytest.mark.parametrize('separate,failure,external_stems', [
+    (False, False, False), (True, False, False), (True, True, False), (False, False, True),
+])
+def test_ingest_respects_background_choice(monkeypatch, tmp_path, separate, failure, external_stems):
     import importlib
 
     dp = importlib.import_module('services.dub_pipeline')  # resolved at run time
@@ -40,18 +42,24 @@ def test_ingest_respects_background_choice(monkeypatch, tmp_path, separate, fail
     monkeypatch.setattr(dp, 'save_job', lambda *a, **kw: None)
     monkeypatch.setattr(dp, '_separate_background', separate_audio)
     async def collect():
+        options = {'separate': False} if external_stems else {'separate_background': separate}
         return [json.loads(e.removeprefix('data: ').strip()) async for e in dp.ingest_pipeline(
-            'roadmap', str(job_dir), {'kind': 'file', 'path': str(source), 'input_type': 'audio', 'separate_background': separate})]
+            'roadmap', str(job_dir), {'kind': 'file', 'path': str(source), 'input_type': 'audio', **options})]
     try:
         events = asyncio.run(collect())
         assert events[-1]['type'] == 'ready', events
         assert bool(separations) is separate
         assert any(e['type'] == 'demucs_start' for e in events) is separate
-        assert any('44100' in cmd for cmd in commands) is separate
+        assert any('44100' in cmd for cmd in commands) is (separate or external_stems)
+        if external_stems:
+            info = sf.info(job_dir / 'audio_hq.wav')
+            assert (info.samplerate, info.channels) == (44100, 2)
         job = dp.get_job('roadmap')
         assert job['background_separation'] == (('failed' if failure else 'ok') if separate else 'skipped')
         assert bool(job['no_vocals_path']) is (separate and not failure)
-        assert cache_keys[0].endswith(':voice-only') is (not separate)
+        assert cache_keys[0].endswith(':voice-only') is (not separate and not external_stems)
+        if external_stems:
+            assert cache_keys == ['']
         if separate:
             assert ':' not in cache_keys[0]  # legacy content hashes are unchanged
         done = next(e for e in events if e['type'] == 'demucs_done')

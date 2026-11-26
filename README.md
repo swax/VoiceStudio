@@ -1,3 +1,23 @@
+# VoiceStudio for Dub Anything
+
+This fork supplies the VoiceStudio backend for [Dub Anything](https://github.com/swax/dub-anything).
+
+Changes beyond [upstream VoiceStudio at `669ed5ef`](https://github.com/debpalash/VoiceStudio/commit/669ed5ef0da41036da7ed8f2f0b57b93aff733a6).
+
+- **Per-line direction** adds voice reference audio and transcripts, emotion
+  references and strengths, and seed overrides to dub segments. These inputs
+  also identify reusable takes.
+- **Audio effects** add echo and public-address presets with reverb tails.
+- **Shared media** keeps a full-quality extract for client-side separation,
+  lets administrators attach the resulting stems, and lets them fork a job
+  over hard-linked media for another voice.
+- **Legacy Windows AMD support** adapts the backend and IndexTTS sidecar
+  for Torch `2.9.1+rocm7.13.x`.
+
+[Dub Anything setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md)
+
+---
+
 <div align="center">
   <h1><sub><img src="docs/logo.png" alt="" width="36" height="36" /></sub> VoiceStudio</h1>
   <p>

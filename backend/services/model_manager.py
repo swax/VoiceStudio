@@ -26,7 +26,32 @@ def _lazy_torch():
     if _torch is None:
         import torch as _t
         _torch = _t
+        _configure_rocm_windows(_t)
     return _torch
+
+
+def _configure_rocm_windows(torch):
+    """Legacy ROCm Torch on Windows: PyTorch's own convolutions instead of MIOpen's, and
+    AOTriton attention on consumer Radeons.
+
+    MIOpen searches and compiles kernels for every new input shape, and every
+    take has a new length: the first generate on a Radeon 890M spent over 300 s
+    in the audio tokenizer's first convolution. Without AOTriton (experimental
+    on RDNA 3) attention takes the math path, about 10x slower.
+    OMNIVOICE_MIOPEN=1 keeps MIOpen. Newer managed runtimes keep upstream's policy.
+    """
+    if (
+        sys.platform != "win32"
+        or getattr(torch.version, "hip", None) is None
+        or not str(getattr(torch, "__version__", "")).startswith("2.9.1+rocm7.13.")
+    ):
+        return
+    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+    if os.environ.get("OMNIVOICE_MIOPEN") != "1":
+        torch.backends.cudnn.enabled = False
+        logging.getLogger("omnivoice.model").info(
+            "ROCm on Windows: MIOpen off (OMNIVOICE_MIOPEN=1 keeps it), AOTriton attention on"
+        )
 
 
 def _missing_module_is_omnivoice(exc: ModuleNotFoundError) -> bool:

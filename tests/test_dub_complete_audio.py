@@ -63,7 +63,7 @@ def render_dub(monkeypatch, tmp_path):
     def run(**kwargs: Any) -> list[dict[str, Any]]:
         return asyncio.run(run_async(**kwargs))
 
-    return SimpleNamespace(run=run, run_async=run_async, output=output, job=job, path=path, generated=generated)
+    return SimpleNamespace(run=run, run_async=run_async, output=output, job=job, path=path, generated=generated, backend=backend)
 
 
 def test_segment_watermark_does_not_block_the_event_loop(
@@ -101,6 +101,72 @@ def test_segment_watermark_does_not_block_the_event_loop(
     audio, sr = sf.read(render_dub.path / "seg_en_a.wav")
     assert sr == 24000
     assert audio.mean() == pytest.approx(0.12, abs=1 / 32768)
+
+
+def test_per_line_conditioning_reaches_engine_and_published_fingerprint(render_dub):
+    from services.incremental import segment_fingerprint
+
+    render_dub.backend.supports_emotion = True
+    render_dub.backend.supports_generation_seed = True
+    reference = str(render_dub.path / "voice.wav")
+    emotion = str(render_dub.path / "emotion.wav")
+    sf.write(reference, torch.ones(24000).numpy() * 0.1, 24000)
+    sf.write(emotion, torch.ones(24000).numpy() * 0.1, 24000)
+    segment = {
+        "start": 0,
+        "end": 1,
+        "text": "Hello there.",
+        "ref_audio": reference,
+        "ref_text": "Reference words.",
+        "emo_audio": emotion,
+        "emo_alpha": 0.5,
+        "seed": 42,
+    }
+    events = render_dub.run(segments=[segment])
+    assert any(e["type"] == "done" for e in events)
+    take = render_dub.generated[-1]
+    for key in ("ref_audio", "ref_text", "emo_audio", "emo_alpha", "seed"):
+        assert take[key] == segment[key]
+    assert take["cache_ref"] is False
+    assert render_dub.job["seg_hashes"]["a"] == segment_fingerprint(segment, track_lang="en")
+
+
+@pytest.mark.parametrize("seed", [0, 23])
+def test_per_line_seed_does_not_require_emotion_support(render_dub, seed):
+    render_dub.backend.supports_generation_seed = True
+    render_dub.backend.supports_emotion = False
+    events = render_dub.run(segments=[{"start": 0, "end": 1, "text": "Hello.", "seed": seed}])
+    assert any(event["type"] == "done" for event in events)
+    assert render_dub.generated[-1]["seed"] == seed
+
+
+def test_per_line_emotion_uses_scalar_generation_when_native_batch_has_no_emotion_contract(render_dub, monkeypatch):
+    import api.routers.dub_generate as dg
+
+    class BatchedBackend(SimpleNamespace):
+        def generate_batch(self, *_args, **_kwargs):
+            raise AssertionError("Native batch cannot receive per-line emotion references")
+
+    backend = BatchedBackend(**vars(render_dub.backend), supports_emotion=True)
+
+    async def resolve():
+        return "omnivoice", backend
+
+    monkeypatch.setattr(dg, "_resolve_dub_execution", resolve)
+    monkeypatch.setattr(dg, "native_batch_width", lambda _: 2)
+    emotion = str(render_dub.path / "emotion.wav")
+    sf.write(emotion, torch.ones(24000).numpy() * 0.1, 24000)
+    # Different strengths keep the rows distinct in upstream's speech cache.
+    strengths = [0.3, 0.7]
+    segments = [
+        {"start": i, "end": i + 1, "text": "Hello.", "emo_audio": emotion, "emo_alpha": strength}
+        for i, strength in enumerate(strengths)
+    ]
+    events = render_dub.run(segments=segments, segment_ids=["a", "b"])
+    assert any(event["type"] == "done" for event in events)
+    assert len(render_dub.generated) == 2
+    assert all(row["emo_audio"] == emotion for row in render_dub.generated)
+    assert [row["emo_alpha"] for row in render_dub.generated] == strengths
 
 
 def test_failed_segment_does_not_publish_complete_track(render_dub):

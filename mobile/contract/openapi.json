@@ -1125,6 +1125,11 @@
       ],
       "title": "Job Id"
      },
+     "separate": {
+      "default": true,
+      "title": "Separate",
+      "type": "boolean"
+     },
      "separate_background": {
       "default": true,
       "title": "Separate Background",
@@ -2510,6 +2515,52 @@
     "title": "DirectionReq",
     "type": "object"
    },
+   "DubAttachStemsRequest": {
+    "description": "Stems the client separated itself, as file names in the job folder.",
+    "properties": {
+     "no_vocals": {
+      "anyOf": [
+       {
+        "maxLength": 255,
+        "minLength": 1,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "No Vocals"
+     },
+     "vocals": {
+      "maxLength": 255,
+      "minLength": 1,
+      "title": "Vocals",
+      "type": "string"
+     }
+    },
+    "required": [
+     "vocals"
+    ],
+    "title": "DubAttachStemsRequest",
+    "type": "object"
+   },
+   "DubForkRequest": {
+    "description": "The id of the new job that shares the source job's media.",
+    "properties": {
+     "job_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "title": "Job Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "job_id"
+    ],
+    "title": "DubForkRequest",
+    "type": "object"
+   },
    "DubIngestUrlRequest": {
     "properties": {
      "cookie_file": {
@@ -2611,6 +2662,28 @@
       "title": "Effect Preset",
       "type": "string"
      },
+     "emo_alpha": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Emo Alpha"
+     },
+     "emo_audio": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Emo Audio"
+     },
      "end": {
       "title": "End",
       "type": "number"
@@ -2635,6 +2708,39 @@
       "default": "",
       "title": "Profile Id",
       "type": "string"
+     },
+     "ref_audio": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Ref Audio"
+     },
+     "ref_text": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Ref Text"
+     },
+     "seed": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Seed"
      },
      "source_ids": {
       "anyOf": [
@@ -13197,6 +13303,54 @@
     "summary": "Dub Export Stems"
    }
   },
+  "/dub/fork/{job_id}": {
+   "post": {
+    "description": "A new job over this job's media (hard-linked where the volume allows),\nto render the same audio again in another voice without uploading,\nextracting or separating it again. Transcription and render state stay\nwith the source job.",
+    "operationId": "dub_fork_dub_fork__job_id__post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/DubForkRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Fork"
+   }
+  },
   "/dub/from-srt": {
    "post": {
     "description": "Create a speech-only project, with no media preparation or ASR.",
@@ -14228,6 +14382,54 @@
     "summary": "Dub Export Srt"
    }
   },
+  "/dub/stems/{job_id}": {
+   "post": {
+    "description": "Make stems the client separated itself the job's voices and bed.\n\nThe files must already be in the job folder; they are named relative to\nit, and must last as long as the job's audio.",
+    "operationId": "dub_attach_stems_dub_stems__job_id__post",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/DubAttachStemsRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Attach Stems"
+   }
+  },
   "/dub/sync-transcript/{job_id}": {
    "post": {
     "description": "Store the editor's transcript while the job has no dub yet (#3393).\n\nExporting the original video or audio with subtitles needs no generated\ntrack, but the subtitle writers read ``job[\"segments\"]``, which still\nholds the raw transcription. Once a dub exists its exports must keep the\nsegments that dub was rendered from, so this refuses to overwrite them.\nPer-row metadata (speaker, word timings, cue sources) is carried over by\nstable id; text and timing come from the editor.",
@@ -14567,7 +14769,7 @@
   },
   "/dub/upload": {
    "post": {
-    "description": "Accept a media upload, write to disk, queue background prep task.\n\n`input_type` is \"video\" (default) or \"audio\". Audio-only jobs (#119) skip\nscene detection, thumbnailing, and the final video mux \u2014 the transcribe \u2192\ntranslate \u2192 TTS core is identical.\n\nReturns 202 with {job_id, task_id, filename}. Client should open SSE on\n/tasks/stream/{task_id} to monitor extract/demucs stages and wait for the\n'ready' event before starting transcription.",
+    "description": "Accept a media upload, write to disk, queue background prep task.\n\nWith ``separate`` false the voices are not separated: the client\nseparates them itself and attaches its stems (``POST /dub/stems``)\nbefore transcribing.\n\n`input_type` is \"video\" (default) or \"audio\". Audio-only jobs (#119) skip\nscene detection, thumbnailing, and the final video mux \u2014 the transcribe \u2192\ntranslate \u2192 TTS core is identical.\n\nReturns 202 with {job_id, task_id, filename}. Client should open SSE on\n/tasks/stream/{task_id} to monitor extract/demucs stages and wait for the\n'ready' event before starting transcription.",
     "operationId": "dub_upload_dub_upload_post",
     "requestBody": {
      "content": {
