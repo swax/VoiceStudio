@@ -132,6 +132,19 @@ describe('toGenerateForm', () => {
     expect(toGenerateForm({ ...BASE_INPUT, presetVoice: 'F3' }).get('preset_voice')).toBe('F3');
   });
 
+  it('sends the paragraph gap and trim only when set', () => {
+    const plain = toGenerateForm(BASE_INPUT);
+    for (const key of ['paragraph_gap_ms', 'trim_engine_silence'])
+      expect(plain.has(key), key).toBe(false);
+    const joined = toGenerateForm({
+      ...BASE_INPUT,
+      paragraphGapMs: 900,
+      trimEngineSilence: true,
+    });
+    expect(joined.get('paragraph_gap_ms')).toBe('900');
+    expect(joined.get('trim_engine_silence')).toBe('true');
+  });
+
   it('keeps existing defaults and sends explicit quality choices', () => {
     const defaults = toGenerateForm(BASE_INPUT);
     expect(defaults.get('wav_bits')).toBe('16');
@@ -401,7 +414,7 @@ describe('generateClone', () => {
     const pending = generateClone({ ...BASE_INPUT, profileId: 'p1' });
     let settled = false;
     pending.catch(() => {}).finally(() => (settled = true));
-    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
     // Still waiting where the old 21-minute backstop gave up on a job the
     // backend was legitimately queueing (30 min) or cold-loading.
     await vi.advanceTimersByTimeAsync(generateAbortMs(BASE_INPUT.text.length) - 1);

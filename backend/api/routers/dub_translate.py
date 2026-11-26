@@ -4,6 +4,8 @@ import re
 import time
 import asyncio
 import logging
+import threading
+import types
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from api.dependencies import consumer_generation, require_consumer_reads_admin_writes
@@ -28,13 +30,19 @@ logger = logging.getLogger("omnivoice.api")
 _NLLB_REPO_ID = "facebook/nllb-200-distilled-600M"
 
 
-def _load_nllb_component(factory):
+def _load_nllb_component(factory, **kwargs):
     """Load explicitly installed NLLB weights at their reviewed revision."""
     return factory.from_pretrained(
         _NLLB_REPO_ID,
         revision=revision_for(_NLLB_REPO_ID),
         local_files_only=True,
+        **kwargs,
     )
+
+
+def _nllb_fp16_enabled() -> bool:
+    """CUDA-only half precision; ``OMNIVOICE_NLLB_FP16=0`` keeps float32."""
+    return os.environ.get("OMNIVOICE_NLLB_FP16", "1").strip().lower() not in ("0", "false", "no", "off")
 
 TRANSLATE_CODES = {
     "en": "en", "es": "es", "fr": "fr", "de": "de", "it": "it", "pt": "pt",
@@ -247,6 +255,12 @@ def _translation_output_error(text: object) -> str | None:
 _nllb_model = None
 _nllb_tokenizer = None
 _nllb_device = None
+# Mutable holder (not a module global) for "the resident model is half precision".
+_nllb_state = types.SimpleNamespace(fp16=False)
+# One lock for every touch of the shared NLLB model (load, generate, the fp16 ->
+# float32 conversion, unload): a conversion must never run under another
+# request's generate. Reentrant because translation unloads from inside it.
+_nllb_lock = threading.RLock()
 _NLLB_BATCH_SIZE_ENV = "OMNIVOICE_NLLB_BATCH_SIZE"
 _NLLB_MAX_BATCH_SIZE = 32
 
@@ -431,15 +445,25 @@ def _resolve_translation_context(req, client, model_name: str, timeout: float,
     return ctx
 
 
+def _locked_nllb(fn):
+    """Run ``fn`` holding the NLLB model lock."""
+    def _run():
+        with _nllb_lock:
+            return fn()
+    return _run
+
+
 def _unload_nllb():
     """Release NLLB VRAM so TTS model can reload."""
     global _nllb_device, _nllb_model, _nllb_tokenizer
     import gc
     from services.model_manager import release_device_cache
-    device = _nllb_device
-    _nllb_model = None
-    _nllb_tokenizer = None
-    _nllb_device = None
+    with _nllb_lock:
+        device = _nllb_device
+        _nllb_model = None
+        _nllb_tokenizer = None
+        _nllb_device = None
+        _nllb_state.fp16 = False
     gc.collect()
     release_device_cache(device=device)
 
@@ -463,6 +487,16 @@ def _should_unload_nllb() -> bool:
 @router.post("/dub/translate")
 @consumer_generation
 async def dub_translate(req: TranslateRequest):
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
+
+    async def _await_unit(start):
+        # Translation and refinement are descendants of this request/job,
+        # including an inherited known-OFF owner. Only a new operation may
+        # observe a new grant after another unit has awaited.
+        with diagnostic_reports.grant_scope(diagnostic_epoch):
+            return await start()
+
     try:
         provider = (req.provider if req.provider else os.environ.get("TRANSLATE_PROVIDER", "google")).lower()
         from services import translation_engines
@@ -517,7 +551,22 @@ async def dub_translate(req: TranslateRequest):
                     if _nllb_tokenizer is None:
                         _nllb_tokenizer = _load_nllb_component(AutoTokenizer)
                     if _nllb_model is None:
-                        _nllb_model = _load_nllb_component(AutoModelForSeq2SeqLM)
+                        _nllb_model = None
+                        if target_device == "cuda" and _nllb_fp16_enabled():
+                            # Half the VRAM and faster matmuls on CUDA; MPS and
+                            # CPU keep float32. Any failure reloads float32.
+                            try:
+                                _nllb_model = _load_nllb_component(
+                                    AutoModelForSeq2SeqLM, torch_dtype=torch.float16)
+                                _nllb_model = _nllb_model.to("cuda")
+                                _nllb_state.fp16 = True
+                            except Exception as e:
+                                logger.warning("NLLB fp16 load on CUDA failed, using float32: %s", e)
+                                _nllb_model = None
+                                _nllb_state.fp16 = False
+                        if _nllb_model is None:
+                            _nllb_model = _load_nllb_component(AutoModelForSeq2SeqLM)
+                            _nllb_state.fp16 = False
                         if target_device != "cpu":
                             try:
                                 _nllb_model = _nllb_model.to(target_device)
@@ -537,7 +586,7 @@ async def dub_translate(req: TranslateRequest):
                 # job uses the same decoding effort even if preferences change.
                 decode_options = translation_decode_defaults()
                 def _generate_rows(rows, target_language):
-                    global _nllb_device
+                    global _nllb_device, _nllb_model
 
                     _nllb_tokenizer.src_lang = flores_src
                     inputs = _nllb_tokenizer(
@@ -556,6 +605,33 @@ async def dub_translate(req: TranslateRequest):
                             **decode_options,
                         )
                     except (RuntimeError, NotImplementedError) as error:
+                        if _nllb_device == "cuda" and _nllb_state.fp16 and "out of memory" not in str(error).lower():
+                            logger.warning("NLLB fp16 generate failed, retrying in float32: %s", error)
+                            try:
+                                _nllb_model.float()
+                                _nllb_state.fp16 = False
+                            except Exception as conv_error:  # noqa: BLE001 — e.g. OOM mid-conversion
+                                # Parameters may be half-converted: never trust
+                                # this model again, reload a clean float32 one.
+                                logger.warning(
+                                    "NLLB float32 conversion failed (%s) — reloading float32", conv_error)
+                                _nllb_model = None
+                                _nllb_state.fp16 = False
+                                release_device_cache(device="cuda")
+                                fresh = _load_nllb_component(AutoModelForSeq2SeqLM)
+                                try:
+                                    fresh = fresh.to("cuda")
+                                    new_device = "cuda"
+                                except Exception as move_error:  # noqa: BLE001
+                                    logger.warning("NLLB cuda placement failed, using CPU: %s", move_error)
+                                    # A partly failed .to("cuda") can leave mixed
+                                    # devices: move everything back before it is
+                                    # published as a CPU model.
+                                    fresh = fresh.to("cpu")
+                                    new_device = "cpu"
+                                _nllb_device = new_device
+                                _nllb_model = fresh
+                            return _generate_rows(rows, target_language)
                         if _nllb_device != "mps":
                             raise
                         logger.warning("MPS generate failed, retrying on CPU: %s", error)
@@ -638,14 +714,15 @@ async def dub_translate(req: TranslateRequest):
 
                 return [results_by_index[index] for index in range(len(req.segments))]
 
-            translated = await loop.run_in_executor(_gpu_pool, _translate_nllb)
+            translated = await _await_unit(lambda: loop.run_in_executor(_gpu_pool, _locked_nllb(_translate_nllb)))
             if _should_unload_nllb():
-                _unload_nllb()
+                # Takes _nllb_lock (may wait on another translation): never on the loop.
+                await asyncio.to_thread(_unload_nllb)
             # Cinematic/Autofit refine + rate-ratio badges must run for NLLB too
             # (previously this returned before _maybe_cinematic, so a Cinematic
             # pick on NLLB silently produced plain Fast output). Unloading NLLB
             # first is fine — the refine LLM is a separate network provider.
-            return await _maybe_cinematic(translated, req, src_lang, loop)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop))
 
         # LLM translation — resolves through the LLM Skills registry: per-skill
         # "Dub translation" override → global active provider (Settings → LLM
@@ -719,10 +796,10 @@ async def dub_translate(req: TranslateRequest):
             # the manual glossary still rides along — that costs no extra call.
             auto_ctx = None
             if auto_glossary_on:
-                auto_ctx = await loop.run_in_executor(
+                auto_ctx = await _await_unit(lambda: loop.run_in_executor(
                     _cpu_pool, _resolve_translation_context,
                     req, client, model_name, llm_timeout, src_lang,
-                )
+                ))
             merged_terms = tq.merge_glossary(req.glossary, (auto_ctx or {}).get("terms"))
             context_extra = tq.context_clause((auto_ctx or {}).get("theme", ""), merged_terms)
 
@@ -857,15 +934,16 @@ async def dub_translate(req: TranslateRequest):
                 return {"id": seg.id, "text": seg.text,
                         "error": scrub_provider_error(last_err, api_key) or "llm-failed"}
 
-            tasks = [loop.run_in_executor(_cpu_pool, _translate_llm, seg) for seg in req.segments]
-            translated = await asyncio.gather(*tasks)
+            translated = await _await_unit(lambda: asyncio.gather(*[
+                loop.run_in_executor(_cpu_pool, _translate_llm, seg) for seg in req.segments
+            ]))
             translated.sort(key=lambda x: str(x["id"]))
             # provider="openai" is already an LLM translation — _maybe_cinematic
             # skips the reflect/adapt re-refine (already_llm) but still stamps
             # rate-ratio badges and runs the bounded Autofit fit pass. Before
             # this it returned here, so Cinematic/Autofit on the LLM engine did
             # nothing.
-            return await _maybe_cinematic(translated, req, src_lang, loop, already_llm=True)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop, already_llm=True))
 
         # Offline Argos Translate
         if provider == "argos" or provider == "libretranslate":
@@ -939,6 +1017,9 @@ async def dub_translate(req: TranslateRequest):
                     },
                 )
 
+            import threading
+            argos_cancelled = threading.Event()
+
             def _translate_argos():
                 import argostranslate.translate
 
@@ -959,15 +1040,23 @@ async def dub_translate(req: TranslateRequest):
                         )
                         results.append({"id": seg.id, "text": translated_text})
                     except Exception as e:
+                        if not argos_cancelled.is_set():
+                            from core import diagnostic_reports
+                            diagnostic_reports.capture_failure("translation", error=e)
                         results.append({"id": seg.id, "text": seg.text, "error": str(e)})
                 return results
 
-            translated = await loop.run_in_executor(_cpu_pool, _translate_argos)
+            try:
+                translated = await _await_unit(lambda: loop.run_in_executor(
+                    _cpu_pool, diagnostic_reports.bind_callable(_translate_argos)))
+            except asyncio.CancelledError:
+                argos_cancelled.set()
+                raise
             # Argos is the DEFAULT engine — routing it through _maybe_cinematic is
             # the headline fix: a user who picks Cinematic/Autofit on Argos now
             # gets the LLM refine + fit pass (and rate-ratio badges in Fast mode)
             # instead of silent plain-Fast output.
-            return await _maybe_cinematic(translated, req, src_lang, loop)
+            return await _await_unit(lambda: _maybe_cinematic(translated, req, src_lang, loop))
 
         # Legacy / API Deep_Translator logic.
         # Preflight the optional `deep_translator` dep once so we fail with a
@@ -996,7 +1085,7 @@ async def dub_translate(req: TranslateRequest):
         if provider == "amazon":
             from services.translation_apis import AmazonConfigurationError, validate_amazon_configuration
             try:
-                await asyncio.to_thread(validate_amazon_configuration)
+                await _await_unit(lambda: asyncio.to_thread(validate_amazon_configuration))
             except AmazonConfigurationError as exc:
                 return JSONResponse(status_code=409, content={"error": exc.public_message})
 
@@ -1048,16 +1137,19 @@ async def dub_translate(req: TranslateRequest):
             return {"id": seg.id, "text": seg.text,
                     "error": scrub_provider_error(last_err, _deepl_key or _msft_key or api_key) or "unknown"}
 
-        tasks = [loop.run_in_executor(_cpu_pool, _translate_single, seg) for seg in req.segments]
-        translated = await asyncio.gather(*tasks)
+        translated = await _await_unit(lambda: asyncio.gather(*[
+            loop.run_in_executor(_cpu_pool, _translate_single, seg) for seg in req.segments
+        ]))
         translated.sort(key=lambda x: str(x["id"]))
 
-        return await _maybe_cinematic(
+        return await _await_unit(lambda: _maybe_cinematic(
             translated, req, src_lang, loop,
-        )
+        ))
     except ModelLicenceNotAccepted:
         raise
     except Exception as e:
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("translation", error=e, expected_epoch=diagnostic_epoch)
         from core.public_errors import public_failure
 
         error = public_failure(

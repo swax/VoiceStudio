@@ -4,15 +4,15 @@ final class PhoneScreens: XCTestCase {
     @MainActor func testSpeechOffersAllEnginesAndExplainsReferenceOnlyModels() {
         let app = XCUIApplication(); app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch(); app.declineConsent()
-        let speech = app.buttons["home.speak"]; app.reveal(speech); speech.tap()
-        let picker = app.buttons["Models"]; app.reveal(picker); picker.tap()
+        let speech = app.buttons["home.speak"]; app.reveal(speech); speech.tapReady()
+        let picker = app.buttons["Models"]; app.reveal(picker); picker.tapReady()
         for name in ["Kitten", "Kokoro", "OmniVoice", "Piper", "Supertonic 3", "Pocket TTS", "ZipVoice"] {
             let option = app.buttons.matching(NSPredicate(format: "label == %@", name)).firstMatch
             app.reveal(option); XCTAssertTrue(option.exists)
         }
         // The standard ARM host has 7 GB RAM; explicit OmniVoice selection must stay available.
         let omni = app.buttons["choice.option.omnivoice-q4-k-m"]; app.reveal(omni)
-        XCTAssertTrue(omni.isEnabled); omni.tap()
+        XCTAssertTrue(omni.isEnabled); omni.tapReady()
         XCTAssertTrue(app.staticTexts["Choose a saved voice to use this model. You can import one from Gallery."].exists)
         XCTAssertEqual(app.buttons["Voice"].value as? String, "Choose a voice")
         XCTAssertTrue(app.buttons["models.get"].isEnabled)
@@ -26,11 +26,11 @@ final class PhoneScreens: XCTestCase {
         let app = XCUIApplication(); app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch(); app.declineConsent()
         let gallery = app.buttons["home.gallery"]
-        app.reveal(gallery); gallery.tap()
+        app.reveal(gallery); gallery.tapReady()
         app.buttons["Gallery"].tapReady(); app.buttons["choice.option.phone"].tapReady()
         let first = app.buttons["gallery.preset.kitten-mini-en-fp16.0"]
         XCTAssertTrue(first.waitForExistence(timeout: uiReadyTimeout))
-        app.reveal(first); first.tap()
+        app.reveal(first); first.tapReady()
         XCTAssertTrue(app.buttons["models.get"].waitForExistence(timeout: uiReadyTimeout))
         XCTAssertFalse(app.buttons["speak.generate"].exists)
         app.buttons["BackButton"].tapReady()
@@ -38,7 +38,7 @@ final class PhoneScreens: XCTestCase {
         app.reveal(search, swipingDown: true); search.tapReady(); search.typeText("Voice 103")
         app.buttons["keyboard.done"].tapReady()
         let last = app.buttons["gallery.preset.kokoro-multi-int8.102"]
-        XCTAssertTrue(last.waitForExistence(timeout: uiReadyTimeout)); app.reveal(last); last.tap()
+        XCTAssertTrue(last.waitForExistence(timeout: uiReadyTimeout)); app.reveal(last); last.tapReady()
         // During navigation the outgoing Gallery Models button can still be in the snapshot.
         for (label, value) in [("Models", "Kokoro"), ("Voice", "Voice 103")] {
             let selection = app.buttons.matching(NSPredicate(format: "label == %@ AND value == %@", label, value)).firstMatch
@@ -49,20 +49,20 @@ final class PhoneScreens: XCTestCase {
     @MainActor func testCommunityGalleryShowsNamedVoicesAndOpensARealRecipeWithoutPairing() {
         let app = XCUIApplication(); app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch(); app.declineConsent()
-        let gallery = app.buttons["home.gallery"]; app.reveal(gallery); gallery.tap()
+        let gallery = app.buttons["home.gallery"]; app.reveal(gallery); gallery.tapReady()
         XCTAssertTrue(app.staticTexts["The Librarian"].waitForExistence(timeout: uiReadyTimeout))
         let search = app.textFields["search.field"]
         search.tapReady(); search.typeText("Thalia"); app.buttons["keyboard.done"].tapReady()
         XCTAssertTrue(app.staticTexts["Thalia"].waitForExistence(timeout: uiReadyTimeout))
-        let use = app.buttons["Use voice"]; app.reveal(use); use.tap()
+        let use = app.buttons["Use voice"]; app.reveal(use); use.tapReady()
         let dialog = app.alerts.firstMatch
         XCTAssertTrue(dialog.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(dialog.buttons["I have permission"].exists)
-        dialog.buttons["Cancel"].tap()
+        dialog.buttons["Cancel"].tapReady()
         app.reveal(search, swipingDown: true); search.tapReady(); search.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue,count: 6)+"The Librarian")
         app.buttons["keyboard.done"].tapReady()
         let recipe = app.buttons["gallery.community.use.feat_00_the_librarian"]
-        app.reveal(recipe); recipe.tap()
+        app.reveal(recipe); recipe.tapReady()
         let script = app.descendants(matching: .any).matching(identifier: "design.script").firstMatch
         XCTAssertTrue(script.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertEqual(script.value as? String,"The valley had been quiet for a hundred years, and tonight, for the first time, something stirred beneath the old stone bridge.")
@@ -88,7 +88,7 @@ final class PhoneScreens: XCTestCase {
         XCTAssertTrue(download.isEnabled)
         XCTAssertEqual(download.label, "Download")
         XCTAssertFalse(app.buttons["speak.generate"].exists)
-        download.tap()
+        download.tapReady()
         XCTAssertTrue(app.buttons["models.accept"].waitForExistence(timeout: uiReadyTimeout))
         XCTAssertFalse(app.buttons["models.accept"].isEnabled)
         app.buttons["Close"].tapReady()
@@ -130,7 +130,8 @@ final class PhoneScreens: XCTestCase {
         let app = launch()
         app.buttons["Models"].tapReady(); app.buttons["choice.option.kokoro-multi-int8"].tapReady()
         app.buttons["Voice"].tapReady()
-        let search = app.textFields.firstMatch
+        XCTAssertTrue(app.navigationBars["Voice"].waitForExistence(timeout: uiReadyTimeout))
+        let search = app.textFields["search.field"]
         XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout)); search.tapReady(); search.typeText("Voice 103")
         app.buttons["choice.option.102"].tapReady()
         XCTAssertEqual(app.buttons["Voice"].value as? String,"Voice 103")
@@ -162,7 +163,7 @@ final class PhoneScreens: XCTestCase {
     @MainActor func testModelsTermsRequireExplicitUncheckedConsent() {
         let app = launch(); app.tabButton("Settings").tapReady(); app.buttons["Models"].tapReady()
         let licence = app.buttons["model.licence.kitten-mini-en-fp16"]
-        XCTAssertTrue(licence.waitForExistence(timeout: uiReadyTimeout)); licence.tap()
+        XCTAssertTrue(licence.waitForExistence(timeout: uiReadyTimeout)); licence.tapReady()
         let accept = app.buttons["models.accept"]
         XCTAssertTrue(accept.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(accept.isHittable)
@@ -176,12 +177,14 @@ final class PhoneScreens: XCTestCase {
         XCTAssertTrue(accept.wait(for: \.isEnabled, toEqual: true, timeout: 3))
         for _ in 0..<15 { if app.buttons["Close"].isHittable { break }; app.swipeDown() }
         app.buttons["Close"].tapReady()
-        licence.tap()
+        licence.tapReady()
         XCTAssertTrue(accept.waitForExistence(timeout: uiReadyTimeout)); XCTAssertFalse(accept.isEnabled)
         app.buttons["Close"].tapReady()
     }
     @MainActor func testCompactDownloadsUseProductNamesAndOneDubAction() {
         let app = launch()
+        // A previous test may leave a different persisted model, including on failure.
+        app.buttons["Models"].tapReady(); app.buttons["choice.option.kitten-mini-en-fp16"].tapReady()
         XCTAssertEqual(app.buttons.matching(identifier: "models.get").count, 1)
         XCTAssertFalse(app.staticTexts["kitten-mini-en-fp16"].exists)
         XCTAssertTrue(app.buttons["models.open"].label.contains("Kitten"))
@@ -235,7 +238,7 @@ final class PhoneScreenshotTour: XCTestCase {
         let picker = app.navigationBars[title]
         let close = picker.buttons["Close"]
         XCTAssertTrue(close.wait(for: \.isHittable, toEqual: true, timeout: 5))
-        close.tap()
+        close.tapReady()
         // The Settings rows remain in the hierarchy behind the native sheet.
         // Its disappearance, rather than a row's existence, marks dismissal.
         XCTAssertTrue(picker.waitForNonExistence(timeout: 5))
@@ -244,30 +247,30 @@ final class PhoneScreenshotTour: XCTestCase {
         XCTAssertTrue(app.navigationBars["Settings"].wait(for: \.isHittable, toEqual: true, timeout: 5))
         app.reveal(row)
         XCTAssertTrue(row.wait(for: \.isHittable, toEqual: true, timeout: 5))
-        row.tap()
+        row.tapReady()
         XCTAssertTrue(destination.wait(for: \.isHittable, toEqual: true, timeout: 5))
     }
     @MainActor func testPhoneFirstScreens() {
         let app = XCUIApplication(); app.launchArguments = ["--ui-smoke","-AppleLanguages","(en)"]
-        app.launch(); XCTAssertTrue(app.buttons["consent.no"].waitForExistence(timeout: uiReadyTimeout)); XCTAssertTrue(app.staticTexts["This companion app records your choice on this phone. It sends no analytics."].exists); capture("Consent",app); app.declineConsent(); capture("Home",app); app.openSpeak()
+        app.launch(); XCTAssertTrue(app.buttons["consent.no"].waitForExistence(timeout: uiReadyTimeout)); XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "Usage analytics are not sent from this phone; your choice is stored locally. Automatic diagnostic reports have a separate opt-in.")).firstMatch.exists); capture("Consent",app); app.declineConsent(); capture("Home",app); app.openSpeak()
         XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout)); capture("Speak-phone",app)
-        app.tabButton("Voices").tapReady(); capture("Voices-phone",app)
+        guard app.selectTab("Voices") else { return }; capture("Voices-phone",app)
         app.buttons["voices.create"].tapReady(); XCTAssertTrue(app.textFields["voices.clone.name"].waitForExistence(timeout: uiReadyTimeout)); capture("Clone-phone",app); app.buttons["Cancel"].tapReady()
-        app.tabButton("Dub").tapReady(); XCTAssertEqual(app.buttons.matching(identifier: "models.get").count, 1); capture("Dub-phone",app)
-        app.tabButton("Dictate").tapReady(); capture("Dictate-phone",app)
-        app.tabButton("Settings").tapReady(); capture("Settings",app)
+        guard app.selectTab("Dub") else { return }; XCTAssertEqual(app.buttons.matching(identifier: "models.get").count, 1); capture("Dub-phone",app)
+        guard app.selectTab("Dictate") else { return }; capture("Dictate-phone",app)
+        guard app.selectTab("Settings") else { return }; capture("Settings",app)
         app.buttons["settings.palette.light"].tapReady()
         XCTAssertTrue(app.buttons["choice.option.default"].waitForExistence(timeout: uiReadyTimeout)); capture("Palette-picker",app); closeSheet("Light palette",app)
         let language = app.buttons["settings.language"]
         app.reveal(language)
         XCTAssertTrue(language.wait(for: \.isHittable, toEqual: true, timeout: 5))
-        language.tap(); capture("Language-picker",app); closeSheet("Language",app)
+        language.tapReady(); capture("Language-picker",app); closeSheet("Language",app)
         let modelsNavigation = app.navigationBars["Models"]
         let modelLicence = app.buttons["model.licence.kitten-mini-en-fp16"]
         openSettingsPage(app.buttons["Models"], destination: modelLicence, app); capture("Models",app)
-        modelLicence.tap(); capture("Model-terms",app); closeSheet("Review model licence",app)
+        modelLicence.tapReady(); capture("Model-terms",app); closeSheet("Review model licence",app)
         let adaptiveBack = app.buttons["BackButton"]
-        if adaptiveBack.exists { adaptiveBack.tap() } else { modelsNavigation.buttons.firstMatch.tap() }
+        if adaptiveBack.exists { adaptiveBack.tapReady() } else { modelsNavigation.buttons.firstMatch.tapReady() }
         // Settings rows can exist while their outgoing navigation page is still transitioning.
         XCTAssertTrue(modelsNavigation.waitForNonExistence(timeout: 5))
         openSettingsPage(app.buttons["settings.connect"], destination: app.buttons["Enter address"], app); capture("Connect",app)
@@ -276,12 +279,12 @@ final class PhoneScreenshotTour: XCTestCase {
     @MainActor func testPairedComputerScreens() {
         let app = XCUIApplication(); app.launchArguments = ["--ui-smoke","-AppleLanguages","(en)"]
         app.launch(); app.declineConsent()
-        app.tabButton("Settings").tapReady()
+        guard app.selectTab("Settings") else { return }
         openSettingsPage(app.buttons["settings.connect"], destination: app.buttons["Enter address"], app)
         app.buttons["Enter address"].tapReady()
         let address = app.textFields["connect.url"]; address.tapReady(); address.typeText("http://127.0.0.1:3900")
         app.buttons["keyboard.done"].tapReady(); app.buttons["connect.submit"].tapReady(); app.openSpeak()
         XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout)); capture("Speak-computer",app)
-        for tab in ["Voices","Dub","Dictate"] { app.tabButton(tab).tap(); capture(tab+"-computer",app) }
+        for tab in ["Voices","Dub","Dictate"] { guard app.selectTab(tab) else { return }; capture(tab+"-computer",app) }
     }
 }

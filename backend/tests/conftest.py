@@ -53,6 +53,15 @@ os.environ.setdefault("OMNIVOICE_ALLOWED_HOSTS", "testserver")
 # different value monkeypatch it explicitly.
 os.environ["OMNIVOICE_MODEL"] = "test"
 
+# These two mirror tests/conftest.py (issue #1175 follow-up): a backend test that
+# boots the app lifespan can leave the deferred preload task pending, and 35s
+# later it loads real models under whichever test is running; and the physical-GPU
+# inventory reads the developer's registry/sysfs, so a routing test would resolve
+# differently on their machine than on a runner. Unconditional, like the root
+# suite: a stray shell export must not re-enable either.
+os.environ["OMNIVOICE_PRELOAD_WATERMARK"] = "0"
+os.environ["OMNIVOICE_DISABLE_GPU_INVENTORY"] = "1"
+
 
 import functools
 import shutil
@@ -201,3 +210,29 @@ def _clear_asr_installed_memo(request):
 
 # The shutdown-state reset (#1269) lives in the repository-root conftest.py so
 # that tests/ gets it as well: CI runs that whole directory in one process.
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_tts_placement():
+    """Fail a test that leaves a reference-ASR hold, exclusive placement or a
+    TTS load/unload registered. Any of those makes every later TTS load in the
+    session wait for a release that never comes (a leaked hold once stalled
+    the Windows suite until its timeout). Resets the state so the next test
+    starts clean. Runs after monkeypatch's undo, so it sees only real leaks.
+    Touches model_manager only when a test already imported it."""
+    yield
+    mm = sys.modules.get("services.model_manager")
+    if mm is None or not hasattr(mm, "_placement_cond"):
+        return
+    names = ("_unified_asr_holds", "_tts_loads_in_flight", "_tts_unloads_in_flight")
+    with mm._placement_cond:
+        leaked = {n: getattr(mm, n) for n in names if getattr(mm, n, 0)}
+        if getattr(mm, "_placement_exclusive", False):
+            leaked["_placement_exclusive"] = True
+        for n in names:
+            if hasattr(mm, n):
+                setattr(mm, n, 0)
+        if hasattr(mm, "_placement_exclusive"):
+            mm._placement_exclusive = False
+        mm._placement_cond.notify_all()
+    assert not leaked, f"test left TTS placement state behind: {leaked}"

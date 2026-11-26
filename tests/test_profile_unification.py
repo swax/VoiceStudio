@@ -279,7 +279,7 @@ async def test_edited_voice_preview_cannot_overwrite_newer_sample(app_client, mo
         await asyncio.wait_for(started.wait(), 4)
         edited = client.put(f"/profiles/{pid}", json={"instruct": "male, low pitch"})
         assert edited.status_code == 200, edited.text
-        assert edited.json()["design_recipe"] is None
+        assert json.loads(edited.json()["design_recipe"])["description"] == "male, low pitch"
         assert edited.json()["ref_audio_path"] is None
         with db_conn() as conn:
             current = conn.execute(
@@ -637,7 +637,9 @@ def test_editing_native_design_invalidates_stale_recipe_and_reference(app_client
     changed = client.put(f"/profiles/{pid}", json={"instruct": "female, low pitch"})
     assert changed.status_code == 200, changed.text
     assert changed.json()["instruct"] == "female, low pitch"
-    assert changed.json()["design_recipe"] is None
+    new_recipe = json.loads(changed.json()["design_recipe"])
+    assert new_recipe["description"] == "female, low pitch"
+    assert new_recipe["picks"] == {}
     assert changed.json()["ref_audio_path"] is None
     assert json.loads(changed.json()["vd_states"])["Pitch"] == "low pitch"
 
@@ -815,3 +817,131 @@ def test_migration_0005_downgrade_drops_columns(tmp_path):
     _run_alembic("downgrade", str(db), target="0003_voice_profile_consent")
     cols = _columns(db, "voice_profiles")
     assert "kind" not in cols and "vd_states" not in cols
+
+
+def _design_row(ref_text):
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT 'design' AS kind, 0 AS is_locked, NULL AS locked_audio_path, "
+        "'sample.wav' AS ref_audio_path, ? AS ref_text, "
+        "'female, young adult' AS instruct, 7 AS seed, NULL AS language, "
+        "NULL AS design_recipe",
+        (ref_text,),
+    ).fetchone()
+
+
+@pytest.mark.parametrize("stored", ["", None])
+def test_cleared_design_transcript_is_never_guessed_at_generation(stored):
+    """A sample kept after the user cleared its line must be transcribed, not
+    paired with words it never spoke."""
+    from api.routers.generation import _resolve_profile_conditioning
+    cond = _resolve_profile_conditioning(_design_row(stored), engine_id="omnivoice")
+    assert not cond["ref_text"]
+
+
+def test_padded_legacy_cut_transcript_is_still_cleared_for_transcription():
+    """The stored text is compared raw: a padded 100-character lock cut keeps
+    its length, is recognised as cut, and is transcribed again."""
+    import sqlite3
+    from api.routers.generation import _resolve_profile_conditioning
+    text = "  " + "x" * 96 + "  "
+    assert len(text) == 100
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT 'clone' AS kind, 1 AS is_locked, 'take.wav' AS locked_audio_path, "
+        "'ref.wav' AS ref_audio_path, ? AS ref_text, NULL AS instruct, 7 AS seed, "
+        "NULL AS language, NULL AS design_recipe, 'p1' AS id",
+        (text,),
+    ).fetchone()
+    cond = _resolve_profile_conditioning(row, engine_id="omnivoice")
+    assert not cond["ref_text"]
+
+
+def test_fresh_design_sample_stores_its_script_and_generation_pairs_it(
+    app_client, fake_render,
+):
+    """A sample rendered without a custom line records the fallback script in
+    the same write, so generation pairs it without a speech-to-text pass."""
+    from api.routers.archetypes import _FALLBACK_SCRIPT
+    from api.routers.generation import _resolve_profile_conditioning
+    from core.db import db_conn
+    client, _ = app_client
+    r = client.post("/profiles", data={
+        "name": "No line", "kind": "design", "vd_states": json.dumps(_VD),
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["ref_audio_path"]
+    assert r.json()["ref_text"] == _FALLBACK_SCRIPT
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM voice_profiles WHERE id=?", (r.json()["id"],),
+        ).fetchone()
+    cond = _resolve_profile_conditioning(row, engine_id="omnivoice")
+    assert cond["ref_text"] == _FALLBACK_SCRIPT
+
+
+PROSE = "warm, calm male narrator, slow and unhurried"
+
+
+def test_style_prose_is_stored_as_typed_on_clone_create_and_put(app_client):
+    client, _ = app_client
+    r = client.post(
+        "/profiles",
+        data={"name": "Prose clone", "kind": "clone", "instruct": PROSE},
+        files={"ref_audio": ("voice.wav", _FAKE_AUDIO, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["instruct"] == PROSE
+    pid = r.json()["id"]
+    edited = client.put(f"/profiles/{pid}", json={"instruct": "  soft whisper, intimate  "})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["instruct"] == "soft whisper, intimate"
+
+
+def test_unchanged_style_keeps_design_traits_recipe_and_sample(app_client):
+    from core.db import db_conn
+
+    client, _ = app_client
+    recipe = {"description": PROSE, "picks": {"Age": "young adult"}}
+    r = client.post("/profiles", data={
+        "name": "Keep", "kind": "design", "engine": "voxcpm2",
+        "vd_states": json.dumps(_VD), "design_recipe": json.dumps(recipe),
+    })
+    assert r.status_code == 200, r.text
+    pid = r.json()["id"]
+    with db_conn() as conn:
+        conn.execute("UPDATE voice_profiles SET ref_audio_path=? WHERE id=?", (f"{pid}.wav", pid))
+    before = client.get(f"/profiles/{pid}").json()
+    same = client.put(
+        f"/profiles/{pid}", json={"name": "Keep 2", "instruct": f" {before['instruct']} "}
+    )
+    assert same.status_code == 200, same.text
+    body = same.json()
+    assert body["vd_states"] == before["vd_states"]
+    assert body["design_recipe"] == before["design_recipe"]
+    assert body["ref_audio_path"] == f"{pid}.wav"
+
+
+def test_edited_design_prose_reaches_free_form_engines(app_client):
+    """#4474: an edited Style becomes the design's recipe, so free-form engines
+    receive the prose as typed and tag-only engines still get only tags."""
+    from core.db import db_conn
+    from services.voice_design_profiles import profile_instruct
+
+    client, _ = app_client
+    recipe = {"description": "A bright young announcer.", "picks": {"Age": "young adult"}}
+    r = client.post("/profiles", data={
+        "name": "Edit prose", "kind": "design", "engine": "voxcpm2",
+        "vd_states": json.dumps(_VD), "design_recipe": json.dumps(recipe),
+    })
+    assert r.status_code == 200, r.text
+    pid = r.json()["id"]
+    edited = client.put(f"/profiles/{pid}", json={"instruct": PROSE})
+    assert edited.status_code == 200, edited.text
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM voice_profiles WHERE id=?", (pid,)).fetchone()
+    assert profile_instruct(row, "voxcpm2") == PROSE
+    assert PROSE not in profile_instruct(row, "omnivoice")

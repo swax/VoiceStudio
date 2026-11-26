@@ -41,6 +41,8 @@ export interface Profile {
 export interface HistoryItem {
   id: string;
   text: string;
+  /** The list response cut `text`; fetch `/history/{id}` for the whole script. */
+  text_truncated?: boolean;
   mode: string; // 'clone' | 'design' | ...
   language: string | null;
   instruct: string | null;
@@ -208,6 +210,10 @@ export interface CloneGenerateInput {
   postprocess: boolean;
   /** '' = auto. */
   duration: string;
+  /** Silence at blank lines (ms). Omitted or 0 = off. */
+  paragraphGapMs?: number;
+  /** Trim each chunk's engine lead-in/tail before joining. */
+  trimEngineSilence?: boolean;
 }
 
 export interface GenerateResult {

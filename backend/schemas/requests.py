@@ -17,6 +17,7 @@ class RevealRequest(BaseModel):
     path: str
 
 class DubSegment(BaseModel):
+    source_ids: Optional[List[str]] = None  # Original subtitle cues linked to a narration block.
     start: float
     end: float
     text: str
@@ -33,15 +34,15 @@ class DubSegment(BaseModel):
     # Per-segment emotion reference for engines that take one (IndexTTS 2):
     # a local audio file whose delivery this line should follow (e.g. the
     # original actor's line), and how strongly (0-1, engine default 1.0).
-    emo_audio: Optional[str] = None
-    emo_alpha: Optional[float] = None
+    emo_audio: str | None = None
+    emo_alpha: float | None = None
     # Per-segment voice reference: a local audio file and its exact transcript,
     # replacing the profile's reference for this line only (both required).
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
     # Per-segment random seed for engines that sample in a sidecar (IndexTTS 2),
     # so a take re-timed at another speed keeps its performance.
-    seed: Optional[int] = None
+    seed: int | None = None
     effect_preset: str = "broadcast"   # NEW: DSP preset id (default: broadcast)
     # Echo of the segment's imported caption source id (`webvtt_source.id` /
     # `srt_source.id`) while its text is still that import's text. Without
@@ -78,6 +79,8 @@ class DubRequest(BaseModel):
     # An empty request has no speech to render; publishing it would replace
     # the language's track with silence.
     segments: List[DubSegment] = Field(min_length=1)
+    caption_segments: Optional[List[DubSegment]] = None
+    caption_segment_ids: Optional[List[str]] = None
     language: str = "Auto"
     language_code: str = "und"  # ISO 639-1 for ffmpeg metadata (e.g. "es", "fr", "de")
     instruct: str = ""
@@ -108,10 +111,11 @@ class DubRequest(BaseModel):
     # High-level timing strategy. Replaces the audio-compression default that
     # produced chipmunk/alien artefacts on high-density target languages
     # (Bengali, Hindi, Arabic…). Three modes:
-    #   "concise"       — never compress TTS audio. Trim text up-front via
-    #                     speech_rate so it fits naturally; if it still
-    #                     overflows, fail without replacing the current track;
-    #                     the user must shorten it or choose another fit mode.
+    #   "concise"       — never compress TTS audio by default. Synthesize at
+    #                     a natural rate and use available cue/gap space; if
+    #                     it still overflows, fail without replacing the
+    #                     current track. Opting in to auto_fit_overflow
+    #                     rescues the take with pitch-preserving compression.
     #                     DEFAULT.
     #   "stretch_video" — never compress TTS audio. Re-lay the timeline so
     #                     each segment's video portion is stretched (via
@@ -121,10 +125,16 @@ class DubRequest(BaseModel):
     #                     mild pitch-preserving audio speed-up (≤1.2× alone,
     #                     ≤1.5× in hybrid) and a mild per-segment video
     #                     slow-down (≤2.0×), per services/fit_planner.py.
-    #                     Residual overflow fails without discarding words.
+    #                     Residual overflow fails without discarding words
+    #                     unless auto_fit_overflow is opted in.
     #   "strict_slot"   — pitch-preserving fit of the complete speech to
     #                     the original start/end; may sound faster or slower.
-    timing_strategy: Optional[Literal["concise", "stretch_video", "strict_slot", "smart_fit"]] = "concise"
+    timing_strategy: Optional[Literal["concise", "stretch_video", "strict_slot", "smart_fit", "narration"]] = "concise"
+
+    # Opt-in (default off): if natural speech exceeds Concise/Smart Fit
+    # limits, fit the entire take with pitch-preserving audio compression
+    # instead of failing. Off keeps the blocking timing error.
+    auto_fit_overflow: bool = False
 
     # Per-job slip budget for "concise" mode. Overflow fails once gap
     # absorption + this much extra time has been consumed.
@@ -148,6 +158,35 @@ class DubRequest(BaseModel):
     #                  reused for every segment. Explicit `auto-seg:` cross
     #                  bindings still honour their clip.
     voice_match: Optional[Literal["per_line", "consistent"]] = "per_line"
+
+    @model_validator(mode="after")
+    def validate_narration(self):
+        if self.timing_strategy != "narration":
+            if self.caption_segments is not None or self.caption_segment_ids is not None:
+                raise ValueError("Separate captions require narration timing")
+            return self
+        import math
+        if not self.caption_segments or not self.caption_segment_ids:
+            raise ValueError("Narration requires the original subtitle cues and IDs")
+        for rows, ids in ((self.caption_segments, self.caption_segment_ids), (self.segments, self.segment_ids)):
+            if not ids or len(rows) != len(ids) or len(set(ids)) != len(ids):
+                raise ValueError("Narration cues require unique matching IDs")
+            if any(not math.isfinite(row.start) or not math.isfinite(row.end) or row.start < 0 or row.end <= row.start for row in rows):
+                raise ValueError("Narration times must be finite positive intervals")
+            if any(rows[i].start < rows[i-1].start for i in range(1, len(rows))):
+                raise ValueError("Narration cues must be in chronological order")
+        caption_ids = set(self.caption_segment_ids)
+        if any(s.source_ids and not set(s.source_ids).issubset(caption_ids) for s in self.segments):
+            raise ValueError("Narration blocks must reference existing subtitle cues")
+        by_id = dict(zip(self.caption_segment_ids, self.caption_segments))
+        for row in self.segments:
+            if row.source_ids:
+                cues = [by_id[sid] for sid in row.source_ids]
+                if abs(row.start - min(c.start for c in cues)) > .001 or abs(row.end - max(c.end for c in cues)) > .001:
+                    raise ValueError("Restore narration block windows from the original SRT before generating")
+        if any(self.segments[i].start < self.segments[i-1].end - 1e-6 for i in range(1, len(self.segments))):
+            raise ValueError("Narration block windows must not overlap")
+        return self
 
 class TranslateSegment(BaseModel):
     id: str
@@ -260,7 +299,7 @@ class DubAttachStemsRequest(BaseModel):
     """Stems the client separated itself, as file names in the job folder."""
 
     vocals: str = Field(min_length=1, max_length=255)
-    no_vocals: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    no_vocals: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class DubForkRequest(BaseModel):

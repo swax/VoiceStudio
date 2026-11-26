@@ -9,6 +9,7 @@ from core import failure
 from core import run_sentinel
 
 logger = logging.getLogger("omnivoice.tasks")
+_EXPECTED_STREAM_ERRORS = ("dub_source_changed", "dub_timing_overflow", "model_licence_required")
 
 
 def _stream_payload(update):
@@ -44,6 +45,45 @@ def _stream_failure(update):
     return detail if isinstance(detail, str) and detail else "Task failed"
 
 
+_TERMINAL_EVENTS = frozenset({"done", "error", "cancelled"})
+
+
+def _stream_event_type(update):
+    """An SSE update's event name, else its JSON ``type``, else None."""
+    payload, lines = _stream_payload(update)
+    for line in lines:
+        if line.startswith("event:"):
+            return line[6:].strip()
+    return payload.get("type") if payload is not None else None
+
+
+def closing_event(job: "dict | None") -> "str | None":
+    """The terminal frame a replay of a job that is no longer running must end with.
+
+    A process that dies mid-task (an OOM kill, a crash, an update restart)
+    leaves the job's last progress event as its tail. The startup sweep marks
+    the job ``failed`` but cannot write the terminal event its worker never
+    reached, so a reconnecting client's stream ended without one and the
+    client kept waiting on a task that no longer exists (#4463). Returns None
+    when the retained tail already ends with a terminal event or the job
+    completed; a ``done`` event carries results that cannot be rebuilt here.
+    """
+    if not job or job.get("status") == "done":
+        return None
+    try:
+        last = job_store.last_event(job["id"])
+    except Exception:
+        logger.exception("job_store.last_event failed; ending the replay from the job status")
+        last = None
+    if last is not None and _stream_event_type(last) in _TERMINAL_EVENTS:
+        return None
+    if job.get("status") == "cancelled":
+        return f"data: {json.dumps({'type': 'cancelled'})}\n\n"
+    # ``failed``, or still ``pending``/``running`` with no live task behind it.
+    event = failure.build_failure_event(job.get("error") or job_store.INTERRUPTED_BY_RESTART, stage="task")
+    return f"data: {json.dumps(event)}\n\n"
+
+
 class TaskManager:
     """In-memory task dispatcher with SQLite-backed metadata.
 
@@ -66,7 +106,9 @@ class TaskManager:
 
     async def add_task(self, task_id, task_type, func, *args, project_id=None, meta=None, **kwargs):
         self._init_queue()
+        from core import diagnostic_reports
         task_obj = {
+            "diagnostic_epoch": diagnostic_reports.inherited_grant(),
             "status": "pending",
             "type": task_type,
             "created_at": time.time(),
@@ -147,42 +189,60 @@ class TaskManager:
             # by the next run. Task TYPE only — never user content. The touch
             # is throttled + exception-safe by contract (core.run_sentinel).
             run_sentinel.touch_activity("task", t.get("type"))
+            from core import diagnostic_reports
+            diagnostic_epoch = t.get("diagnostic_epoch")
             try:
                 import inspect
-                res = func(*args, **kwargs)
-                if inspect.isasyncgen(res):
-                    # Close the stream however the task ends (done, cancelled,
-                    # failed or raised) so a render releases what it holds, such
-                    # as voice-file leases, instead of staying suspended (#2535).
-                    async with contextlib.aclosing(res):
-                        async for update in res:
-                            # A `done` update means the work is already
-                            # committed; a cancel that arrived meanwhile must
-                            # not report it as cancelled, or the client would
-                            # redo work that exists.
-                            if t.get("cancelled") and not _stream_completed(update):
-                                await self._push_event(task_id, f"data: {json.dumps({'type': 'cancelled'})}\n\n")
-                                t["status"] = "cancelled"
-                                try: job_store.mark_cancelled(task_id)
-                                except Exception: logger.exception("job_store.mark_cancelled failed")
-                                break
-                            await self._push_event(task_id, update)
-                            stream_error = _stream_failure(update)
-                            if stream_error is not None:
-                                t["status"] = "failed"
-                                t["error"] = stream_error
+                with diagnostic_reports.grant_scope(diagnostic_epoch):
+                    res = func(*args, **kwargs)
+                    if inspect.isasyncgen(res):
+                        # Close the stream however the task ends (done, cancelled,
+                        # failed or raised) so a render releases what it holds, such
+                        # as voice-file leases, instead of staying suspended (#2535).
+                        async with contextlib.aclosing(res):
+                            while True:
                                 try:
-                                    job_store.mark_failed(task_id, stream_error)
-                                except Exception:
-                                    logger.exception("job_store.mark_failed failed")
-                                break
-                elif inspect.iscoroutine(res):
-                    await res
-                if t["status"] not in {"cancelled", "failed"}:
-                    t["status"] = "done"
-                    try: job_store.mark_done(task_id)
-                    except Exception: logger.exception("job_store.mark_done failed")
+                                    update = await diagnostic_reports.await_owned(anext(res), diagnostic_epoch)
+                                except StopAsyncIteration:
+                                    break
+                                # A `done` update means the work is already
+                                # committed; a cancel that arrived meanwhile must
+                                # not report it as cancelled, or the client would
+                                # redo work that exists.
+                                if t.get("cancelled") and not _stream_completed(update):
+                                    await self._push_event(task_id, f"data: {json.dumps({'type': 'cancelled'})}\n\n")
+                                    t["status"] = "cancelled"
+                                    try: job_store.mark_cancelled(task_id)
+                                    except Exception: logger.exception("job_store.mark_cancelled failed")
+                                    break
+                                await self._push_event(task_id, update)
+                                stream_error = _stream_failure(update)
+                                if stream_error is not None:
+                                    frame, _ = _stream_payload(update)
+                                    code = frame.get("error_code") if frame is not None else None
+                                    expected_refusal = isinstance(code, str) and code in _EXPECTED_STREAM_ERRORS
+                                    if (
+                                        diagnostic_epoch is not None
+                                        and not expected_refusal
+                                        and not diagnostic_reports.failure_already_captured(update, diagnostic_epoch)
+                                    ):
+                                        diagnostic_reports.capture_failure(diagnostic_reports.route_stage(t.get("type", "")), expected_epoch=diagnostic_epoch)
+                                    t["status"] = "failed"
+                                    t["error"] = stream_error
+                                    try:
+                                        job_store.mark_failed(task_id, stream_error)
+                                    except Exception:
+                                        logger.exception("job_store.mark_failed failed")
+                                    break
+                    elif inspect.iscoroutine(res):
+                        await diagnostic_reports.await_owned(res, diagnostic_epoch)
+                    if t["status"] not in {"cancelled", "failed"}:
+                        t["status"] = "done"
+                        try: job_store.mark_done(task_id)
+                        except Exception: logger.exception("job_store.mark_done failed")
             except Exception as e:
+                if diagnostic_epoch is not None and not t.get("cancelled"):
+                    diagnostic_reports.capture_failure(diagnostic_reports.route_stage(t.get("type", "")), error=e, expected_epoch=diagnostic_epoch)
                 logger.exception("Task %s failed", task_id)
                 t["status"] = "failed"
                 # plan-04 (#131): structured, non-empty failure event instead of

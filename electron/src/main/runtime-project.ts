@@ -2,6 +2,8 @@ import {
   nvidiaDriverPresent,
   cudaOnlyPackages,
   windowsRocmSyncArgs,
+  legacyNvidiaCard,
+  primeLegacyNvidiaProbe,
 } from '../../scripts/torch-variant.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 export { nvidiaDriverPresent, cudaOnlyPackages } from '../../scripts/torch-variant.mjs';
@@ -55,7 +57,18 @@ import {
 } from './wheel-prefetch';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { cp, mkdir, readFile, readdir, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import {
+  cp,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  rmdir,
+  stat,
+  statfs,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, isAbsolute, join, win32 } from 'node:path';
 
 // The web UI is not staged: the backend serves it straight from the app's
@@ -66,6 +79,7 @@ const SOURCES = [
   'omnivoice',
   'pyproject.toml',
   'uv.lock',
+  'vendor/wheels',
   'scripts/windows-rocm-recipe.json',
   'scripts/smoke_windows_rocm.py',
   'README.md',
@@ -143,6 +157,109 @@ export const CPU_TORCH_ARGS = [
   '--index-strategy',
   'unsafe-best-match',
 ] as const;
+/**
+ * CUDA 12.6 PyTorch for NVIDIA cards below compute capability 7.0 (#4242). The
+ * lock's cu128 build has no sm_50-sm_61 kernels (PyTorch dropped them in 2.8);
+ * the cu126 builds keep them through PyTorch 2.14. Installed as an overlay like
+ * the CPU build, so the lock and the Docker images stay on cu128. Pins are kept
+ * equal to the `torch==` constraints in pyproject.toml by
+ * tests/test_rocm_torch_pins_match_pyproject.py.
+ */
+export const LEGACY_CUDA_INDEX = 'https://download.pytorch.org/whl/cu126';
+export const LEGACY_CUDA_PINS = [
+  'torch==2.10.0+cu126',
+  'torchaudio==2.10.0+cu126',
+  'torchvision==0.25.0+cu126',
+] as const;
+export const LEGACY_CUDA_ARGS = [
+  '--extra-index-url',
+  LEGACY_CUDA_INDEX,
+  '--index-strategy',
+  'unsafe-best-match',
+] as const;
+/** Why the last legacy-CUDA install fell back to CPU; read by the backend's GPU report. */
+export const LEGACY_CUDA_FALLBACK_MARKER = '.runtime-torch-fallback';
+export const LEGACY_CUDA_PROBE_PREFIX = 'VOICESTUDIO_LEGACY_CUDA_PROBE=';
+/**
+ * Confirms the freshly installed cu126 torch can drive the card. Mirrors
+ * backend/core/device_caps.py::cuda_build_covers (tests keep them equal) and never
+ * raises: the verdict is printed as JSON.
+ */
+export const LEGACY_CUDA_PROBE = [
+  'import json',
+  "r = {'ok': False, 'reason': 'probe did not run'}",
+  'def covers(arch, major, minor):',
+  '    import re',
+  '    dev = major * 10 + minor',
+  '    for entry in arch:',
+  "        m = re.match(r'^(sm|compute)_(\\d+)([a-z]?)$', str(entry).strip())",
+  '        if not m:',
+  '            continue',
+  '        cc = int(m.group(2))',
+  '        if m.group(3):',
+  '            if cc == dev:',
+  '                return True',
+  '            continue',
+  "        if m.group(1) == 'sm':",
+  '            if cc // 10 == major and cc % 10 <= minor:',
+  '                return True',
+  '        elif cc <= dev:',
+  '            return True',
+  '    return False',
+  'try:',
+  '    import torch',
+  "    if not getattr(torch.version, 'cuda', None):",
+  "        r = {'ok': False, 'reason': 'the installed PyTorch has no CUDA support'}",
+  '    elif not torch.cuda.is_available():',
+  "        r = {'ok': False, 'reason': 'torch.cuda.is_available() is False (driver too old or no usable device)'}",
+  '    else:',
+  '        arch = list(torch.cuda.get_arch_list())',
+  '        bad = []',
+  '        for i in range(torch.cuda.device_count()):',
+  '            major, minor = torch.cuda.get_device_capability(i)',
+  '            if not covers(arch, major, minor):',
+  "                bad.append('sm_%d%d' % (major, minor))",
+  "        r = {'ok': not bad, 'reason': ('no kernels for ' + ', '.join(bad) + ' in ' + ' '.join(arch)) if bad else ''}",
+  'except Exception as exc:',
+  "    r = {'ok': False, 'reason': type(exc).__name__ + ' while checking CUDA'}",
+  "print('" + LEGACY_CUDA_PROBE_PREFIX + "' + json.dumps(r), flush=True)",
+  'import os',
+  'os._exit(0)',
+].join('\n');
+export function parseLegacyCudaProbe(output: string | void): { ok: boolean; reason: string } {
+  const line = (output || '')
+    .split(/\r?\n/)
+    .findLast((candidate) => candidate.startsWith(LEGACY_CUDA_PROBE_PREFIX));
+  if (!line) return { ok: false, reason: 'the CUDA check produced no result' };
+  try {
+    const parsed = JSON.parse(line.slice(LEGACY_CUDA_PROBE_PREFIX.length)) as {
+      ok?: unknown;
+      reason?: unknown;
+    };
+    return { ok: parsed.ok === true, reason: String(parsed.reason ?? '').slice(0, 300) };
+  } catch {
+    return { ok: false, reason: 'the CUDA check result was unreadable' };
+  }
+}
+
+/**
+ * Read the GPU's compute capability once, off the main thread, before any
+ * variant resolution (resolveTorchVariant reads the primed cache). Only hosts
+ * with an NVIDIA driver on a platform that can select cu126 spawn nvidia-smi.
+ */
+export async function primeTorchVariantProbe(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+  hasNvidia: () => boolean = () => nvidiaDriverPresent(platform),
+  prime: () => Promise<unknown> = () => primeLegacyNvidiaProbe(),
+): Promise<void> {
+  if (!cpuTorchApplies(platform, arch) || (platform === 'win32' && arch === 'arm64')) return;
+  // `auto` and an empty value still reach the sync reader in resolveTorchVariant.
+  const requested = process.env.OMNIVOICE_TORCH_VARIANT?.trim().toLowerCase();
+  if (requested && requested !== 'auto') return;
+  if (hasNvidia()) await prime();
+}
+
 /** Windows on ARM runs the x64 interpreter: PyTorch ships no win_arm64 torchaudio. */
 export const WIN_ARM64_PYTHON_REQUEST = 'cpython-3.11-windows-x86_64';
 export const RUNTIME_REPAIR_PACKAGES = ['torch', 'torchaudio', 'torchvision'] as const;
@@ -187,6 +304,18 @@ export const OUTDATED_SYSTEM_LIBRARY_CODE = 'OUTDATED_SYSTEM_LIBRARY';
 export const MIN_MSVCP140_VERSION = [14, 40] as const;
 /** Windows exit status for an access violation, unsigned and signed. */
 const ACCESS_VIOLATION_EXIT_CODES = new Set<unknown>([3221225477, -1073741819]);
+/**
+ * Python's `OSError: [WinError 1114]` from torch's own DLL loader (#4230).
+ *
+ * `torch/__init__.py` re-raises it as "Error loading ...\\torch\\lib\\c10.dll or one of
+ * its dependencies". A DLL initialization routine fails in `c10.dll` when the
+ * Visual C++ runtime it initialises against is too old or damaged; reinstalling
+ * the wheels cannot change a system library.
+ */
+/** Error code for a torch DLL that would not initialise when the cause is not established. */
+export const TORCH_DLL_INIT_FAILED_CODE = 'TORCH_DLL_INIT_FAILED';
+// One line, no distance limit: a long custom runtime path must still match (#4230).
+const TORCH_DLL_INIT_FAILED = /WinError 1114[^\r\n]*\btorch[\\/]+lib[\\/]+\w+\.dll/i;
 function importFailure(error: unknown): Error {
   const failure = error as { code?: unknown; message?: unknown; stdout?: unknown } | null;
   const module = lastImportAttempted(failure?.stdout);
@@ -276,7 +405,7 @@ export function runtimePython(root: string, platform = process.platform): string
     : join(root, '.venv', 'bin', 'python');
 }
 
-export type TorchVariant = 'default' | 'cpu' | 'rocm';
+export type TorchVariant = 'default' | 'cpu' | 'rocm' | 'cu126';
 export interface TorchChoice {
   variant: TorchVariant;
   /** True when pinned via OMNIVOICE_TORCH_VARIANT; false when inferred from the host. */
@@ -296,13 +425,15 @@ export function cpuTorchApplies(platform: NodeJS.Platform, arch: string): boolea
  * `cuda` | `cpu` | `rocm` | `auto` (default). Auto installs the CPU build on
  * Linux/Windows x64 hosts with no NVIDIA driver (no multi-GB CUDA download) and
  * always on Windows on ARM; every other host keeps the lock's default wheels
- * (macOS: PyPI MPS/CPU, Linux arm64: PyPI CPU).
+ * (macOS: PyPI MPS/CPU, Linux arm64: PyPI CPU). NVIDIA hosts whose cards are all
+ * below compute capability 7.0 get the CUDA 12.6 build (`cu126`) instead.
  */
 export function resolveTorchVariant(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
   hasNvidia: () => boolean = () => nvidiaDriverPresent(platform),
+  legacyNvidia: () => boolean = () => legacyNvidiaCard().legacy,
 ): TorchChoice {
   const raw = env.OMNIVOICE_TORCH_VARIANT?.trim().toLowerCase() ?? '';
   windowsRocmSelected(raw, platform, arch);
@@ -313,7 +444,10 @@ export function resolveTorchVariant(
   }
   if (!cpuTorchApplies(platform, arch)) return { variant: 'default', explicit: false };
   if (platform === 'win32' && arch === 'arm64') return { variant: 'cpu', explicit: false };
-  return { variant: hasNvidia() ? 'default' : 'cpu', explicit: false };
+  if (!hasNvidia()) return { variant: 'cpu', explicit: false };
+  // Pre-Volta cards (GTX 900/1000) need the cu126 wheels (#4242). An explicit
+  // `cuda` request above keeps the lock's cu128 build as the opt-out.
+  return { variant: legacyNvidia() ? 'cu126' : 'default', explicit: false };
 }
 
 /** uv's download cache: beside the replaceable project, so retries reuse finished wheels. */
@@ -368,6 +502,7 @@ async function dependencyStamp(
   hash.update(RUNTIME_SCHEMA);
   if (variant === 'rocm') hash.update(':torch=rocm');
   if (variant === 'cpu') hash.update(':torch=cpu');
+  if (variant === 'cu126') hash.update(':torch=cu126');
   if (windowsRocmSelected(variant)) hash.update(await windowsRocmStamp(bundle));
   for (const file of ['pyproject.toml', 'uv.lock']) hash.update(await readFile(join(bundle, file)));
   return hash.digest('hex');
@@ -439,7 +574,7 @@ async function ensureCudnn8Compat(
     // CPU and ROCm installs cannot need CUDA compatibility libraries. Avoid
     // importing native Torch just to rediscover that fact (#2942), while still
     // finding site-packages for the Linux executable-stack repair below.
-    ...(variant === 'default'
+    ...(variant === 'default' || variant === 'cu126'
       ? [
           "device = 'unknown'",
           'try:',
@@ -785,10 +920,40 @@ export function outdatedSystemLibraryError(
   diagnosis: NativeRuntimeDiagnosis,
 ): Error | null {
   const code = (failure as { code?: unknown } | null)?.code;
-  if (!ACCESS_VIOLATION_EXIT_CODES.has(code)) return null;
   const msvcp = diagnosis.msvcp140;
+  const output = failure as { stdout?: unknown; stderr?: unknown; message?: unknown } | null;
+  const text = `${output?.stderr ?? ''}\n${output?.stdout ?? ''}\n${output?.message ?? ''}`;
+  const module = lastImportAttempted(output?.stdout);
+  // torch's DLL loader names the failure itself, so it needs no crash status. The
+  // system runtime is the cause whether or not the probe could read its version.
+  if (TORCH_DLL_INIT_FAILED.test(text)) {
+    const subject = module ? `Importing "${module}" failed` : 'Loading PyTorch failed';
+    if (msvcp && msvcp140Outdated(msvcp.version)) {
+      return Object.assign(
+        new Error(
+          `${subject} because Windows could not initialise PyTorch's c10.dll (WinError 1114) and this ` +
+            `system's Visual C++ runtime is outdated (${scrubText(msvcp.path)} is version ${msvcp.version}; ` +
+            `${MIN_MSVCP140_VERSION.join('.')} or newer is needed). Install the latest Microsoft Visual C++ ` +
+            'Redistributable (x64) from Microsoft, restart Windows and press Retry; reinstalling the ' +
+            'Python packages cannot update a system library.',
+        ),
+        { code: OUTDATED_SYSTEM_LIBRARY_CODE, stdout: output?.stdout },
+      );
+    }
+    // The runtime is current or could not be read: the cause is not established.
+    return Object.assign(
+      new Error(
+        `${subject} because Windows could not initialise PyTorch's c10.dll (WinError 1114). The cause ` +
+          'is not established: this Windows system\'s Visual C++ runtime ' +
+          `${msvcp?.version ? `(${msvcp.version}) looks current` : 'version could not be read'}. Installing the latest ` +
+          'Microsoft Visual C++ Redistributable (x64) and restarting Windows may help; so may updating the ' +
+          'graphics driver or pressing Clean & Retry under More fixes. Send the in-app report if it persists.',
+      ),
+      { code: TORCH_DLL_INIT_FAILED_CODE, stdout: output?.stdout },
+    );
+  }
+  if (!ACCESS_VIOLATION_EXIT_CODES.has(code)) return null;
   if (!msvcp || !msvcp140Outdated(msvcp.version)) return null;
-  const module = lastImportAttempted((failure as { stdout?: unknown }).stdout);
   return Object.assign(
     new Error(
       `${module ? `Importing "${module}" crashed` : 'A native import crashed'} because this Windows ` +
@@ -801,6 +966,7 @@ export function outdatedSystemLibraryError(
 }
 
 export async function runtimeReady(bundle: string, project: string): Promise<boolean> {
+  await primeTorchVariantProbe();
   if (await runtimeIncomplete(project)) return false;
   try {
     return (
@@ -825,6 +991,7 @@ export async function runtimeReady(bundle: string, project: string): Promise<boo
  * Tauri predates it and owns the same frozen Python graph.
  */
 export async function runtimeCompatible(bundle: string, project: string): Promise<boolean> {
+  await primeTorchVariantProbe();
   if (await runtimeIncomplete(project)) return false;
   try {
     const [python, config, bundledProject, installedProject, bundledLock, installedLock, marker] =
@@ -853,8 +1020,12 @@ export async function runtimeCompatible(bundle: string, project: string): Promis
           normalizeLockHosts(installedLock.toString('utf8'))) &&
       (marker === null
         ? // A Tauri environment carries the lock's default (CUDA) torch: fine for
-          // inferred CPU hosts, wrong for an explicit ROCm or CPU request.
-          !resolveTorchVariant().explicit || resolveTorchVariant().variant === 'default'
+          // inferred CPU hosts, wrong for an explicit ROCm or CPU request, and
+          // wrong for a pre-Volta card that needs the cu126 build (#4242).
+          ((choice) =>
+            choice.variant !== 'cu126' && (!choice.explicit || choice.variant === 'default'))(
+            resolveTorchVariant(),
+          )
         : (await acceptedStamps(bundle)).includes(marker)) &&
       (!windowsRocmSelected() ||
         ((await windowsRocmRecipeMatches(bundle, project)) && (await windowsRocmReady(project))))
@@ -1297,7 +1468,59 @@ export async function installManagedPython(
   }
 }
 
-/** Called only by the user's install action; normal startup never downloads. */
+
+function errorText(error: unknown): string {
+  return [error instanceof Error ? error.message : String(error), (error as { stderr?: unknown })?.stderr]
+    .filter((part) => typeof part === 'string')
+    .join('\n');
+}
+
+const MINOR_LINK_ERROR_RE =
+  /Missing expected target directory for Python minor version link at ([^\r\n]+)/;
+
+/**
+ * uv (up to at least 0.12) fails `python install` with "Missing expected target
+ * directory for Python minor version link" when its `cpython-3.11-<platform>`
+ * junction cannot be validated, even though the patch interpreter is intact
+ * (astral-sh/uv#19622; #4487). Setup only needs the interpreter, so on this
+ * error drop the stale minor-version links (links only, never an interpreter
+ * directory) and, if uv still refuses, hand back the patch interpreter's own
+ * path, which needs no link. Returns null when the error is something else.
+ */
+export async function recoverMinorVersionLink(
+  error: unknown,
+  installDir: string,
+  log: (line: string) => void = () => {},
+): Promise<{ python: string | null } | null> {
+  const patchDir = MINOR_LINK_ERROR_RE.exec(errorText(error))?.[1]?.trim();
+  if (!patchDir) return null;
+  let removed = 0;
+  for (const name of await readdir(installDir).catch(() => [] as string[])) {
+    if (!/^cpython-\d+\.\d+-/.test(name)) continue;
+    const link = join(installDir, name);
+    try {
+      if (!(await lstat(link)).isSymbolicLink()) continue;
+      await rmdir(link).catch(() => rm(link, { force: true }));
+      removed++;
+    } catch {
+      /* leave anything we cannot inspect alone */
+    }
+  }
+  // Windows interpreters sit at the patch root, POSIX ones under bin/.
+  let python: string | null = null;
+  for (const candidate of [join(patchDir, 'python.exe'), join(patchDir, 'bin', 'python3')]) {
+    if (await stat(candidate).then(() => true, () => false)) {
+      python = candidate;
+      break;
+    }
+  }
+  log(
+    `uv could not validate its Python minor-version link (uv#19622); removed ${removed} stale link(s)` +
+      (python ? ', using the interpreter path directly if uv still refuses.' : '.'),
+  );
+  return { python };
+}
+
 /**
  * Runs the pinned interpreter once before gigabytes of wheels arrive, so a machine
  * that refuses it finds out now. Only a refusal stops setup and it removes nothing;
@@ -1312,7 +1535,7 @@ async function interpreterCanary(
   signal: AbortSignal,
   downloads: MirrorReporter,
   allowMirrorFallback = false,
-): Promise<void> {
+): Promise<string | undefined> {
   const refused = (program: string, error: unknown) => {
     const refusal = runtimeLaunchRefusal(program, error);
     if (!refusal) return null;
@@ -1324,12 +1547,12 @@ async function interpreterCanary(
     );
   };
   const request = managedPythonRequest();
-  let python = '';
-  try {
-    // Stays inside the runtime: no user-wide python on PATH, no Windows registry entry.
-    await installManagedPython(
+  const installArgs = ['python', 'install', '--no-bin', '--no-registry', request];
+  // Stays inside the runtime: no user-wide python on PATH, no Windows registry entry.
+  const install = () =>
+    installManagedPython(
       uv,
-      ['python', 'install', '--no-bin', '--no-registry', request],
+      installArgs,
       project,
       env,
       run,
@@ -1337,27 +1560,52 @@ async function interpreterCanary(
       allowMirrorFallback,
       downloads.log,
     );
+  let python = '';
+  let direct: string | undefined;
+  try {
+    try {
+      await install();
+    } catch (error) {
+      signal.throwIfAborted();
+      const recovery = await recoverMinorVersionLink(
+        error,
+        env.UV_PYTHON_INSTALL_DIR ?? join(project, '..', '.python'),
+        downloads.log,
+      );
+      if (!recovery) throw error;
+      try {
+        await install();
+      } catch (second) {
+        signal.throwIfAborted();
+        if (!MINOR_LINK_ERROR_RE.test(errorText(second)) || !recovery.python) throw second;
+        downloads.log?.("Using the installed interpreter by path, without uv's minor-version link.");
+        direct = recovery.python;
+        python = direct;
+      }
+    }
     signal.throwIfAborted();
-    const found = await run(uv, ['python', 'find', '--managed-python', request], project, env, {
-      timeoutMs: CANARY_TIMEOUT_MS,
-      quiet: true,
-    });
-    // The quiet runner mixes stderr in, so a warning may sit beside the path.
-    python =
-      typeof found === 'string'
-        ? (found
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .find((line) => isAbsolute(line) || win32.isAbsolute(line)) ?? '')
-        : '';
+    if (!direct) {
+      const found = await run(uv, ['python', 'find', '--managed-python', request], project, env, {
+        timeoutMs: CANARY_TIMEOUT_MS,
+        quiet: true,
+      });
+      // The quiet runner mixes stderr in, so a warning may sit beside the path.
+      python =
+        typeof found === 'string'
+          ? (found
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .find((line) => isAbsolute(line) || win32.isAbsolute(line)) ?? '')
+          : '';
+    }
   } catch (error) {
     signal.throwIfAborted();
     const refusal = refused(uv, error);
     if (refusal) throw refusal;
     downloads.log?.('Skipping the interpreter check: uv could not prepare Python here.');
-    return;
+    return undefined;
   }
-  if (!python) return;
+  if (!python) return direct;
   try {
     await run(python, ['-c', 'import _ctypes'], project, env, {
       timeoutMs: CANARY_TIMEOUT_MS,
@@ -1369,6 +1617,7 @@ async function interpreterCanary(
     if (refusal) throw refusal;
     downloads.log?.('The interpreter check did not pass; continuing with setup.');
   }
+  return direct;
 }
 
 export async function installRuntime(
@@ -1382,6 +1631,7 @@ export async function installRuntime(
   downloads: MirrorReporter = {},
 ): Promise<void> {
   signal.throwIfAborted();
+  await primeTorchVariantProbe();
   phase('checking');
   if (process.platform === 'darwin' && process.arch === 'x64') {
     throw Object.assign(new Error('INTEL_MAC_UNSUPPORTED'), { code: 'INTEL_MAC_UNSUPPORTED' });
@@ -1508,11 +1758,11 @@ export async function installRuntime(
     // supply a system file (#3058).
     throw missingSystemLibraryError(missingSystemLibraries);
   }
-  const pythonArgs = existingPython
+  let pythonArgs = existingPython
     ? ['--python', runtimePython(project)]
     : ['--managed-python', '--python', managedPythonRequest()];
-  if (!existingPython)
-    await interpreterCanary(
+  if (!existingPython) {
+    const direct = await interpreterCanary(
       uv,
       project,
       env,
@@ -1521,9 +1771,14 @@ export async function installRuntime(
       downloads,
       region === 'auto' && !process.env.UV_PYTHON_INSTALL_MIRROR,
     );
+    // uv's own minor-version link is broken here (#4487): name the interpreter
+    // itself so the sync never has to validate that link.
+    if (direct) pythonArgs = ['--python', direct];
+  }
   const cpuTorch = torch.variant === 'cpu';
   const linuxRocm = process.platform === 'linux' && torch.variant === 'rocm';
-  const overlayTorch = cpuTorch || linuxRocm;
+  const legacyCuda = torch.variant === 'cu126';
+  const overlayTorch = cpuTorch || linuxRocm || legacyCuda;
   // A failed native import may leave distribution metadata intact, so uv's
   // ordinary sync would otherwise consider the broken wheel already satisfied.
   const torchPackages: readonly string[] = RUNTIME_REPAIR_PACKAGES;
@@ -1546,7 +1801,9 @@ export async function installRuntime(
   const cudaPackages = overlayTorch
     ? cudaOnlyPackages(await readFile(join(project, 'uv.lock'), 'utf8'))
     : [];
-  if (overlayTorch && existingPython && cudaPackages.length) {
+  // cu126 needs the nvidia-* runtime wheels it pins; the overlay install below
+  // replaces whichever versions are present, so they are skipped, not removed.
+  if (overlayTorch && !legacyCuda && existingPython && cudaPackages.length) {
     // A CUDA sync may finish before verification updates .runtime-torch.
     // Remove its runtime payloads independently of that historical marker,
     // keeping matching CPU/ROCm torch and shared locked dependencies intact.
@@ -1573,7 +1830,7 @@ export async function installRuntime(
           // Exact sync uninstalls every skipped package, so each Resume or
           // Repair would remove the matching CPU/ROCm overlay (#3475). A
           // switch from CUDA must still remove its multi-GB runtime wheels.
-          ...(keepTorchOverlay ? ['--inexact'] : []),
+          ...(keepTorchOverlay || legacyCuda ? ['--inexact'] : []),
           ...[...torchPackages, ...cudaPackages].flatMap((name) => ['--no-install-package', name]),
         ]
       : [];
@@ -1645,6 +1902,73 @@ export async function installRuntime(
     );
     signal.throwIfAborted();
   }
+  let legacyFallback = '';
+  // A stale reason from an earlier cu126 attempt must not outlive a switch to any other variant.
+  await rm(join(project, LEGACY_CUDA_FALLBACK_MARKER), { force: true });
+  if (legacyCuda) {
+    try {
+      await retryDownload(() =>
+        run(
+          uv,
+          [
+            'pip',
+            'install',
+            '--python',
+            runtimePython(project),
+            ...repairPackages
+              .filter((name) => torchPackages.includes(name))
+              .flatMap((name) => ['--reinstall-package', name]),
+            ...LEGACY_CUDA_PINS,
+            ...LEGACY_CUDA_ARGS,
+          ],
+          project,
+          env,
+        ),
+      );
+      signal.throwIfAborted();
+      const verdict = parseLegacyCudaProbe(
+        await run(runtimePython(project), ['-c', LEGACY_CUDA_PROBE], project, env, {
+          timeoutMs: CANARY_TIMEOUT_MS,
+          quiet: true,
+        }).catch((error: { stdout?: string }) => error?.stdout),
+      );
+      if (!verdict.ok) legacyFallback = verdict.reason;
+    } catch (error) {
+      signal.throwIfAborted();
+      legacyFallback = `the CUDA 12.6 PyTorch install failed: ${String((error as Error)?.message ?? error).slice(0, 200)}`;
+    }
+    if (legacyFallback) {
+      legacyFallback = scrubText(legacyFallback).slice(0, 300);
+      // Same outcome as before this build existed: PyTorch engines on the CPU.
+      // The cu128 build has no kernels for these cards, so it is no fallback.
+      downloads.log?.(
+        `Legacy NVIDIA CUDA 12.6 build rejected (${legacyFallback}); using the CPU build.`,
+      );
+      await retryDownload(() =>
+        run(
+          uv!,
+          [
+            'pip',
+            'install',
+            '--python',
+            runtimePython(project),
+            '--reinstall-package',
+            'torch',
+            '--reinstall-package',
+            'torchaudio',
+            '--reinstall-package',
+            'torchvision',
+            ...CPU_TORCH_PINS,
+            ...CPU_TORCH_ARGS,
+          ],
+          project,
+          env,
+        ),
+      );
+      signal.throwIfAborted();
+      await writeFile(join(project, LEGACY_CUDA_FALLBACK_MARKER), legacyFallback);
+    }
+  }
   if (windowsRocm) {
     await retryDownload(() =>
       run(runtimePython(project), ['-m', WINDOWS_ROCM_MODULE, '--uv', uv], project, env),
@@ -1667,7 +1991,7 @@ export async function installRuntime(
     );
     signal.throwIfAborted();
   }
-  await ensureCudnn8Compat(uv, project, run, env, signal, torch.variant);
+  await ensureCudnn8Compat(uv, project, run, env, signal, legacyFallback ? 'cpu' : torch.variant);
   signal.throwIfAborted();
   // A non-English profile path in uv's editable .pth crashes Python 3.11 at
   // startup on a non-UTF-8 Windows code page (#1783).
@@ -1709,7 +2033,7 @@ export async function installRuntime(
   signal.throwIfAborted();
   await writeFile(
     join(project, RUNTIME_TORCH_MARKER),
-    windowsRocm ? 'windows-rocm' : torch.variant,
+    windowsRocm ? 'windows-rocm' : legacyFallback ? 'cpu' : torch.variant,
   );
   // The ready marker is written last and is authoritative: it supersedes the
   // install marker even if removing that marker below fails (#3475).

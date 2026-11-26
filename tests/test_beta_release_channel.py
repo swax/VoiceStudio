@@ -161,6 +161,16 @@ def test_publish_proves_where_latest_points(tmp_path, channel, latest, ok):
     import os
     import subprocess
 
+    git_bash = Path(os.environ.get("ProgramFiles", "")) / "Git/bin/bash.exe"
+    bash = None
+    for directory in [str(git_bash.parent), *os.environ.get("PATH", os.defpath).split(os.pathsep)]:
+        candidate = shutil.which("bash", path=directory)
+        if candidate and Path(candidate.replace("\\", "/")).parent.name.casefold() not in {"system32", "sysnative"}:
+            bash = candidate
+            break
+    if bash is None:
+        pytest.skip("Native Bash required; the WSL launcher does not preserve the test environment")
+
     workflow = yaml.safe_load((ROOT / ".github/workflows/electron-release.yml").read_text(encoding="utf-8"))
     step = next(s for s in workflow["jobs"]["release"]["steps"] if s.get("name") == "Publish only when explicitly requested")
     fake = tmp_path / "bin"
@@ -176,7 +186,5 @@ def test_publish_proves_where_latest_points(tmp_path, channel, latest, ok):
                GITHUB_REPOSITORY="debpalash/VoiceStudio", REHEARSAL="false")
     script = tmp_path / "publish.sh"
     script.write_text(step["run"], encoding="utf-8", newline="\n")
-    result = subprocess.run(
-        [shutil.which("bash") or "bash", "-e", script.as_posix()], env=env, capture_output=True, text=True
-    )
+    result = subprocess.run([bash, "-e", script.as_posix()], env=env, capture_output=True, text=True)
     assert (result.returncode == 0) is ok, result.stdout + result.stderr

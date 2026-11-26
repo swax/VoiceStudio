@@ -38,6 +38,7 @@ GET /api/settings/changelog
 GET /api/settings/compute-device
 GET /api/settings/cuda-device
 GET /api/settings/db-backup
+GET /api/settings/diagnostics
 GET /api/settings/dictation-refinement
 GET /api/settings/engines/{family}/{engine_id}/local-model
 GET /api/settings/gpu-report
@@ -84,6 +85,7 @@ GET /community/items/{item_id}/preview
 GET /community/manifest
 GET /community/sources
 GET /community/submit-url
+GET /demo/dubbing/status
 GET /dictation/models
 GET /dictation/prefs
 GET /dictation/readiness
@@ -105,6 +107,7 @@ GET /dub/onsets/{job_id}
 GET /dub/preview-video/{job_id}
 GET /dub/preview/{job_id}/{segment_index}
 GET /dub/segments-text/{job_id}
+GET /dub/speech-preview/{job_id}/{render_id}/{token}
 GET /dub/srt/{job_id}
 GET /dub/srt/{job_id}/{filename}
 GET /dub/thumb/{job_id}
@@ -113,6 +116,12 @@ GET /dub/transcribe-stream/{job_id}
 GET /dub/txt/{job_id}
 GET /dub/vtt/{job_id}
 GET /dub/vtt/{job_id}/{filename}
+GET /elevenlabs/v1/models
+GET /elevenlabs/v1/voices
+GET /elevenlabs/v1/voices/settings/default
+GET /elevenlabs/v1/voices/{voice_id}
+GET /elevenlabs/v1/voices/{voice_id}/settings
+GET /elevenlabs/v2/voices
 GET /engines
 GET /engines/asr
 GET /engines/audiocpp/runtime/install/status
@@ -136,6 +145,7 @@ GET /generate/budget
 GET /glossary/{project_id}
 GET /health
 GET /history
+GET /history/{history_id}
 GET /jobs
 GET /jobs/{job_id}
 GET /jobs/{job_id}/events
@@ -211,6 +221,7 @@ POST /api/cloud-sync/use-choices-of/{device_id}
 POST /api/integrations/twilio/test
 POST /api/settings/analytics/event
 POST /api/settings/asr-openai-compat/test
+POST /api/settings/diagnostics/event
 POST /api/settings/engines/{family}/{engine_id}/local-model/discover
 POST /api/settings/hf-mirror/test
 POST /api/settings/hf-token
@@ -238,16 +249,19 @@ POST /calls/{call_id}/takeover
 POST /clean-audio
 POST /community/items/{item_id}/use
 POST /convert
+POST /demo/dubbing/download
 POST /design/describe
 POST /dictation/prefs
 POST /dub/abort/{job_id}
 POST /dub/agent-fit
 POST /dub/cleanup-segments/{job_id}
 POST /dub/fork/{job_id}
+POST /dub/from-srt
 POST /dub/generate/{job_id}
 POST /dub/import-srt/{job_id}
 POST /dub/ingest-url
 POST /dub/parse-subtitle-text
+POST /dub/plan/{job_id}
 POST /dub/preview-segment/{job_id}
 POST /dub/prosody-mirror/{job_id}
 POST /dub/qc/{job_id}
@@ -257,6 +271,16 @@ POST /dub/transcribe/{job_id}
 POST /dub/translate
 POST /dub/upload
 POST /dub/use-downloaded-captions/{job_id}
+POST /dub/validate-srt
+POST /elevenlabs/v1/audio-isolation
+POST /elevenlabs/v1/sound-generation
+POST /elevenlabs/v1/speech-to-speech/{voice_id}
+POST /elevenlabs/v1/speech-to-speech/{voice_id}/stream
+POST /elevenlabs/v1/speech-to-text
+POST /elevenlabs/v1/text-to-speech/{voice_id}
+POST /elevenlabs/v1/text-to-speech/{voice_id}/stream
+POST /elevenlabs/v1/voice-changer/{voice_id}
+POST /elevenlabs/v1/voice-changer/{voice_id}/stream
 POST /engines/audiocpp/runtime/install
 POST /engines/diarisation/select
 POST /engines/omnivoice-gguf/gpu-offer
@@ -318,6 +342,7 @@ POST /project-bundles/import
 POST /projects
 POST /pronunciation
 POST /pronunciation/import
+POST /pronunciation/parse-pls
 POST /pronunciation/test
 POST /setup/warmup
 POST /stories/encode
@@ -354,6 +379,7 @@ PUT /api/settings/analytics
 PUT /api/settings/asr-openai-compat
 PUT /api/settings/compute-device
 PUT /api/settings/cuda-device
+PUT /api/settings/diagnostics
 PUT /api/settings/dictation-refinement
 PUT /api/settings/engines/{family}/{engine_id}/local-model
 PUT /api/settings/hf-mirror

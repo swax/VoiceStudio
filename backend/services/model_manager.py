@@ -323,6 +323,8 @@ class _ResilientGpuPool(Executor):
         # so wrapping the callable is the one place that sees queue→run→done
         # for the whole pool.
         token = {"counted": False}
+        from core import diagnostic_reports
+        fn = diagnostic_reports.bind_callable(fn)
 
         def _tracked(*a, **kw):
             with self._stats_lock:
@@ -868,6 +870,8 @@ async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
     finalizer. Normal completion never calls it. This lets request-owned temp
     files outlive abandoned workers without delaying ordinary requests (#1668).
     """
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
     from services.inference_cancellation import InferenceCancellation
     cancellation = InferenceCancellation()
     loop = asyncio.get_running_loop()
@@ -925,7 +929,7 @@ async def run_on_gpu_pool_guarded(fn, *, what: str = "GPU job",
                 _fire_abandon_callback()
 
     from core.render_trace import bind as bind_render_trace
-    concurrent_fut = ex.submit(bind_render_trace(_job))
+    concurrent_fut = ex.submit(bind_render_trace(diagnostic_reports.bind_callable(_job, diagnostic_epoch)))
     fut = asyncio.wrap_future(concurrent_fut, loop=loop)
 
     def _abandon() -> None:
@@ -2465,6 +2469,11 @@ def _repair_model_cache(checkpoint: str, *, force: bool = False) -> bool:
     for attempt in range(1, retries + 1):
         try:
             _attempt()
+            from services.hf_revisions import settle_install_pending
+            # A returned snapshot_download is not proof of a whole snapshot
+            # (it can hand back an existing incomplete one); the marker only
+            # clears once every file is verified.
+            settle_install_pending(checkpoint, revision, cache_root, fetch_kwargs=dl_kwargs)
             logger.info("Auto-repair of %s completed; retrying model load.", checkpoint)
             return True
         except Exception as e:
@@ -2503,51 +2512,12 @@ def _repair_model_cache(checkpoint: str, *, force: bool = False) -> bool:
     return False
 
 
-_DEFAULT_OMNIVOICE_CHECKPOINT = "k2-fsa/OmniVoice"
+from services import omnivoice_checkpoint as _omnivoice_checkpoint  # noqa: E402
 
-
-def resolve_omnivoice_checkpoint() -> str:
-    """Resolve the VoiceStudio TTS checkpoint from ``OMNIVOICE_MODEL``, self-healing
-    a misconfigured value.
-
-    A valid checkpoint is either a HuggingFace repo id (``org/repo`` — contains a
-    ``/``) or an existing local directory. A bare token like ``"omnivoice"`` — a
-    TTS *engine id* that leaked into ``OMNIVOICE_MODEL`` (e.g. a stale pref/env) —
-    is neither, and would crash model load with *"omnivoice is not a local folder
-    and is not a valid model identifier listed on huggingface.co/models"* (#693).
-    Fall back to the default rather than 500 on every launch.
-    """
-    checkpoint = os.environ.get("OMNIVOICE_MODEL", "").strip()
-    if not checkpoint:
-        from services.local_model_paths import get
-        local = get("tts", "omnivoice")
-        if local:
-            # Inventory must remain accessible to repair missing local folders.
-            # The actual load path validates before opening weights.
-            return local
-        checkpoint = _DEFAULT_OMNIVOICE_CHECKPOINT
-    if not checkpoint:
-        return _DEFAULT_OMNIVOICE_CHECKPOINT
-    if checkpoint == "test":
-        # Test-suite sentinel (tests/conftest.py sets OMNIVOICE_MODEL=test):
-        # return it verbatim. Self-healing it to the real default — "test"
-        # is a bare token like the #693 engine-id leak — would hand every
-        # app-booting test the real 2.3 GB k2-fsa/OmniVoice checkpoint,
-        # which is exactly the download the sentinel exists to prevent. A
-        # real load against "test" fails fast with a clear HF error instead.
-        return checkpoint
-    # Honor a HF repo id (org/repo) or an EXPLICIT local path (absolute, or with
-    # a path separator). A bare token like "omnivoice" must NOT be treated as a
-    # local dir even if a cwd-relative folder happens to share its name — that
-    # is exactly the engine-id leak (#693), so self-heal to the default.
-    if "/" in checkpoint or "\\" in checkpoint or os.path.isabs(checkpoint):
-        return checkpoint
-    logger.warning(
-        "OMNIVOICE_MODEL=%r is not a HuggingFace repo id (org/repo) or a local "
-        "path — falling back to %s (#693).",
-        checkpoint, _DEFAULT_OMNIVOICE_CHECKPOINT,
-    )
-    return _DEFAULT_OMNIVOICE_CHECKPOINT
+# Re-exported: callers and tests reach it through model_manager.
+resolve_omnivoice_checkpoint = _omnivoice_checkpoint.resolve_omnivoice_checkpoint
+omnivoice_pin_kwargs = _omnivoice_checkpoint.omnivoice_pin_kwargs
+omnivoice_asr_pin_kwargs = _omnivoice_checkpoint.omnivoice_asr_pin_kwargs
 
 
 #: CPython's exact executor-rejection message once interpreter shutdown began
@@ -2763,6 +2733,8 @@ def _load_model_sync():
             return VoiceStudio.from_pretrained(
                 checkpoint, device_map=device,
                 dtype=getattr(torch, tts_dtype_name(device)), load_asr=False,
+                tokenizer_fallback_guard=_guard_tokenizer_fallback,
+                **omnivoice_pin_kwargs(checkpoint),
             )
 
         def _recover_corrupt_weights(exc: BaseException):
@@ -2776,6 +2748,9 @@ def _load_model_sync():
             for nested_exc in _exception_chain(exc):
                 repository_id = getattr(nested_exc, "repository_id", None)
                 if repository_id == "eustlb/higgs-audio-v2-tokenizer":
+                    # Never download an unaccepted repo, even to repair it.
+                    from services.model_acceptance import ensure_accepted
+                    ensure_accepted([repository_id])
                     repair_checkpoint = repository_id
                     break
             asset_label = (
@@ -2936,7 +2911,7 @@ def _load_model_sync():
             # corrupt, it must never be mistaken for the TTS checkpoint and
             # trigger a second multi-GB TTS load/re-download (CodeRabbit).
             try:
-                _model.load_asr_model()
+                _model.load_asr_model(**omnivoice_asr_pin_kwargs())
             except Exception as asr_exc:
                 if not _is_corrupt_model_file_error(asr_exc):
                     raise
@@ -3097,6 +3072,8 @@ def _load_model_sync():
                 "Model load aborted: shutdown during load — benign, not a failure."
             )
             raise ModelLoadInterruptedByShutdown("shutdown during load") from exc
+        from core import diagnostic_reports
+        diagnostic_reports.capture_failure("model_load", error=exc, engine_id="omnivoice")
         # Surface an ACTIONABLE, sanitized error in /model/status (it's shown in
         # the first-run System Check). build_failure classifies the cause and
         # attaches a fix hint — e.g. a corrupted transformers install
@@ -3257,8 +3234,15 @@ def _load_model_exclusive(
         if model is not None:
             # A load that finished while we waited.
             return model
-        _make_room_before_tts_load()
-        model = _load_model_sync()
+        # Wait out any reference-ASR hold (integrated Arc) and register as an
+        # in-flight load so a new hold's admission waits for us. Atomic with
+        # the hold count, so a hold cannot start between check and load.
+        _begin_tts_load()
+        try:
+            _make_room_before_tts_load()
+            model = _load_model_sync()
+        finally:
+            _end_tts_load()
         return model
     finally:
         # Whether this load succeeded, failed or was an abandoned one finishing
@@ -3345,6 +3329,13 @@ async def _load_model_with_timeout():
             "stall downloading the model (proxy, firewall, or antivirus). Check "
             "your connection or set a Hugging Face mirror in Settings, then retry."
         ) from exc
+
+
+def _guard_tokenizer_fallback(repo_id: str) -> None:
+    """Loader hook: the Hub tokenizer fallback needs its own licence accepted."""
+    from services.model_acceptance import ensure_accepted
+
+    ensure_accepted([repo_id])
 
 
 def _ensure_omnivoice_licence() -> None:
@@ -3565,6 +3556,8 @@ async def preload_model():
     global model, _last_used
     if model is not None:
         return  # already loaded
+    from core import diagnostic_reports
+    diagnostic_epoch = diagnostic_reports.inherited_grant()
 
     # This singleton belongs to native OmniVoice, not the selected engine's
     # adapter. Warming it for another engine wastes memory before first use.
@@ -3629,7 +3622,7 @@ async def preload_model():
         _last_used = time.time()
         async with _model_lock:
             if model is None:
-                model = await _load_model_with_timeout()
+                model = await diagnostic_reports.await_owned(_load_model_with_timeout(), diagnostic_epoch)
         logger.info("Preload complete — model ready.")
     except ModelLoadInterruptedByShutdown:
         # Expected teardown (#1174): the backend was shut down while the
@@ -3642,6 +3635,8 @@ async def preload_model():
         # (#1000 class) — the full chain, not just str(e), is what actually
         # distinguishes a real dependency problem from a shutdown-interrupted
         # import.
+        if diagnostic_epoch is not None:
+            diagnostic_reports.capture_failure("model_load", error=e, engine_id="omnivoice", expected_epoch=diagnostic_epoch)
         logger.warning("Model preload failed (non-fatal): %s", e, exc_info=e)
         # Non-fatal must not mean invisible (#1415). A broken dependency in the
         # model's import chain fails here and nowhere else until the user tries
@@ -4052,11 +4047,53 @@ def unload_shared_model() -> bool:
     global model, _ram_offload
     if model is None:
         return False
-    model = None
-    _ram_offload = None
-    release_tts_side_caches()
-    free_vram()
+    # Register before clearing the reference so an admission that sees
+    # model None also sees this unload still in flight.
+    _begin_tts_unload()
+    try:
+        model = None
+        _ram_offload = None
+        release_tts_side_caches()
+        # Cached OmniVoiceBackend adapters hold their own strong ref to the
+        # model (#4355); without this the weights survive the unload.
+        _mod = sys.modules.get("services.tts_backend")
+        if _mod is not None:
+            _mod.drop_omnivoice_instance_refs()
+        free_vram()
+    finally:
+        _end_tts_unload()
     return True
+
+
+# Intel integrated Xe/Arc GPUs (e.g. Lunar Lake 130V/140V) allocate model
+# weights in system RAM, so they are unified-memory devices. Detect that case
+# first; the rest of the stack stays unchanged.
+
+
+def _xpu_is_unified_memory() -> bool:
+    """True only for a single integrated Intel Arc XPU.
+
+    Uses the device properties' ``is_integrated_gpu`` flag. (``local_mem_size``
+    is per-work-group memory, not device memory, so it cannot tell integrated
+    from discrete.) A discrete Arc card, a multi-XPU box, a non-Intel device,
+    or a torch build that does not expose the flag all keep the dedicated
+    path. Never raises: an unreadable property falls back to dedicated,
+    preserving behaviour on non-Intel XPU hosts.
+    """
+    torch = _lazy_torch()
+    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+        return False
+    try:
+        if torch.xpu.device_count() != 1:
+            return False
+        props = torch.xpu.get_device_properties(0)
+        integrated = getattr(props, "is_integrated_gpu", None)
+        name = str(getattr(props, "name", "")).lower()
+    except Exception:  # noqa: BLE001 — a probe must never break the caller
+        return False
+    if integrated is not True:
+        return False
+    return "intel" in name and "arc" in name
 
 
 def _has_dedicated_vram():
@@ -4065,7 +4102,7 @@ def _has_dedicated_vram():
     if torch.cuda.is_available():
         return True
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return True
+        return not _xpu_is_unified_memory()
     if hasattr(torch, "npu") and torch.npu.is_available():
         return True
     return False
@@ -4081,8 +4118,8 @@ _UNIFIED_OFFLOAD_HEADROOM_GB = float(
 )
 
 
-def _offload_unified_memory() -> bool:
-    """Release the TTS model on a unified-memory host when RAM is tight.
+def _offload_unified_memory(*, force: bool = False) -> bool:
+    """Release the TTS model on a unified-memory host when RAM is tight or forced.
 
     Returns True when the model was actually released. Never raises — a failure
     to make room must not abort the transcription that asked for it."""
@@ -4091,7 +4128,7 @@ def _offload_unified_memory() -> bool:
         from services.memory_budget import available_memory
 
         free_gb = available_memory().get("ram_available_gb")
-        if free_gb is not None and free_gb > _UNIFIED_OFFLOAD_HEADROOM_GB:
+        if not force and free_gb is not None and free_gb > _UNIFIED_OFFLOAD_HEADROOM_GB:
             return False  # plenty of room — keep the model warm, pay no reload
         logger.info(
             "Unified memory tight (%s GB free) — releasing the TTS model so ASR has room "
@@ -4105,7 +4142,7 @@ def _offload_unified_memory() -> bool:
         return False
 
 
-def offload_tts_for_asr():
+def offload_tts_for_asr(*, force_unified_release: bool = False) -> bool:
     """Move TTS model to CPU to free VRAM for ASR (WhisperX large-v3).
 
     On a 7-8 GB laptop GPU the TTS model (~2.4 GB) and WhisperX large-v3
@@ -4113,12 +4150,24 @@ def offload_tts_for_asr():
     CPU before transcription prevents CUDA OOM, then restore_tts_after_asr()
     moves it back.
 
-    Works on CUDA (NVIDIA + ROCm) and Intel XPU.
+    Works on CUDA (NVIDIA + ROCm) and Intel XPU. ``force_unified_release``
+    releases the model even when the unified-memory headroom would normally
+    keep it warm; callers such as the clone-reference path use it when the
+    cold ASR load is itself the risk (a trace-less host reset), not just OOM.
+
+    Returns False only when a unified-memory release was refused because a
+    generation is still using the model; callers doing optional ASR should skip
+    it then. A forced release on integrated Arc holds exclusive placement until
+    ``restore_tts_after_asr()`` runs, so callers must always pair the two.
     """
     global model
     torch = _lazy_torch()
     if model is None:
-        return
+        if force_unified_release and not _has_dedicated_vram() and _xpu_is_unified_memory():
+            # Nothing to unload, but a cold TTS load must still wait through
+            # this reference ASR (joins an active hold or starts one).
+            return _admit_forced_asr(release=False)
+        return True
     if not _has_dedicated_vram():
         # UNIFIED MEMORY (Apple Silicon / CPU). Moving the model "to CPU" frees
         # nothing here — it is the same physical RAM — which is why this used to
@@ -4130,20 +4179,42 @@ def offload_tts_for_asr():
         # 16 GB Mac (#1119) — the transcribe stream just dies. Unload it and the
         # room is real. get_model() lazily reloads on the next TTS use, so the
         # only cost is that reload, and only when memory was actually tight.
-        _offload_unified_memory()
-        return
+        # Only the integrated Intel Arc case forces a release; on Apple Silicon
+        # or CPU-only unified boxes the old headroom window stays in charge,
+        # because those machines are not the host-reset case this guards.
+        if not _xpu_is_unified_memory():
+            _offload_unified_memory(force=False)
+            return True
+        # Integrated Arc: like the dedicated branch, wait for active
+        # tts_inference() slots before releasing the model under them.
+        if not force_unified_release:
+            if not _acquire_exclusive_placement(_ASR_PLACEMENT_WAIT_S):
+                logger.warning(
+                    "TTS release for ASR refused: a generation is still using the model."
+                )
+                return False
+            try:
+                _offload_unified_memory(force=False)
+            finally:
+                _release_exclusive_placement()
+            return True
+        # Forced (clone-reference ASR): join the reference-counted hold that
+        # keeps placement exclusive until every such op has called
+        # restore_tts_after_asr(), so a concurrent generate's cold TTS load
+        # waits instead of loading beside WhisperX.
+        return _admit_forced_asr(release=True)
     try:
         # Check if there's enough free VRAM to skip offloading
         if torch.cuda.is_available():
             free_mem = torch.cuda.mem_get_info()[0]
             if free_mem > 8 * 1024 ** 3:  # > 8 GB free → skip offload
-                return
+                return True
     except Exception:
         pass
     m = model
     if not _acquire_exclusive_placement(_ASR_PLACEMENT_WAIT_S):
         logger.warning("TTS offload for ASR skipped: a generation is still using the model.")
-        return
+        return True
     try:
         logger.info("Offloading TTS model to CPU to free VRAM for ASR...")
         _relocate_shared_model(m, "cpu")
@@ -4152,12 +4223,16 @@ def offload_tts_for_asr():
         logger.warning("TTS offload failed: %s", e)
     finally:
         _release_exclusive_placement()
+    return True
 
 
 def restore_tts_after_asr():
     """Move TTS model back to the GPU after ASR completes."""
     global model, _ram_offload
     torch = _lazy_torch()
+    # End a forced integrated-Arc reference-ASR hold first: the model is None
+    # after that release, so the early return below would otherwise skip it.
+    _leave_unified_asr_hold()
     if model is None:
         return
     if not _has_dedicated_vram():
@@ -4357,6 +4432,123 @@ def _acquire_exclusive_placement(wait_s: float) -> bool:
             _placement_cond.wait(remaining)
         _placement_exclusive = True
         return True
+
+
+# Reference count of forced integrated-Arc reference-ASR ops holding exclusive
+# placement (see offload_tts_for_asr). Guarded by _placement_cond. Each op's
+# join is recorded on its thread, so restore_tts_after_asr() releases only its
+# own hold; placement is freed and waiters woken when the count reaches 0.
+_unified_asr_holds = 0
+_asr_hold_tls = threading.local()
+# Bound on how long a cold TTS load waits for those ASR ops to finish.
+_UNIFIED_ASR_HOLD_WAIT_S = 300.0
+
+
+def _join_unified_asr_hold(wait_s: float) -> bool:
+    """Join the hold, starting it (exclusive placement) if none is active.
+    False when placement could not be acquired within ``wait_s``."""
+    global _unified_asr_holds
+    with _placement_cond:  # reentrant: lets acquire+count be one atomic step
+        if _unified_asr_holds == 0 and not _acquire_exclusive_placement(wait_s):
+            return False
+        _unified_asr_holds += 1
+    _asr_hold_tls.tokens = getattr(_asr_hold_tls, "tokens", 0) + 1
+    return True
+
+
+def _leave_unified_asr_hold() -> None:
+    """Release this thread's own hold, if any (no-op without one)."""
+    global _unified_asr_holds
+    if getattr(_asr_hold_tls, "tokens", 0) <= 0:
+        return
+    _asr_hold_tls.tokens -= 1
+    with _placement_cond:
+        _unified_asr_holds -= 1
+        last = _unified_asr_holds == 0
+    if last:
+        _release_exclusive_placement()  # notify_all wakes load waiters
+
+
+# Cold TTS loads and unloads currently in flight (guarded by _placement_cond).
+# A forced ASR admission waits for both to drain, so it never overlaps a load
+# or an unload whose model reference is already cleared but not yet freed.
+_tts_loads_in_flight = 0
+_tts_unloads_in_flight = 0
+
+
+def _begin_tts_unload() -> None:
+    global _tts_unloads_in_flight
+    with _placement_cond:
+        _tts_unloads_in_flight += 1
+
+
+def _end_tts_unload() -> None:
+    global _tts_unloads_in_flight
+    with _placement_cond:
+        _tts_unloads_in_flight -= 1
+        _placement_cond.notify_all()
+
+
+def _begin_tts_load(timeout: float = _UNIFIED_ASR_HOLD_WAIT_S) -> None:
+    """Block a cold TTS load while forced reference ASR ops hold the device,
+    then register it as in flight. Bounded; on timeout the load proceeds as it
+    did before the hold existed."""
+    global _tts_loads_in_flight
+    deadline = time.monotonic() + timeout
+    with _placement_cond:
+        while _unified_asr_holds > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("TTS load proceeding: reference ASR hold timed out.")
+                break
+            _placement_cond.wait(remaining)
+        _tts_loads_in_flight += 1
+
+
+def _end_tts_load() -> None:
+    global _tts_loads_in_flight
+    with _placement_cond:
+        _tts_loads_in_flight -= 1
+        _placement_cond.notify_all()
+
+
+def _wait_tts_idle(timeout: float) -> bool:
+    """Wait until no TTS load or unload is in flight. False on timeout."""
+    deadline = time.monotonic() + timeout
+    with _placement_cond:
+        while _tts_loads_in_flight > 0 or _tts_unloads_in_flight > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _placement_cond.wait(remaining)
+        return True
+
+
+def _admit_forced_asr(*, release: bool) -> bool:
+    """Admit one forced reference-ASR op on integrated Arc: join the hold,
+    release the TTS model (when ``release``), and wait for any in-flight
+    load/unload to finish. On any failure this op's hold is dropped and False
+    is returned so the caller skips the optional ASR."""
+    if not _join_unified_asr_hold(_ASR_PLACEMENT_WAIT_S):
+        logger.warning(
+            "TTS release for ASR refused: a generation is still using the model."
+        )
+        return False
+    try:
+        if release and not _offload_unified_memory(force=True):
+            logger.warning("TTS release for ASR failed; skipping reference ASR.")
+            _leave_unified_asr_hold()
+            return False
+        if not _wait_tts_idle(_ASR_PLACEMENT_WAIT_S):
+            logger.warning(
+                "TTS release for ASR refused: a model load/unload is still in flight."
+            )
+            _leave_unified_asr_hold()
+            return False
+    except BaseException:
+        _leave_unified_asr_hold()
+        raise
+    return True
 
 
 def _release_exclusive_placement() -> None:

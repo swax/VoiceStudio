@@ -360,6 +360,15 @@ def test_webvtt_metadata_words_can_identify_a_cue(identifier):
     assert [cue['text'] for cue in parse_srt(text).segments] == ['Spoken text']
 
 
+@pytest.mark.parametrize('identifier', ['STYLE', 'REGION'])
+def test_webvtt_metadata_with_overlong_timing_is_not_a_cue(identifier):
+    text = (
+        f'WEBVTT\n\n{identifier}\n00:01.0000 --> 00:02.000\n'
+        '00:03.000 --> 00:04.000\nmetadata text\n\n00:05.000 --> 00:06.000\nSpoken text\n'
+    )
+    assert [cue['text'] for cue in parse_srt(text).segments] == ['Spoken text']
+
+
 @pytest.mark.parametrize('identifier', ['NOTE', 'NOTE identifier'])
 def test_webvtt_note_block_is_never_a_cue_even_with_a_timing_line(identifier):
     text = f'WEBVTT\n\n{identifier}\n00:01.000 --> 00:02.000\nprivate note\n\n00:03.000 --> 00:04.000\nSpoken text\n'
@@ -394,3 +403,40 @@ def test_unrepresentable_hour_timestamp_is_skipped():
     hours = "9" * 1000
     result = parse_srt(f"{hours}:00:00.000 --> {hours}:00:01.000\nToo large\n")
     assert result.segments == []
+
+
+@pytest.mark.parametrize("separator", [",", "."])
+@pytest.mark.parametrize("endpoint", ["start", "end"])
+@pytest.mark.parametrize("milliseconds", ["1234", "1234567890"])
+def test_skips_overlong_milliseconds_without_losing_next_cue(
+    separator, endpoint, milliseconds
+):
+    start, end = "00:00:01,000", "00:00:02,000"
+    if endpoint == "start":
+        start = f"00:00:01{separator}{milliseconds}"
+    else:
+        end = f"00:00:02{separator}{milliseconds}"
+    content = (
+        f"1\n{start} --> {end}\nInvalid timestamp.\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nKeep this cue.\n"
+    )
+    result = parse_srt(content)
+    assert result.skipped_cues == 1
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == "Keep this cue."
+    assert result.segments[0]["start"] == 3.0
+
+
+def test_webvtt_timing_line_starts_a_cue_even_without_a_blank_line():
+    """WebVTT parsers start a new cue at any timing line; an identifier is not dialogue."""
+    text = ("WEBVTT\n\nintro\n00:01.000 --> 00:03.000\nThe schedule says:\n"
+            "00:10.000 --> 00:11.000\nWrite that down.\n\n00:12.000 --> 00:13.000\nNext.")
+    result = parse_srt(text)
+    assert [(s["start"], s["end"], s["text"]) for s in result.segments] == [
+        (1.0, 3.0, "The schedule says:"), (10.0, 11.0, "Write that down."), (12.0, 13.0, "Next."),
+    ]
+
+
+def test_webvtt_accepts_a_first_cue_without_a_blank_after_the_header():
+    result = parse_srt("WEBVTT\n00:01.000 --> 00:02.000\nHello\n")
+    assert [segment["text"] for segment in result.segments] == ["Hello"]

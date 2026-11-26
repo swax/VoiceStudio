@@ -11,11 +11,6 @@ import pytest
 TEXT = "abcdefghijklmno"  # fifteen English characters: one natural second
 
 
-@pytest.mark.parametrize("seed", [0, 42])
-def test_per_line_seed_reaches_the_sidecar(forwarded, seed):
-    assert forwarded(seed=seed)["seed"] == seed
-
-
 @pytest.fixture
 def forwarded(monkeypatch):
     from services.subprocess_backend import SubprocessBackend

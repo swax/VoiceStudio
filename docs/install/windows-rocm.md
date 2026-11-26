@@ -134,6 +134,11 @@ processes only. They do not change the system environment. Existing models,
 voices and projects stay in place. Changing the recipe or Python ABI invalidates
 the runtime readiness stamp and requires verification/repair.
 
+Readiness also compares the verifier's reported Python ABI and architecture with
+the staged recipe; missing reports or recipe pins cannot certify the runtime.
+The existing dependency-stamp salt stays unchanged so this verification change
+alone does not require working installations to repeat setup.
+
 This feature must be present in the installed build; older releases do not gain
 it from an environment variable. See the
 [Releases page](https://github.com/debpalash/VoiceStudio/releases) for available builds.
@@ -282,3 +287,40 @@ timeouts, crashes and unclassified failures stop verification without downloadin
 or reinstalling the overlay. CLI diagnostics include a bounded failure category;
 correct the reported host problem before retrying. A successful package repair
 must still pass the complete model-free GPU verification.
+
+
+### Native probe access violations
+
+A failed native probe reports its decimal exit code and Windows status, including
+`0xC0000005` for an access violation, even when it produced no JSON diagnostic.
+The status alone does not identify the faulting DLL, GPU, driver or underlying
+cause. Crashes remain non-repairable verification failures; they do not trigger
+an automatic package reinstall.
+
+The [hybrid-GPU report #4200](https://github.com/debpalash/VoiceStudio/issues/4200)
+describes a ROCm 7.2.1 probe crash on an RX 7900 XTX plus Ryzen integrated GPU.
+That reporter identified `amdhip64_7.dll` 10.0.3581 in Windows Error Reporting and
+reported success after preloading the driver-provided System32 version 10.0.3679
+before Torch. This is evidence from that machine, not a validated general fix.
+Related upstream reports describe [hybrid-device enumeration/crashes](https://github.com/ROCm/legacy-rocm-build/issues/5871)
+and [a HIP availability crash](https://github.com/ROCm/TheRock/issues/9181);
+the same exit status does not establish the same cause on another host.
+
+When the installed `_rocm_sdk_core` wheel bundles an `amdhip64_*.dll`, VoiceStudio
+compares it with the same-named DLL in `%SystemRoot%\System32` (shipped with the
+Adrenalin driver). Only when the driver copy has a strictly newer file version does
+the Windows ROCm runtime load it by full path before Torch, so it takes the place of
+the bundled copy for that process. Installed wheels are never modified, and nothing
+changes for CUDA, CPU, macOS or Linux. Fallbacks, each logged with its reason:
+
+- Missing, older, equal or unreadable driver DLL: the bundled runtime is used.
+- Driver DLL fails to load: the bundled runtime is used.
+- The verification probe dies natively with the driver runtime preloaded: it is
+  retried once with the bundled runtime.
+- Set `OMNIVOICE_ROCM_DRIVER_HIP=0` to always use the bundled runtime.
+
+VoiceStudio does not hide an integrated GPU; the iGPU may drive your display.
+Keep explicit device selection (for example `HIP_VISIBLE_DEVICES`) unchanged and
+retain the probe code plus Windows Error Reporting's faulting-module/version
+details when reporting a failure; redact personal paths. If the probe still
+crashes after the retry, update the AMD Adrenalin driver and report it.

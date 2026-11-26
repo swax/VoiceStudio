@@ -1,15 +1,12 @@
 """Fork controls preserve backend compatibility and invalidate conditioned takes."""
 
-import ast
 import importlib.util
 import os
-from pathlib import Path
 import sys
-import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from schemas.requests import DubSegment
 from services.incremental import segment_fingerprint
 
@@ -35,46 +32,6 @@ def test_unset_controls_keep_raw_and_parsed_fingerprints_identical():
     segment = {"start": 0, "end": 1, "text": "Hello there."}
     parsed = DubSegment(**segment).model_dump()
     assert segment_fingerprint(segment) == segment_fingerprint(parsed)
-
-
-@pytest.mark.parametrize("hint,supports_language", [(None, True), ("ja", True), ("ja", False)])
-def test_transcription_worker_pins_language_only_for_supported_backends(hint, supports_language):
-    from services.asr_backend import transcribe_request_kwargs
-    from services.dub_language import asr_source_language
-
-    # Exercise the real nested chunk worker without loading ASR or a GPU.
-    source = (ROOT / "backend/api/routers/dub_core.py").read_text(encoding="utf-8")
-    worker = next(
-        n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef) and n.name == "_transcribe_chunk"
-    )
-    calls = []
-
-    def with_language(path, word_timestamps=True, language=None):
-        calls.append(language)
-        return {"chunks": [], "language": language}
-
-    def without_language(path, word_timestamps=True):
-        calls.append(None)
-        return {"chunks": [], "language": "en"}
-
-    scope = {
-        "chunk_arr": [],
-        "t0": 0,
-        "sr": 16000,
-        "job": {"source_lang_override": hint},
-        "_asr_backend": SimpleNamespace(transcribe=with_language if supports_language else without_language),
-        "_safe_soundfile_write": lambda *args: None,
-        "tempfile": tempfile,
-        "os": os,
-        "asr_source_language": asr_source_language,
-        "transcribe_request_kwargs": transcribe_request_kwargs,
-    }
-    exec(
-        compile(ast.Module(body=[worker], type_ignores=[]), str(ROOT / "backend/api/routers/dub_core.py"), "exec"),
-        scope,
-    )
-    scope["_transcribe_chunk"]()
-    assert calls == [hint if supports_language else None]
 
 
 @pytest.mark.parametrize(

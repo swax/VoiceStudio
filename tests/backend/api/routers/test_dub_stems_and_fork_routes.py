@@ -14,8 +14,8 @@ os.environ.setdefault("OMNIVOICE_MODEL", "test")
 
 @pytest.fixture()
 def client():
-    from fastapi.testclient import TestClient
     from core.db import init_db
+    from fastapi.testclient import TestClient
     from main import app
 
     init_db()
@@ -105,6 +105,7 @@ def test_the_upload_passes_separate_to_the_ingest(monkeypatch, client):
     assert res.status_code == 202, res.text
     assert seen["separate"] is False
     import shutil
+
     from services import dub_pipeline
 
     shutil.rmtree(dub_pipeline.safe_job_dir(res.json()["job_id"]), ignore_errors=True)

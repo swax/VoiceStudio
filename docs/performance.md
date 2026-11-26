@@ -100,7 +100,7 @@ None of them are required — the defaults are chosen for the common case.
 | `OMNIVOICE_GPU_WORKERS` | auto | Concurrent generations on the GPU. Auto-sized from free VRAM (1 worker per 5 GB, max 4); MPS and CPU always get 1. **Do not raise this on ≤10 GB cards or Apple Silicon** — two concurrent jobs over-committing VRAM is exactly the crash class (#567) the auto-sizing exists to prevent. |
 | `OMNIVOICE_CPU_POOL` | `min(8, cores)` | Thread pool for CPU-side work (translation dispatch, audio I/O). |
 | `OMNIVOICE_SINGLE_ENGINE_RESIDENT` | `1` | Keep only one TTS engine in memory at a time. Set `0` on 32 GB+ machines to keep several engines warm across switches. |
-| `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB` | `6` | On unified memory (Apple Silicon): if free RAM is below this when a dub needs the transcription model, the TTS model is fully released first (it reloads on the next generation). Raise to be more aggressive about freeing, lower on 32 GB+ machines to avoid the reload. |
+| `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB` | `6` | On unified memory hosts that are not integrated Intel Arc (Apple Silicon/CPU-only): if free RAM is below this when a dub needs the transcription model, the TTS model is fully released first (it reloads on the next generation). Raise to be more aggressive about freeing, lower on 32 GB+ machines to avoid the reload. The headroom still governs integrated Intel Arc XPU dub offloads too; only a forced clone-reference release (profile save auto-transcription) bypasses it. Integrated Arc is detected via PyTorch's `is_integrated_gpu` XPU property (documented from PyTorch 2.13); older builds keep the dedicated path. |
 | `OMNIVOICE_FREE_VRAM_BEFORE_GENERATE` | `auto` | Free idle GPU memory (the dictation model, cached voice prompts, allocator caches) just before a generation. `auto` does it when free RAM is below `OMNIVOICE_UNIFIED_OFFLOAD_HEADROOM_GB`, or when a CUDA/ROCm GPU has less free VRAM than `OMNIVOICE_LOW_MEMORY_HEADROOM_GB` (2 GB, the same figure that logs "Low GPU memory"). On a small card a nearly full VRAM otherwise spills into shared system memory and renders several times slower. `always` frees before every generation; `never` turns it off. |
 | `OMNIVOICE_INDEXTTS_FP16` | `1` | IndexTTS half-precision. Leave on. On ROCm the bfloat16 claim is verified with a tiny test matmul in a child process first: GPUs whose rocBLAS crashes on bf16 load fp32 automatically instead of segfaulting the sidecar. Set `0` to force fp32 outright. |
 | `OMNIVOICE_ASR_VRAM_PREFLIGHT` | `1` | Downgrade transcription precision instead of crashing when VRAM is short (CUDA). Leave on. |
@@ -381,6 +381,15 @@ compatibility fallback that preserves the one-segment behavior.
 NLLB similarly groups subtitles by target language and translates four rows
 per forward pass on CPU/MPS or eight on CUDA by default. Set
 `OMNIVOICE_NLLB_BATCH_SIZE=1` to disable it or choose up to 32 explicitly.
+On CUDA, NLLB loads in half precision (less VRAM, faster); it reloads or retries
+in float32 automatically if that fails, and `OMNIVOICE_NLLB_FP16=0` keeps
+float32. MPS and CPU always use float32.
+
+Faster-Whisper uses up to 8 decode threads on CPU. On CUDA you can opt in to its
+batched pipeline with `OMNIVOICE_ASR_BATCHED=1` (`OMNIVOICE_ASR_BATCH_SIZE`,
+default 12, max 32). It is off by default because the batched decoder has no
+temperature-fallback retries, so sequential decoding transcribes more
+accurately; any batched error falls back to sequential decoding.
 
 Streaming clients also receive measured latency in the `/ws/tts` terminal
  `done` frame: `ttfa_ms` is request-to-first-audio, `gen_time_s` is the

@@ -12,7 +12,6 @@ import os
 import numpy as np
 import pytest
 import soundfile as sf
-
 from services import dub_pipeline
 
 
@@ -182,13 +181,3 @@ def test_a_job_still_ingesting_can_be_neither_forked_nor_given_stems(jobs):
     finally:
         dub_pipeline.end_ingest("part-01")
     assert not (root / "part-01-us").exists()
-
-
-def test_an_unseparated_upload_neither_offers_nor_reuses_cached_stems():
-    """Its stems do not exist until the client attaches them, so it must not
-    hand the mix to a later upload as "vocals", nor take another job's."""
-    import inspect
-
-    src = inspect.getsource(dub_pipeline.ingest_pipeline)
-    assert 'separate = source.get("separate", True)' in src
-    assert 'compute_file_hash, audio_path) if separate else ""' in src

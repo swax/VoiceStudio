@@ -8,7 +8,11 @@ import {
   authorizeModelsDirectory,
   authorizeModelsDirectoryReadOnly,
 } from './media-authorization';
-import { isTrustedRenderer } from './trusted-renderer';
+import {
+  assertTrustedMainFrame as trustedIpcMainFrame,
+  assertTrustedTopLevel as trustedTopLevel,
+  trustedOwner,
+} from './trusted-ipc';
 import { replaceFile } from './replace-file';
 import { encodeDownloadFailure, MAX_FAILURE_BODY_CHARS } from '../shared/download-failure';
 import { homedir, tmpdir } from 'node:os';
@@ -174,7 +178,13 @@ async function openPermissionSettings(kind: unknown): Promise<boolean> {
 
 const RELOCATION_SELECTION_TTL_MS = 10 * 60 * 1000;
 
-const OPEN_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'mailto:']);
+// Web and mail only. A `file:` URL, and an absolute path handed to
+// `shell.openPath`, both launch a local file through its OS association — the
+// renderer has `files:revealPath` for showing a saved file, and nothing in the
+// app needs openExternal to run a local path. Keeping the two local forms out
+// means a hostile or compromised backend reply (a notification's `action`,
+// a gallery item's link) cannot become local code execution on a click.
+const OPEN_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 
 function windowFor(event: IpcMainInvokeEvent | Electron.IpcMainEvent): BrowserWindow | null {
   return BrowserWindow.fromWebContents(event.sender);
@@ -217,28 +227,16 @@ function assertSaveDataRequest(value: unknown): SaveDataRequest {
 export function assertTrustedMainFrame(
   event: IpcMainInvokeEvent,
   owner: BrowserWindow | null,
+  message?: string,
 ): asserts owner is BrowserWindow {
-  if (
-    !owner ||
-    event.sender !== owner.webContents ||
-    event.senderFrame !== owner.webContents.mainFrame ||
-    !isTrustedRenderer(event.senderFrame.url, process.env.ELECTRON_RENDERER_URL)
-  ) {
-    throw new Error('Untrusted main-frame request');
-  }
+  // One implementation lives in trusted-ipc.ts; the name stays exported for the
+  // callers that already import it from here.
+  trustedIpcMainFrame(event, owner, message);
 }
 
 /** Read-only connection metadata is also needed by trusted utility windows. */
 function assertTrustedTopLevelFrame(event: IpcMainInvokeEvent): void {
-  const owner = windowFor(event);
-  if (
-    !owner ||
-    event.sender !== owner.webContents ||
-    event.senderFrame !== owner.webContents.mainFrame ||
-    !isTrustedRenderer(event.senderFrame.url, process.env.ELECTRON_RENDERER_URL)
-  ) {
-    throw new Error('Untrusted top-level request');
-  }
+  trustedTopLevel(event);
 }
 
 function remoteInput(raw: unknown): { url: string; apiKey: string } {
@@ -375,7 +373,10 @@ export function registerIpc(
   supervisor: BackendSupervisor,
   getMainWindow: () => BrowserWindow | null,
   exitForUninstall: () => Promise<void> = async () => app.exit(0),
+  runOperation: <T>(work: () => T) => T = (work) => work(),
 ): void {
+  const handle: typeof ipcMain.handle = (channel, listener) =>
+    ipcMain.handle(channel, (event, ...args) => runOperation(() => listener(event, ...args)));
   registerSiteBrowser(getMainWindow);
   let maintenanceBusy = false;
   let relocationSelection: {
@@ -414,25 +415,25 @@ export function registerIpc(
   };
   supervisor.subscribe((status: BackendStatus) => broadcast(CHANNELS.backendStatus, status));
 
-  ipcMain.handle(CHANNELS.permissionsGetState, (event) => {
+  handle(CHANNELS.permissionsGetState, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return nativePermissions();
   });
-  ipcMain.handle(CHANNELS.permissionsOpenSettings, (event, kind: unknown) => {
+  handle(CHANNELS.permissionsOpenSettings, (event, kind: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return openPermissionSettings(kind);
   });
 
-  ipcMain.handle(CHANNELS.backendGetStatus, (): BackendStatus => supervisor.status);
-  ipcMain.handle(CHANNELS.backendAcknowledgeCrash, (event) => {
+  handle(CHANNELS.backendGetStatus, (): BackendStatus => supervisor.status);
+  handle(CHANNELS.backendAcknowledgeCrash, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.acknowledgeLastCrash();
   });
-  ipcMain.handle(CHANNELS.backendGetConnection, () => supervisor.connection);
-  ipcMain.handle(CHANNELS.backendDiscoverPythonRuntimes, async (event) => {
+  handle(CHANNELS.backendGetConnection, () => supervisor.connection);
+  handle(CHANNELS.backendDiscoverPythonRuntimes, async (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (!discoveryInFlight) {
@@ -450,7 +451,7 @@ export function registerIpc(
     }
     return discoveryInFlight;
   });
-  ipcMain.handle(CHANNELS.backendUseDiscoveredPythonRuntime, async (event, raw: unknown) => {
+  handle(CHANNELS.backendUseDiscoveredPythonRuntime, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (typeof raw !== 'string' || !isAbsolute(raw)) throw new Error('Invalid Python runtime path');
@@ -459,7 +460,7 @@ export function registerIpc(
     const validation = await validatePythonRuntime(pythonPath, backendRoot());
     return { ...validation, token: stagePython(pythonPath, event, validation.ok) };
   });
-  ipcMain.handle(CHANNELS.backendConfirmPythonRuntime, async (event, raw: unknown) => {
+  handle(CHANNELS.backendConfirmPythonRuntime, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const staged = consumeStage(raw, event);
@@ -469,7 +470,7 @@ export function registerIpc(
     await supervisor.restart();
     return validation;
   });
-  ipcMain.handle(CHANNELS.backendPlanPythonRepair, async (event, raw: unknown) => {
+  handle(CHANNELS.backendPlanPythonRepair, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (typeof raw !== 'string') throw new Error('Python selection token is required');
@@ -483,7 +484,7 @@ export function registerIpc(
     stagedRepairs.set(repairToken, { plan: validation.repairPlan, senderId: event.sender.id, frameId: event.frameId, createdAt: Date.now() });
     return { ...validation, repairToken };
   });
-  ipcMain.handle(CHANNELS.backendInstallPythonRepair, async (event, raw: unknown) => {
+  handle(CHANNELS.backendInstallPythonRepair, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (!raw || typeof raw !== 'object') throw new Error('Invalid Python repair confirmation');
@@ -534,48 +535,48 @@ export function registerIpc(
     }
     return { ...after, installed: after.ok && !installError, token: after.ok && !installError ? stagePython(after.pythonPath, event, true) : undefined, outputTail: output.slice(-4000) };
   });
-  ipcMain.handle(CHANNELS.backendHostSnapshot, (event) => {
+  handle(CHANNELS.backendHostSnapshot, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.hostSnapshot();
   });
-  ipcMain.handle(CHANNELS.backendSetupDiagnostics, (event) => {
+  handle(CHANNELS.backendSetupDiagnostics, (event) => {
     assertTrustedMainFrame(event, getMainWindow());
     return supervisor.getSetupDiagnostics();
   });
-  ipcMain.handle(CHANNELS.backendCheckSetupConnection, (event) => {
+  handle(CHANNELS.backendCheckSetupConnection, (event) => {
     assertTrustedMainFrame(event, getMainWindow());
     return supervisor.checkSetupConnection();
   });
-  ipcMain.handle(CHANNELS.backendTestRemote, async (event, raw: unknown) => {
+  handle(CHANNELS.backendTestRemote, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const input = remoteInput(raw);
     return supervisor.testRemote(input.url, input.apiKey);
   });
-  ipcMain.handle(CHANNELS.backendUseRemote, async (event, raw: unknown) => {
+  handle(CHANNELS.backendUseRemote, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const input = remoteInput(raw);
     return supervisor.useRemote(input.url, input.apiKey);
   });
-  ipcMain.handle(CHANNELS.backendUseLocal, async (event) => {
+  handle(CHANNELS.backendUseLocal, async (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.useLocal();
   });
-  ipcMain.handle(CHANNELS.backendWebsocketUrl, async (event, raw: unknown) => {
+  handle(CHANNELS.backendWebsocketUrl, async (event, raw: unknown) => {
     assertTrustedTopLevelFrame(event);
     if (raw !== '/ws/transcribe' && raw !== '/ws/events' && raw !== '/ws/tts')
       throw new Error('Unsupported backend WebSocket path');
     return supervisor.websocketUrl(raw);
   });
-  ipcMain.handle(CHANNELS.maintenanceScanReset, async (event) => {
+  handle(CHANNELS.maintenanceScanReset, async (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return scanResetScopes(await resetRoots(supervisor));
   });
-  ipcMain.handle(CHANNELS.maintenancePurgeReset, async (event, raw: unknown) => {
+  handle(CHANNELS.maintenancePurgeReset, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (
@@ -602,7 +603,7 @@ export function registerIpc(
       maintenanceBusy = false;
     }
   });
-  ipcMain.handle(CHANNELS.maintenanceChooseDataDirectory, async (event) => {
+  handle(CHANNELS.maintenanceChooseDataDirectory, async (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (supervisor.connection.remote) throw new Error('local_only');
@@ -626,7 +627,7 @@ export function registerIpc(
     };
     return { ...plan, authorization: relocationSelection.authorization };
   });
-  ipcMain.handle(CHANNELS.maintenanceRelocateDataDirectory, async (event, raw: unknown) => {
+  handle(CHANNELS.maintenanceRelocateDataDirectory, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (
@@ -661,13 +662,13 @@ export function registerIpc(
       maintenanceBusy = false;
     }
   });
-  ipcMain.handle(CHANNELS.maintenanceScanUninstall, async (event) => {
+  handle(CHANNELS.maintenanceScanUninstall, async (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (supervisor.connection.remote) throw new Error('local_only');
     return scanUninstallTargets(await uninstallRoots(supervisor));
   });
-  ipcMain.handle(CHANNELS.maintenancePurgeUninstall, async (event, includeModels: unknown) => {
+  handle(CHANNELS.maintenancePurgeUninstall, async (event, includeModels: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (typeof includeModels !== 'boolean') throw new Error('invalid_uninstall_request');
@@ -692,33 +693,26 @@ export function registerIpc(
       throw error;
     }
   });
-  ipcMain.handle(CHANNELS.backendSetupRuntime, (event) => {
-    const owner = getMainWindow();
-    if (
-      !owner ||
-      event.sender !== owner.webContents ||
-      event.senderFrame !== owner.webContents.mainFrame ||
-      !isTrustedRenderer(event.senderFrame.url, process.env.ELECTRON_RENDERER_URL)
-    )
-      throw new Error('Untrusted runtime setup request');
+  handle(CHANNELS.backendSetupRuntime, (event) => {
+    assertTrustedMainFrame(event, getMainWindow(), 'Untrusted runtime setup request');
     return supervisor.setupRuntime();
   });
-  ipcMain.handle(CHANNELS.backendCleanSetupRuntime, (event) => {
+  handle(CHANNELS.backendCleanSetupRuntime, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.cleanSetupRuntime();
   });
-  ipcMain.handle(CHANNELS.backendSetupRuntimeOnCpu, (event) => {
+  handle(CHANNELS.backendSetupRuntimeOnCpu, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.setupRuntimeOnCpu();
   });
-  ipcMain.handle(CHANNELS.backendSetRuntimeRegion, (event, raw: unknown) => {
+  handle(CHANNELS.backendSetRuntimeRegion, (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.setRuntimeRegion(raw);
   });
-  ipcMain.handle(CHANNELS.backendChooseRuntimeLocation, async (event, rawTitle: unknown) => {
+  handle(CHANNELS.backendChooseRuntimeLocation, async (event, rawTitle: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const title = typeof rawTitle === 'string' && rawTitle.length <= 200 ? rawTitle : undefined;
@@ -729,12 +723,12 @@ export function registerIpc(
     if (picked.canceled || !picked.filePaths[0]) return null;
     return supervisor.setRuntimeLocation(picked.filePaths[0]);
   });
-  ipcMain.handle(CHANNELS.backendUseDefaultRuntimeLocation, (event) => {
+  handle(CHANNELS.backendUseDefaultRuntimeLocation, (event) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return supervisor.setRuntimeLocation(null);
   });
-  ipcMain.handle(CHANNELS.backendGetPythonRuntime, (event: IpcMainInvokeEvent) => {
+  handle(CHANNELS.backendGetPythonRuntime, (event: IpcMainInvokeEvent) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     return {
@@ -742,7 +736,7 @@ export function registerIpc(
       overrideActive: Boolean(String(process.env.OMNIVOICE_BACKEND_CMD ?? '').trim()),
     };
   });
-  ipcMain.handle(CHANNELS.backendChoosePythonRuntime, async (event: IpcMainInvokeEvent, rawTitle: unknown) => {
+  handle(CHANNELS.backendChoosePythonRuntime, async (event: IpcMainInvokeEvent, rawTitle: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const title = typeof rawTitle === 'string' && rawTitle.length <= 200 ? rawTitle : undefined;
@@ -754,22 +748,26 @@ export function registerIpc(
     const validation = await validatePythonRuntime(picked.filePaths[0], backendRoot());
     return { ...validation, token: stagePython(validation.pythonPath, event, validation.ok) };
   });
-  ipcMain.handle(CHANNELS.backendUseManagedPython, async (event: IpcMainInvokeEvent) => {
+  handle(CHANNELS.backendUseManagedPython, async (event: IpcMainInvokeEvent) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     clearPythonRuntimeSelection();
     await supervisor.restart();
     return { ok: true };
   });
-  ipcMain.handle(CHANNELS.backendRestart, () => supervisor.restart());
-  ipcMain.handle(CHANNELS.backendRestartOnCpu, async (event: IpcMainInvokeEvent) => {
+  handle(CHANNELS.backendRestart, (event: IpcMainInvokeEvent) => {
+    // It stops and restarts the backend: only the app's own window may ask.
+    assertTrustedMainFrame(event, getMainWindow());
+    return supervisor.restart();
+  });
+  handle(CHANNELS.backendRestartOnCpu, async (event: IpcMainInvokeEvent) => {
     // It changes a stored setting: only the app's own window may ask.
     assertTrustedMainFrame(event, getMainWindow());
     await supervisor.restartOnCpu();
   });
-  ipcMain.handle(CHANNELS.filesExtractScript, (_event, input: unknown) => extractWordScript(input));
+  handle(CHANNELS.filesExtractScript, (_event, input: unknown) => extractWordScript(input));
 
-  ipcMain.handle(CHANNELS.filesAuthorizeMediaTool, async (event, raw: unknown) => {
+  handle(CHANNELS.filesAuthorizeMediaTool, async (event, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     const kind = assertMediaTool(raw);
@@ -784,7 +782,7 @@ export function registerIpc(
     return authorizeMediaTool(await backendDataDirectory(supervisor), picked.filePaths[0], kind);
   });
 
-  ipcMain.handle(CHANNELS.filesAuthorizeModelsDirectory, async (event, raw: unknown = false) => {
+  handle(CHANNELS.filesAuthorizeModelsDirectory, async (event, raw: unknown = false) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (typeof raw !== 'boolean') throw new Error('Invalid models-directory request');
@@ -802,7 +800,7 @@ export function registerIpc(
     }
     return authorizeModelsDirectory(await backendDataDirectory(supervisor), selected);
   });
-  ipcMain.handle(CHANNELS.filesChooseEngineModelDirectory, async (event: IpcMainInvokeEvent, raw: unknown) => {
+  handle(CHANNELS.filesChooseEngineModelDirectory, async (event: IpcMainInvokeEvent, raw: unknown) => {
     const owner = getMainWindow();
     assertTrustedMainFrame(event, owner);
     if (supervisor.connection.remote) throw new Error('Local model selection requires a local backend');
@@ -818,7 +816,7 @@ export function registerIpc(
     return authorizeModelsDirectoryReadOnly(dataDirectory, picked.filePaths[0], raw);
   });
 
-  ipcMain.handle(CHANNELS.filesSaveAudio, async (event, raw: unknown): Promise<SaveAudioResult> => {
+  handle(CHANNELS.filesSaveAudio, async (event, raw: unknown): Promise<SaveAudioResult> => {
     const owner = windowFor(event) ?? getMainWindow();
     assertTrustedMainFrame(event, owner);
     const req = assertSaveAudioRequest(raw);
@@ -843,7 +841,7 @@ export function registerIpc(
     return { canceled: false, path: picked.filePath };
   });
 
-  ipcMain.handle(CHANNELS.filesSaveData, async (event, raw: unknown): Promise<SaveAudioResult> => {
+  handle(CHANNELS.filesSaveData, async (event, raw: unknown): Promise<SaveAudioResult> => {
     const owner = windowFor(event) ?? getMainWindow();
     assertTrustedMainFrame(event, owner);
     const req = assertSaveDataRequest(raw);
@@ -859,20 +857,27 @@ export function registerIpc(
     return { canceled: false, path: picked.filePath };
   });
 
-  ipcMain.handle(CHANNELS.filesRevealPath, (_event, raw: unknown) => {
+  handle(CHANNELS.filesRevealPath, (event, raw: unknown) => {
+    const owner = getMainWindow();
+    assertTrustedMainFrame(event, owner);
     const path = assertString(raw, 'path');
     if (!isAbsolute(path)) throw new Error('revealPath needs an absolute path');
     shell.showItemInFolder(path);
   });
 
-  ipcMain.handle(CHANNELS.filesOpenExternal, async (_event, raw: unknown) => {
+  handle(CHANNELS.filesOpenExternal, async (event, raw: unknown) => {
+    const owner = getMainWindow();
+    assertTrustedMainFrame(event, owner);
     const target = assertString(raw, 'url');
-    if (isAbsolute(target)) {
-      const failure = await shell.openPath(target);
-      if (failure) throw new Error(failure);
-      return;
+    // Web and mail only. A local path is not a URL at all (`new URL` refuses a
+    // POSIX path) and `file:` is in no allowlist here: both would launch a local
+    // file through its OS association, which is what `files:revealPath` is for.
+    let url: URL;
+    try {
+      url = new URL(target);
+    } catch {
+      throw new Error('Refusing to open a non-URL target');
     }
-    const url = new URL(target);
     if (!OPEN_EXTERNAL_PROTOCOLS.has(url.protocol)) {
       throw new Error(`Refusing to open ${url.protocol} URLs`);
     }
@@ -880,19 +885,21 @@ export function registerIpc(
   });
 
   ipcMain.on(CHANNELS.windowMinimize, (event) => {
-    (windowFor(event) ?? getMainWindow())?.minimize();
+    trustedOwner(event, windowFor(event) ?? getMainWindow())?.minimize();
   });
   ipcMain.on(CHANNELS.windowToggleMaximize, (event) => {
-    const win = windowFor(event) ?? getMainWindow();
+    const win = trustedOwner(event, windowFor(event) ?? getMainWindow());
     if (!win) return;
     if (win.isMaximized()) win.unmaximize();
     else win.maximize();
   });
   ipcMain.on(CHANNELS.windowClose, (event) => {
-    (windowFor(event) ?? getMainWindow())?.close();
+    trustedOwner(event, windowFor(event) ?? getMainWindow())?.close();
   });
-  ipcMain.handle(CHANNELS.windowIsMaximized, (event) => {
-    return (windowFor(event) ?? getMainWindow())?.isMaximized() ?? false;
+  handle(CHANNELS.windowIsMaximized, (event) => {
+    const owner = windowFor(event);
+    assertTrustedMainFrame(event, owner);
+    return owner.isMaximized();
   });
 }
 

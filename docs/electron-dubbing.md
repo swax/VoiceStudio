@@ -85,6 +85,10 @@ also answer metadata-only `HEAD` requests, including after backend restart, with
 reading the source body or starting a preview mux. Local NLLB batches scale with available accelerator memory while
 bounding batch multiplied by beam count.
 
+Fresh dub segments use the existing watermark worker before they enter recovery
+storage or the published track, keeping API requests responsive while marking runs.
+Recovered segments retain their existing mark and are not marked a second time.
+
 The backend remains responsible for separation, ASR, speaker cloning, translation,
 TTS, fitting, mixing and export. When the vocals were separated, each line starts on
 detected speech and ends after its last spoken sound (#3419): a sigh, breath, footstep
@@ -136,7 +140,7 @@ public downloader without loading speech models or touching app data. The curren
 smoke downloaded a browser-safe MP4 and one original-language caption track, then
 parsed 165 usable cues.
 
-A disconnected preparation or generation stream retains its existing task for Resume or Cancel. Editing and new jobs remain disabled until that task finishes or cancellation is confirmed; reconnecting never creates a replacement generation. A task already absent from the backend counts as cancelled. If the backend cannot confirm cancellation, Change file explicitly abandons the unreachable local recovery record so the workspace cannot become permanently blocked.
+A disconnected preparation or generation stream retains its existing task for Resume or Cancel. Editing and new jobs remain disabled until that task finishes or cancellation is confirmed; reconnecting never creates a replacement generation. A task already absent from the backend counts as cancelled. A task the backend settled while the stream was down ends with that outcome on Resume and frees the workspace: when the backend process dies mid-task (an out-of-memory kill, a crash), the restarted backend marks the task failed, and its replayed stream ends with that failure instead of stopping without a terminal event. If the backend cannot confirm cancellation, Change file explicitly abandons the unreachable local recovery record so the workspace cannot become permanently blocked.
 
 The setup sidebar groups the source, target language and translation engine, timing,
 production overrides and export choices into stable sections. Translation quality and
@@ -147,6 +151,8 @@ generation actions.
 Import .srt replaces the current segment text and timings after source preparation.
 The backend retains voice references only where their timing overlaps the new cues.
 Malformed, overlapping, or duration-clamped cue counts remain visible in the sidebar.
+Timestamp millisecond fields longer than three digits are skipped and counted as
+malformed, rather than truncated; one- and two-digit millisecond fields remain accepted.
 Failed imports preserve the current edits. Generated track buttons clear on successful
 replacement to avoid presenting older audio as the new subtitles' output.
 Ruby pronunciation guides in SRT/VTT captions are excluded from the spoken text
