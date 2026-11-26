@@ -679,7 +679,7 @@ def _stem_in_job(job_dir: str, name: str, duration: float) -> str:
     return path
 
 
-def attach_stems(job_id: str, vocals: str, no_vocals: Optional[str]) -> dict:
+def attach_stems(job_id: str, vocals: str, no_vocals: str | None) -> dict:
     """Record stems a client separated itself as the job's voices and bed.
 
     The files must already be in the job folder (named relative to it) and as

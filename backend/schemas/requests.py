@@ -34,15 +34,15 @@ class DubSegment(BaseModel):
     # Per-segment emotion reference for engines that take one (IndexTTS 2):
     # a local audio file whose delivery this line should follow (e.g. the
     # original actor's line), and how strongly (0-1, engine default 1.0).
-    emo_audio: Optional[str] = None
-    emo_alpha: Optional[float] = None
+    emo_audio: str | None = None
+    emo_alpha: float | None = None
     # Per-segment voice reference: a local audio file and its exact transcript,
     # replacing the profile's reference for this line only (both required).
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
     # Per-segment random seed for engines that sample in a sidecar (IndexTTS 2),
     # so a take re-timed at another speed keeps its performance.
-    seed: Optional[int] = None
+    seed: int | None = None
     effect_preset: str = "broadcast"   # NEW: DSP preset id (default: broadcast)
     # Echo of the segment's imported caption source id (`webvtt_source.id` /
     # `srt_source.id`) while its text is still that import's text. Without
@@ -299,7 +299,7 @@ class DubAttachStemsRequest(BaseModel):
     """Stems the client separated itself, as file names in the job folder."""
 
     vocals: str = Field(min_length=1, max_length=255)
-    no_vocals: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    no_vocals: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class DubForkRequest(BaseModel):

@@ -135,7 +135,7 @@ def test_per_line_conditioning_reaches_engine_and_published_fingerprint(render_d
 def test_per_line_seed_does_not_require_emotion_support(render_dub, seed):
     render_dub.backend.supports_generation_seed = True
     render_dub.backend.supports_emotion = False
-    events = render_dub.run(segments=[dict(start=0, end=1, text="Hello.", seed=seed)])
+    events = render_dub.run(segments=[{"start": 0, "end": 1, "text": "Hello.", "seed": seed}])
     assert any(event["type"] == "done" for event in events)
     assert render_dub.generated[-1]["seed"] == seed
 
@@ -156,11 +156,17 @@ def test_per_line_emotion_uses_scalar_generation_when_native_batch_has_no_emotio
     monkeypatch.setattr(dg, "native_batch_width", lambda _: 2)
     emotion = str(render_dub.path / "emotion.wav")
     sf.write(emotion, torch.ones(24000).numpy() * 0.1, 24000)
-    segments = [dict(start=i, end=i + 1, text="Hello.", emo_audio=emotion) for i in range(2)]
+    # Different strengths keep the rows distinct in upstream's speech cache.
+    strengths = [0.3, 0.7]
+    segments = [
+        {"start": i, "end": i + 1, "text": "Hello.", "emo_audio": emotion, "emo_alpha": strength}
+        for i, strength in enumerate(strengths)
+    ]
     events = render_dub.run(segments=segments, segment_ids=["a", "b"])
     assert any(event["type"] == "done" for event in events)
     assert len(render_dub.generated) == 2
     assert all(row["emo_audio"] == emotion for row in render_dub.generated)
+    assert [row["emo_alpha"] for row in render_dub.generated] == strengths
 
 
 def test_failed_segment_does_not_publish_complete_track(render_dub):
