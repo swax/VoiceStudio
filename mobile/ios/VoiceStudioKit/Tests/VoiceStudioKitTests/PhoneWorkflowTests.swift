@@ -8,37 +8,66 @@ private func fixtureRoot() throws -> URL {
     try PrivateFiles.directory(root); return root
 }
 
+/// Deterministic source for the mux test, not a test of cold encoder startup.
+/// FFmpeg 9.0.2, generated locally (no audio, models or external input):
+/// ffmpeg -f lavfi -i color=c=black:s=64x64:r=30:d=1 -an -c:v libx264 -threads 1 \
+///   -pix_fmt yuv420p -movflags +faststart black.mp4
+/// ffmpeg -display_rotation -90 -i black.mp4 -c copy source.mp4
+/// FFmpeg's -90 display matrix is AVFoundation's b=1,c=-1 rotation, as asserted below.
+private func writePhoneVideoFixture(to output: URL) throws {
+    let source = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAABIBtZGF0AAACrgYF//+q
+        3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBF
+        Ry00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4u
+        b3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTMgZGVibG9jaz0xOjA6MCBhbmFs
+        eXNlPTB4MzoweDExMyBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVk
+        X3JlZj0xIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MSBjcW09MCBk
+        ZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTEg
+        bG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRl
+        cmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0zIGJf
+        cHlyYW1pZD0yIGJfYWRhcHQ9MSBiX2JpYXM9MCBkaXJlY3Q9MSB3ZWlnaHRiPTEgb3Blbl9nb3A9
+        MCB3ZWlnaHRwPTIga2V5aW50PTI1MCBrZXlpbnRfbWluPTI1IHNjZW5lY3V0PTQwIGludHJhX3Jl
+        ZnJlc2g9MCByY19sb29rYWhlYWQ9NDAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAu
+        NjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAAA
+        IGWIhAA3//728P4FNlYEUJcRzeh8/QAFV2va4eIv/1RhAAAACkGaJGxDf/6nj4gAAAAIQZ5CeIV/
+        DDkAAAAIAZ5hdEJ/DkgAAAAIAZ5jakJ/DkkAAAAQQZpoSahBaJlMCG///qePiQAAAApBnoZFESwr
+        /ww5AAAACAGepXRCfw5JAAAACAGep2pCfw5IAAAAEEGarEmoQWyZTAhv//6nj4gAAAAKQZ7KRRUs
+        K/8MOQAAAAgBnul0Qn8OSAAAAAgBnutqQn8OSAAAABBBmvBJqEFsmUwIb//+p4+JAAAACkGfDkUV
+        LCv/DDkAAAAIAZ8tdEJ/DkkAAAAIAZ8vakJ/DkgAAAAQQZs0SahBbJlMCG///qePiAAAAApBn1JF
+        FSwr/ww5AAAACAGfcXRCfw5IAAAACAGfc2pCfw5IAAAAEEGbeEmoQWyZTAhn//6eLfEAAAAKQZ+W
+        RRUsK/8MOAAAAAgBn7V0Qn8OSQAAAAgBn7dqQn8OSQAAABBBm7xJqEFsmUwIV//+OI3AAAAACkGf
+        2kUVLCv/DDkAAAAIAZ/5dEJ/DkgAAAAIAZ/7akJ/DkkAAAAQQZv9SahBbJlMCE///fGtgQAABKFt
+        b292AAAAbG12aGQAAAAAAAAAAAAAAAAAADwAAAA8AAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAA
+        AAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAD
+        zHRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAA8AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAEAAAAAAAD//wAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAQAAAAEAAAAAAACRlZHRzAAAAHGVsc3QA
+        AAAAAAAAAQAAPAAAAAQAAAEAAAAAA0RtZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAADwAAAA8AFXE
+        AAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAALvbWluZgAA
+        ABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAC
+        r3N0YmwAAAC/c3RzZAAAAAAAAAABAAAAr2F2YzEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQABA
+        AEgAAABIAAAAAAAAAAEUTGF2YzYzLjEuMTAyIGxpYngyNjQAAAAAAAAAAAAAAAAY//8AAAA1YXZj
+        QwFkAAr/4QAYZ2QACqzZRCbARAAAAwAEAAADAPA8SJZYAQAGaOvjyyLA/fj4AAAAABBwYXNwAAAA
+        AQAAAAEAAAAUYnRydAAAAAAAACPAAAAjwAAAABhzdHRzAAAAAAAAAAEAAAAeAAACAAAAABRzdHNz
+        AAAAAAAAAAEAAAABAAABAGN0dHMAAAAAAAAAHgAAAAEAAAQAAAAAAQAACgAAAAABAAAEAAAAAAEA
+        AAAAAAAAAQAAAgAAAAABAAAKAAAAAAEAAAQAAAAAAQAAAAAAAAABAAACAAAAAAEAAAoAAAAAAQAA
+        BAAAAAABAAAAAAAAAAEAAAIAAAAAAQAACgAAAAABAAAEAAAAAAEAAAAAAAAAAQAAAgAAAAABAAAK
+        AAAAAAEAAAQAAAAAAQAAAAAAAAABAAACAAAAAAEAAAoAAAAAAQAABAAAAAABAAAAAAAAAAEAAAIA
+        AAAAAQAACgAAAAABAAAEAAAAAAEAAAAAAAAAAQAAAgAAAAABAAAEAAAAABxzdHNjAAAAAAAAAAEA
+        AAABAAAAHgAAAAEAAACMc3RzegAAAAAAAAAAAAAAHgAAAtYAAAAOAAAADAAAAAwAAAAMAAAAFAAA
+        AA4AAAAMAAAADAAAABQAAAAOAAAADAAAAAwAAAAUAAAADgAAAAwAAAAMAAAAFAAAAA4AAAAMAAAA
+        DAAAABQAAAAOAAAADAAAAAwAAAAUAAAADgAAAAwAAAAMAAAAFAAAABRzdGNvAAAAAAAAAAEAAAAw
+        AAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAs
+        aWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2My4xLjEwMg==
+        """
+    let data = try #require(Data(base64Encoded: source, options: .ignoreUnknownCharacters))
+    try data.write(to: output)
+    #expect(try ModelHash.file(output) == "841dd81c3406935c57c2fc8dcf86490299872f38abece2844402007605072bf6")
+}
+
 @Test func phoneVideoMuxPreservesOrientationAndMarksPlayableAudio() async throws {
     let root = try fixtureRoot(); defer { try? FileManager.default.removeItem(at: root) }
     let source = root.appendingPathComponent("source.mp4")
-    let writer = try AVAssetWriter(outputURL: source, fileType: .mp4)
-    let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-        AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 64, AVVideoHeightKey: 64
-    ])
-    input.transform = CGAffineTransform(rotationAngle: .pi / 2)
-    let adapter = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        kCVPixelBufferWidthKey as String: 64, kCVPixelBufferHeightKey as String: 64
-    ])
-    try #require(writer.canAdd(input)); writer.add(input)
-    try #require(writer.startWriting()); writer.startSession(atSourceTime: .zero)
-    defer { if writer.status == .writing { writer.cancelWriting() } }
-    for frame in 0..<30 {
-        let deadline = ContinuousClock.now + .seconds(10)
-        while !input.isReadyForMoreMediaData && ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        try #require(input.isReadyForMoreMediaData)
-        var buffer: CVPixelBuffer?
-        try #require(CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, kCVPixelFormatType_32BGRA, nil, &buffer) == kCVReturnSuccess)
-        let pixels = try #require(buffer)
-        CVPixelBufferLockBaseAddress(pixels, [])
-        memset(CVPixelBufferGetBaseAddress(pixels), 0, CVPixelBufferGetDataSize(pixels))
-        CVPixelBufferUnlockBaseAddress(pixels, [])
-        try #require(adapter.append(pixels, withPresentationTime: CMTime(value: Int64(frame), timescale: 30)))
-    }
-    input.markAsFinished(); writer.endSession(atSourceTime: CMTime(seconds: 1, preferredTimescale: 30))
-    await writer.finishWriting(); try #require(writer.status == .completed)
+    try writePhoneVideoFixture(to: source)
     let wave = root.appendingPathComponent("marked.wav")
     let samples: [Float] = (0..<24000).map { frame in
         let phase = Double(frame) * 2.0 * Double.pi * 440.0 / 24000.0
@@ -553,6 +582,67 @@ func realAuxiliaryPhoneDubOfflineAndResume() async throws {
     let pcm = try await AVPhoneAudioDecoder().decode(source: output,output: root.appendingPathComponent("check.pcm"),maxSeconds: 2,progress: { _ in })
     #expect(try pcm.read(start: 2500,count: 100).samples.allSatisfy { abs($0-0.2) < 0.0001 })
     #expect(try pcm.read(start: 13000,count: 100).samples.allSatisfy { $0 == 0 })
+}
+
+@Test(arguments: [PhoneDubPackage.clips,.stems], ["important","ordinary","filesystem","missing","low-important","low-ordinary","negative-important"])
+func nativeDubPackageUsesAvailableCapacityWithoutBypassingLowSpace(_ kind: PhoneDubPackage,_ probe: String) async throws {
+    let root = try fixtureRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.wav"); try Data("natural recording".utf8).write(to: source)
+    let store = try PhoneDubStore(root: root.appendingPathComponent("jobs")), engine = FixtureEngine()
+    let models = try [fixtureModel(.asr),fixtureModel(.translate),fixtureModel(.clone)]
+    let request = try await store.create(source: source,title: "Source",targets: [PhoneDubTarget(code: "fr",name: "French")],models: models,consent: true,audioOnly: true)
+    let pipeline = PhoneDubPipeline(store: store,engine: engine,decoder: FixtureDecoder(),media: FixtureMedia())
+    let complete = try await pipeline.run(id: request.id,models: models)
+    let frames = kind == .stems ? complete.frames*2 : complete.renders.filter { $0.target == "fr" }.reduce(0) { $0+$1.frames }
+    let required = Int64(frames)*4+16_000_000
+    let workspace = root.appendingPathComponent("exports"); try PrivateFiles.directory(workspace)
+    let capacity: PhoneDubStorageCapacity
+    switch probe {
+    case "ordinary": capacity = PhoneDubStorageCapacity(important: 0,ordinary: required)
+    case "filesystem": capacity = PhoneDubStorageCapacity(important: 0,ordinary: 0,filesystem: required)
+    case "missing": capacity = PhoneDubStorageCapacity()
+    case "low-important": capacity = PhoneDubStorageCapacity(important: required-1,ordinary: required,filesystem: required)
+    case "low-ordinary": capacity = PhoneDubStorageCapacity(important: 0,ordinary: required-1,filesystem: required)
+    case "negative-important": capacity = PhoneDubStorageCapacity(important: -1,ordinary: required)
+    default: capacity = PhoneDubStorageCapacity(important: required)
+    }
+    let allowed = ["important","ordinary","filesystem","negative-important"].contains(probe)
+    if allowed {
+        let package = try await store.exportPackage(request.id,target: "fr",kind: kind,workspace: workspace,availableStorage: { _ in capacity })
+        #expect(try ProjectArchive.entries(package).contains { $0.path == "manifest.json" })
+    } else {
+        do {
+            _ = try await store.exportPackage(request.id,target: "fr",kind: kind,workspace: workspace,availableStorage: { _ in capacity })
+            Issue.record("Export ignored insufficient or unknown capacity")
+        } catch let error as ClientError { #expect(error.key == "mobile.local.storage_required") }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: workspace.path).isEmpty)
+    }
+    #expect(try await store.checkpoint(request.id).outputs.map(\.file) == complete.outputs.map(\.file))
+}
+
+@Test(arguments: [PhoneDubPackage.clips,.stems], [false,true])
+func nativeDubPackageRequiresActualWorkspaceCapacity(_ kind: PhoneDubPackage,_ existingWorkspace: Bool) async throws {
+    let root = try fixtureRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appendingPathComponent("source.wav"); try Data("natural recording".utf8).write(to: source)
+    let store = try PhoneDubStore(root: root.appendingPathComponent("jobs")), engine = FixtureEngine()
+    let models = try [fixtureModel(.asr),fixtureModel(.translate),fixtureModel(.clone)]
+    let request = try await store.create(source: source,title: "Source",targets: [PhoneDubTarget(code: "fr",name: "French")],models: models,consent: true,audioOnly: true)
+    let complete = try await PhoneDubPipeline(store: store,engine: engine,decoder: FixtureDecoder(),media: FixtureMedia()).run(id: request.id,models: models)
+    let workspace = root.appendingPathComponent("exports")
+    if existingWorkspace { try PrivateFiles.directory(workspace) }
+    do {
+        _ = try await store.exportPackage(request.id,target: "fr",kind: kind,workspace: workspace,availableStorage: { url in
+            PhoneDubStorageCapacity(important: url == workspace ? 1 : Int64.max)
+        })
+        Issue.record("Export checked the saved job volume instead of its output workspace")
+    } catch let error as ClientError { #expect(error.key == "mobile.local.storage_required") }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: workspace.path).isEmpty)
+    if !existingWorkspace { try FileManager.default.removeItem(at: workspace) }
+    let package = try await store.exportPackage(request.id,target: "fr",kind: kind,workspace: workspace,availableStorage: { url in
+        PhoneDubStorageCapacity(important: url == workspace ? Int64.max : 1)
+    })
+    #expect(try ProjectArchive.entries(package).contains { $0.path == "manifest.json" })
+    #expect(try await store.checkpoint(request.id).outputs.map(\.file) == complete.outputs.map(\.file))
 }
 
 @Test func nativeDubPackagesShareCastReferencesAndExportVerifiedMarkedClipsWithoutReferenceAssets() async throws {

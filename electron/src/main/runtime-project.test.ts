@@ -1,7 +1,17 @@
 // @vitest-environment node
 import { RuntimeLaunchRefusedError } from './runtime-launch-refusal';
 import { existsSync } from 'node:fs';
-import { cp, mkdtemp, mkdir, readFile, rm, writeFile, statfs, utimes } from 'node:fs/promises';
+import {
+  cp,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+  statfs,
+  utimes,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { downloadRuntimeInstaller } from './runtime-download';
@@ -17,6 +27,7 @@ import { PYPI_SPEED_SAMPLE_BYTES } from './pypi-mirror';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   installManagedPython,
+  recoverMinorVersionLink,
   installRuntime,
   runtimeDownloadEnv,
   runtimeRequiredGib,
@@ -85,6 +96,7 @@ async function fixture() {
   await mkdir(join(bundle, 'frontend', 'dist'), { recursive: true });
   await mkdir(join(bundle, 'omnivoice'));
   await mkdir(join(bundle, 'scripts'));
+  await mkdir(join(bundle, 'vendor', 'wheels'), { recursive: true });
   for (const file of [
     'pyproject.toml',
     'uv.lock',
@@ -96,6 +108,7 @@ async function fixture() {
     'omnivoice/__init__.py',
     'scripts/windows-rocm-recipe.json',
     'scripts/smoke_windows_rocm.py',
+    'vendor/wheels/docopt-0.6.2-py2.py3-none-any.whl',
   ]) {
     await writeFile(join(bundle, file), file);
   }
@@ -691,6 +704,33 @@ describe('packaged runtime setup', () => {
       ([, args]) => args[0] === '-c' && args[1]?.includes('import fastapi'),
     );
     expect(verify?.[1][1]).toContain('sentencepiece');
+  });
+  it('syncs with the recovered interpreter path when the minor-version link stays broken (#4487)', async () => {
+    const { bundle, project } = await fixture();
+    const patch = join(project, '..', '.python', 'cpython-3.11.16-test-none');
+    await mkdir(join(patch, 'bin'), { recursive: true });
+    const python = process.platform === 'win32' ? join(patch, 'python.exe') : join(patch, 'bin', 'python3');
+    await writeFile(python, '');
+    const run = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] === 'python' && args[1] === 'install') {
+        throw new Error(
+          `error: Missing expected target directory for Python minor version link at ${patch}\n`,
+        );
+      }
+      await interpreter(project);
+    });
+    await installRuntime(
+      bundle,
+      project,
+      'uv',
+      run,
+      new AbortController().signal,
+      undefined,
+      'global',
+    );
+    const sync = run.mock.calls.find(([, args]) => args[0] === 'sync');
+    expect(sync?.[1]).not.toContain('--managed-python');
+    expect(sync?.[1]).toEqual(expect.arrayContaining(['--python', python]));
   });
   it('reinstalls the pinned ROCm stack only after an explicit opt-in', async () => {
     forcePlatform('linux');
@@ -1963,6 +2003,63 @@ describe('outdated Visual C++ runtime behind a native import crash (#3293)', () 
     expect(await runtimeReady(bundle, project)).toBe(false);
   });
 
+  it('names an outdated runtime behind torch WinError 1114 on c10.dll (#4230)', async () => {
+    const { bundle, project } = await fixture();
+    const failure = installRuntime(
+      bundle,
+      project,
+      'uv',
+      runner('14.23.27820.0', () =>
+        Object.assign(new Error('Runtime setup exited with code 1'), {
+          code: 1,
+          stdout: 'VOICESTUDIO_IMPORT=fastapi\nVOICESTUDIO_IMPORT=faster_whisper\n',
+          stderr:
+            'OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading "C:\\x\\torch\\lib\\c10.dll" or one of its dependencies.',
+        }),
+      ),
+      new AbortController().signal,
+    );
+    await expect(failure).rejects.toMatchObject({ code: OUTDATED_SYSTEM_LIBRARY_CODE });
+    await expect(failure).rejects.toThrow(/"faster_whisper".*14\.23\.27820\.0.*Visual C\+\+/s);
+  });
+
+  const dllInit = (dir = 'C:\\x') => () =>
+    Object.assign(new Error('Runtime setup exited with code 1'), {
+      code: 1,
+      stdout: 'VOICESTUDIO_IMPORT=fastapi\nVOICESTUDIO_IMPORT=faster_whisper\n',
+      stderr: `OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading "${dir}\\torch\\lib\\c10.dll" or one of its dependencies.`,
+    });
+
+  it('matches WinError 1114 even when the runtime path is very long (#4230)', async () => {
+    const { bundle, project } = await fixture();
+    await expect(
+      installRuntime(
+        bundle,
+        project,
+        'uv',
+        runner('14.23.27820.0', dllInit(`D:\\${'a'.repeat(400)}`)),
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: OUTDATED_SYSTEM_LIBRARY_CODE });
+  });
+
+  it.each([
+    ['a current runtime', '14.44.35211.0', /\(14\.44\.35211\.0\) looks current/],
+    ['an unreadable runtime version', '', /version could not be read/],
+  ])('does not blame the runtime for WinError 1114 with %s (#4230)', async (_n, version, text) => {
+    const { bundle, project } = await fixture();
+    const failure = installRuntime(
+      bundle,
+      project,
+      'uv',
+      runner(version, dllInit()),
+      new AbortController().signal,
+    );
+    await expect(failure).rejects.toMatchObject({ code: 'TORCH_DLL_INIT_FAILED' });
+    await expect(failure).rejects.toThrow(text);
+    await expect(failure).rejects.toThrow(/not established/);
+  });
+
   it('keeps the plain import failure when the runtime is current or the error is not a crash', async () => {
     const current = await fixture();
     await expect(
@@ -2155,5 +2252,33 @@ describe('installManagedPython', () => {
     ).rejects.toMatchObject({ code: 'EPERM' });
     expect(run).toHaveBeenCalledTimes(2);
     expect(refused).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('recoverMinorVersionLink (#4487)', () => {
+  it('removes only stale minor-version links and returns the patch interpreter path', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'vs-minor-'));
+    try {
+      const patch = join(dir, 'cpython-3.11.16-linux-x86_64-none');
+      await mkdir(join(patch, 'bin'), { recursive: true });
+      await writeFile(join(patch, 'bin', 'python3'), '');
+      const link = join(dir, 'cpython-3.11-linux-x86_64-none');
+      await symlink(patch, link, 'dir');
+      const error = new Error(
+        `error: Missing expected target directory for Python minor version link at ${patch}\n`,
+      );
+      const log = vi.fn();
+      const result = await recoverMinorVersionLink(error, dir, log);
+      expect(result).toEqual({ python: join(patch, 'bin', 'python3') });
+      expect(existsSync(link)).toBe(false);
+      expect(existsSync(join(patch, 'bin', 'python3'))).toBe(true);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('uv#19622'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores unrelated failures', async () => {
+    expect(await recoverMinorVersionLink(new Error('network down'), '/nope')).toBeNull();
   });
 });

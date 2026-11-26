@@ -11,6 +11,7 @@ import { router } from './router';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { UpdateRestartConfirm } from '@/components/update-restart-confirm';
 import { AnalyticsConsentBanner, AnalyticsRuntime } from '@/components/analytics-consent';
+import { DiagnosticRuntime } from '@/components/diagnostic-consent';
 import { GpuOfferBanner } from '@/components/gpu-offer';
 import { CloudSyncRuntime } from '@/features/account/cloud-sync-runtime';
 import { getBridge } from '@/components/bridge';
@@ -54,11 +55,13 @@ export function App() {
   useEffect(() => {
     void window.voicestudio?.capture
       ?.labels({
-        show: `${t('common.open')} ${t('app.name')}`,
-        start: t('transcriptions.capture'),
-        stop: t('clone.stop_recording'),
-        settings: t('nav.settings'),
-        exit: t('crash.field_exit'),
+        // Tray-only keys: borrowed strings read wrong out of context (the
+        // crash report's "Exit" status became the Quit command).
+        show: t('tray.open', { app: t('app.name') }),
+        start: t('tray.start_dictation'),
+        stop: t('tray.stop_dictation'),
+        settings: t('tray.settings'),
+        exit: t('tray.quit'),
       })
       .catch(() => {});
   }, [t]);
@@ -93,6 +96,7 @@ export function App() {
           <RealtimeEventSync />
           <GenerateBudgetSync />
           <AnalyticsRuntime />
+          <DiagnosticRuntime />
           <CloudSyncRuntime />
           <AnalyticsConsentBanner />
           <GpuOfferBanner />

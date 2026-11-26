@@ -308,14 +308,17 @@
     "test_global_hint": "Previsualización só de entradas globais: escolle un idioma para incluír entradas de ámbito lingüístico.",
     "test_error": "A vista previa non está dispoñible. Non se puido acceder ao backend.",
     "backup_title": "Copia de seguranza e restauración",
-    "backup_hint": "Descarga o dicionario como ficheiro JSON ou importa entradas dunha exportación anterior.",
+    "backup_hint": "Descarga o dicionario como JSON ou como léxico PLS, ou importa calquera dos dous. Tamén funcionan os léxicos PLS doutros servizos de voz.",
     "export": "Exportar JSON",
+    "export_pls": "Exportar PLS",
     "import": "Importar JSON",
-    "import_error": "Non se puido importar ese ficheiro; esperaba JSON dunha exportación de pronuncia.",
+    "import_error": "Non se puido importar ese ficheiro; esperaba unha exportación de pronuncia (JSON) ou un léxico PLS.",
     "import_replace_prompt_one": "Queres substituír a {{count}} entrada existente polo ficheiro importado? Escolla Non para engadir as entradas importadas xunto a el.",
     "import_replace_prompt_other": "Queres substituír as {{count}} entradas existentes polo ficheiro importado? Escolla Non para engadir as entradas importadas xunto a elas.",
     "import_done_one": "Importouse a entrada {{count}}.",
     "import_done_other": "Importáronse {{count}} entradas.",
+    "import_skipped_one": "Omitiuse {{count}} entrada: a súa transcrición fonética non é compatible.",
+    "import_skipped_other": "Omitíronse {{count}} entradas: a súa transcrición fonética non é compatible.",
     "entries_count_one": "{{count}} entrada",
     "entries_count_other": "{{count}} entradas",
     "scope_language": "Idioma",
@@ -384,6 +387,7 @@
     "setup_wrong_architecture": "Sae de VoiceStudio, substitúeo polo Apple Silicon (arm64) DMG e, a continuación, ábreo de novo. Estás executando a compilación de Intel a través de Rosetta; o cambio de compilación permite a IA local sen eliminar voces ou proxectos.",
     "setup_missing_system_library": "Este sistema Windows carece do Microsoft Visual C++ 2015-2022 Redistributable (x64), que necesita a extensión de audio PyTorch. Instálao desde Microsoft e, a continuación, prema Reintentar.",
     "setup_outdated_system_library": "Microsoft Visual C++ Redistributable (x64) deste sistema Windows é demasiado antigo, polo que unha biblioteca de voz falla cando se carga. Instala a versión máis recente de Microsoft e, a continuación, preme Retry.",
+    "setup_torch_dll_init_failed": "Non se puido cargar PyTorch e a causa non está establecida. Instala o último Microsoft Visual C++ Redistributable (x64), despois actualiza o controlador gráfico e preme Tentar de novo. Se aínda falla, usa «Limpar e tentar de novo» en «Máis solucións».",
     "setup_files_locked": "Outro programa está a usar os ficheiros de VoiceStudio (OneDrive ou outra aplicación de sincronización, antivirus ou un backend de VoiceStudio que aínda está en execución). Péchao ou fai unha pausa na sincronización e, a continuación, preme Reintentar.",
     "download_apple_silicon": "Descarga a versión de Apple Silicon",
     "proxy_bypass_help": "Sae totalmente de VoiceStudio, configure HTTP_PROXY/HTTPS_PROXY no URL do seu proxy e NO_PROXY para os hosts excluídos nun terminal e, a continuación, inicie VoiceStudio desde ese terminal. Volver tentar na aplicación actual non se poden cargar novas variables de ambiente.",
@@ -548,6 +552,7 @@
     "history_star": "Estrela",
     "history_unstar": "Desestrela",
     "history_reuse": "Reutilizar o script",
+    "history_full_text_failed": "Non se puido cargar o guión completo desta toma. Comproba que VoiceStudio está en execución e téntao de novo.",
     "history_starred": "Destacado",
     "history_all": "Todos",
     "characters_one": "{{count}} carácter",
@@ -683,6 +688,7 @@
     "source_language_required": "O recoñecemento de voz non informou en que idioma se fala este vídeo, polo que non se pode traducir aquí. Abre o vídeo en Dobraxe e escolle o seu idioma de orixe ou escolle un modelo de recoñecemento de voz que detecte o idioma.",
     "transcription_media_tool": "A transcrición precisa ffmpeg, que VoiceStudio non puido atopar nin executar. Abra Configuración → Ferramentas de audio e use Descargar/Reparar ou instale ffmpeg (macOS: instalación de brew ffmpeg; Windows: instalación de winget Gyan.FFmpeg; Linux: o seu xestor de paquetes) e reinicie VoiceStudio. Tamén pode apuntar FFMPEG_PATH a un binario ffmpeg.",
     "transcription_pipe_lost": "O backend perdeu o seu tubo de saída para a aplicación durante a transcrición (tubo roto). Reinicia VoiceStudio e téntao de novo.",
+    "reference_transcript_required": "O clip de referencia desta voz non ten transcrición, que este motor precisa para clonala. Engade a transcrición ao perfil de voz ou instala un modelo de voz a texto para transcribila automaticamente.",
     "gpu_oom": "A GPU quedou sen memoria. Pecha outras aplicacións con GPU pesada ou descarga modelos e, a continuación, téntao de novo. Tamén podes escoller CPU en Configuración → Rendemento e dispositivo ou seleccionar un motor TTS máis pequeno.",
     "host_memory_exhausted": "O ordenador quedou sen memoria. Pecha outras aplicacións e pestanas do navegador con moita memoria, descarga os modelos que non estás a usar, fai un paso máis curto ou selecciona un motor TTS máis lixeiro.",
     "disk_full": "O disco está cheo. Libra espazo na unidade que contén os datos de VoiceStudio, a caché do modelo ou o cartafol temporal e téntao de novo. Configuración → Almacenamento mostra o uso do disco e pode borrar ficheiros temporais.",
@@ -751,7 +757,8 @@
     "unknown": "descoñecido",
     "remove": "Eliminar {{term}}",
     "not_set": "Non definido",
-    "details": "Detalles"
+    "details": "Detalles",
+    "link_blocked": "Non se pode abrir esta ligazón. Só se permiten ligazóns web e de correo."
   },
   "preferences": {
     "title": "Configuración",
@@ -1528,6 +1535,9 @@
     "terminal_command_added": "Engadido. Abre unha nova xanela de terminal para usar voicestudio.",
     "terminal_command_failed": "Non se puido engadir voicestudio ao terminal. Comproba que o teu cartafol persoal non sexa de só lectura e téntao de novo.",
     "terminal_command_conflict": "{{path}} pertence a outra instalación, así que VoiceStudio non o modificou.",
+    "close_to_tray": "Seguir en execución na bandexa ao pechar",
+    "close_to_tray_desc": "Ao pechar a xanela, VoiceStudio ocúltase na bandexa en lugar de saír, e as tarefas en curso continúan. Volve abrilo desde a icona da bandexa e escolle Saír alí para pechalo. Nalgúns escritorios Linux a icona precisa compatibilidade con AppIndicator; abrir VoiceStudio de novo tamén reabre a xanela.",
+    "close_to_tray_failed": "Non se puido gardar este axuste. Téntao de novo.",
     "review_mode_on": "Pausa para revisar",
     "review_mode_off": "Corre directo",
     "translate_agent": "Axente apto",
@@ -1555,6 +1565,7 @@
     "gpu_report_state_nvidia_rocm_build": "Atopouse {{gpu}}, pero este PyTorch é unha compilación AMD ROCm e non pode manexar GPU NVIDIA.",
     "gpu_report_state_intel_unsupported": "Atopouse {{gpu}}, pero ningún motor instalado pode usar GPU Intel, polo que todo funciona na CPU.",
     "gpu_report_state_kernels_missing": "Atopouse {{gpu}}, pero esta compilación de PyTorch ({{torch}}) non ten núcleos para a súa arquitectura de cálculo, polo que os motores funcionan na CPU.",
+    "gpu_report_torch_fallback": "A configuración probou a compilación de PyTorch con CUDA 12.6 para esta GPU, pero non puido usar a tarxeta, polo que os motores de PyTorch seguen na CPU. Motivo: {{reason}}",
     "gpu_report_state_kernels_missing_legacy": "{{gpu}} é unha GPU NVIDIA máis antiga (serie GTX 900 / 1000 ou anterior). Esta compilación de PyTorch ({{torch}}) xa non admite esa xeración, así que os motores de PyTorch execútanse na CPU. Os motores co seu propio runtime Vulkan aínda poden usar a GPU.",
     "gpu_report_state_unknown": "Non se puido determinar o estado da GPU.",
     "gpu_report_option_vulkan_engines": "Use un motor co seu propio tempo de execución da GPU: audio.cpp execútase en GPU AMD Radeon a través de Vulkan (Configuración → Modelos → instalar o tempo de execución).",
@@ -1810,7 +1821,8 @@
     "open": "Queres abrir \"{{name}}\" e substituír o borrador actual? Garda primeiro o teu traballo actual.",
     "save_copy": "Garda unha copia",
     "new": "Novo proxecto",
-    "new_confirm": "Comezar un proxecto novo e baleiro? Os proxectos gardados non cambian; perderanse os cambios sen gardar do borrador actual."
+    "new_confirm": "Comezar un proxecto novo e baleiro? Os proxectos gardados non cambian; perderanse os cambios sen gardar do borrador actual.",
+    "delete_hint": "Só se elimina o proxecto gardado da lista. Consérvanse os ficheiros de audio e vídeo e as voces."
   },
   "sidebar": {
     "save_project": "Gardar proxecto de dobraxe",
@@ -2048,7 +2060,12 @@
     "untitled": "Sen título",
     "recovery_busy": "Outro renderizado está en execución. Retoma cando remate.",
     "cast_note_one": "{{names}} aínda non se emitiu, polo que se le na voz principal. Escolle unha voz para ela en Cast.",
-    "cast_note_other": "{{names}} aínda non se emitiron, polo que len coa voz principal. Escolle voces para eles en Cast."
+    "cast_note_other": "{{names}} aínda non se emitiron, polo que len coa voz principal. Escolle voces para eles en Cast.",
+    "result_other_connection": "Este audio gardado pertence a outra conexión de VoiceStudio. Volve a esa conexión para reproducilo.",
+    "result_connection_unknown": "Conecta o teu motor local ou o teu ordenador remoto para mostrar o audio gardado.",
+    "result_legacy": "Este resultado gardado antigo non ten información de conexión. Busca o seu nome de ficheiro nesta conexión; podería ser un ficheiro diferente.",
+    "result_check_audio": "Comprobar o audio gardado nesta conexión",
+    "result_recovery_failed": "O audio gardado non está dispoñible nesta conexión. Volve á súa conexión orixinal ou xérao de novo."
   },
   "credentials": {
     "microsoft_key": "Chave de Microsoft Translator",
@@ -2326,6 +2343,10 @@
     "dubbing_cta": "Executa isto no teu propio vídeo →",
     "dubbing_loading": "Cargando demostración de dobraxe…",
     "dubbing_dismiss": "Rexeitar a demostración de dobraxe",
+    "dubbing_download": "Descargar vídeos de demostración (~10 MB)",
+    "dubbing_downloading": "Descargando…",
+    "dubbing_download_failed": "A descarga fallou. Comproba a túa conexión.",
+    "dubbing_retry": "Reintentar",
     "original_tag": "orixinal",
     "dubbed_tag": "dobrado",
     "script_conversational": "Conversacional",
@@ -2554,7 +2575,7 @@
   },
   "crash": {
     "view": "Ver detalles do accidente",
-    "field_exit": "Saír",
+    "field_exit": "Estado de saída",
     "field_when": "Cando",
     "field_uptime": "Tempo de actividade antes do accidente",
     "field_version": "Versión de backend",
@@ -2926,7 +2947,8 @@
     "missingSpeech": "Falta o discurso ou non se pode lexir. Rexenera o segmento afectado antes de exportar.",
     "timingOverflow": "A fala supera a súa franxa horaria. Acurta a tradución ou escolle Slot Strict ou Stretch Video.",
     "sourceChanged": "Os subtítulos cambiaron mentres se procesaba esta dobraxe. Mantívose a pista anterior; xerar de novo para usar os novos subtítulos.",
-    "backgroundUnavailable": "Non se puido conservar o son orixinal. Comproba a separación en segundo plano e a sincronización dos diálogos, despois téntao de novo ou exporta explícitamente só a voz."
+    "backgroundUnavailable": "Non se puido conservar o son orixinal. Comproba a separación en segundo plano e a sincronización dos diálogos, despois téntao de novo ou exporta explícitamente só a voz.",
+    "untranslated": "Esta pista aínda non ten tradución: todas as liñas seguen iguais ao texto orixinal. Tradúcea ou escolle o idioma de orixe e xera de novo."
   },
   "dubStyle": {
     "label": "Indicador de estilo de tradución",
@@ -2945,6 +2967,8 @@
     "free": "Libre",
     "pro": "Pro",
     "get_pro": "Obtén Pro",
+    "upgrade_pro": "Mellorar a Pro",
+    "get_pro_app": "Obter a app Pro",
     "sponsor_bar": "Barra de patrocinadores",
     "visible": "Visible",
     "hideable": "Pódese ocultar",
@@ -2989,6 +3013,7 @@
       "speechCurl": "Texto a voz (curl)",
       "transcriptionCurl": "Transcrición (curl)",
       "openaiPython": "Python (SDK de OpenAI)",
+      "elevenlabsPython": "Python (SDK de ElevenLabs)",
       "dockerRun": "Executar o recipiente",
       "dockerCompose": "Docker Compose",
       "workflow": "fluxo de traballo n8n",
@@ -3341,7 +3366,8 @@
     "denoise": "Ruído de referencia limpo",
     "polish": "Audio xerado polaco",
     "basics": "1× é a velocidade normal. Deixa a duración en branco para o tempo natural.",
-    "hint": "Normalmente deixa estes predeterminado. A orientación axusta a influencia inmediata; os outros controis cambian como o modelo constrúe o son. Cambia un a un."
+    "hint": "Normalmente deixa estes predeterminado. A orientación axusta a influencia inmediata; os outros controis cambian como o modelo constrúe o son. Cambia un a un.",
+    "pauses_hint": "Engade silencio nas liñas en branco. 0 mantén o ritmo propio do motor."
   },
   "languagePicker": {
     "dialectFollowsVoice": "{{model}} ten un modelo {{language}}, polo que o acento segue a voz de referencia.",
@@ -3613,7 +3639,7 @@
       "notifications": "Notificacións",
       "notifications_help": "Notificar cando remate unha duplicación. As notificacións créanse neste teléfono; nada pasa por un servizo na nube.",
       "privacy": "Privacidade",
-      "privacy_help": "Esta aplicación só fala co servidor de VoiceStudio que vinculaches. Sen contas, sen procesamento na nube.",
+      "privacy_help": "As tarefas locais quedan neste teléfono. As descargas de modelos, os informes que decides enviar e o ordenador vinculado usan a rede. Os metadatos de diagnóstico automático só usan a rede tras un consentimento independente.",
       "about": "Sobre",
       "version": "Versión {{version}}",
       "licenses": "Licenzas de código aberto"
@@ -3666,7 +3692,7 @@
       "dictation_setup": "O ditado non está dispoñible. No host, instala e acepta un modelo ASR. Para o acceso remoto, volve conectarse mediante unha clave API ou unha rede de confianza; un PIN para compartir só non pode autorizar o ditado.",
       "host_label": "Etiqueta do servidor",
       "theme_preview": "Vista previa da aparencia",
-      "analytics_local": "Esta aplicación complementaria rexistra a túa elección neste teléfono. Non envía ningunha análise.",
+      "analytics_local": "Este teléfono non envía estatísticas de uso; a túa elección gárdase localmente. Os informes de diagnóstico automático requiren un consentimento independente.",
       "model_licenses": "Revisa as licenzas modelo do teu servidor",
       "stage_upload": "Cargando medios",
       "stage_prepare": "Preparando medios no host",
@@ -3719,7 +3745,7 @@
       "upload_pending": "A carga continúa en segundo plano. Mantén VoiceStudio no teu ordenador funcionando.",
       "upload_resume": "Retomar o seguimento",
       "upload_failed": "Produciuse un erro na carga. Conéctate de novo ao mesmo servidor e selecciona de novo o multimedia.",
-      "privacy_local": "A preferencia de Analytics gárdase neste dispositivo. Esta versión nunca envía análises.",
+      "privacy_local": "Este teléfono non envía estatísticas de uso; a túa elección gárdase localmente. Os informes de diagnóstico automático requiren un consentimento independente.",
       "transcript": "Transcrición",
       "qr_unavailable": "A cámara non está dispoñible. Introduza o enderezo do host manualmente.",
       "language_system": "Linguaxe do sistema",
@@ -3772,7 +3798,7 @@
       "capture_slow": "Este teléfono non puido procesar o audio do micrófono con suficiente rapidez. Detén outras aplicacións ou usa o teu ordenador.",
       "preset_voice": "Voz {{number}}",
       "transfer": "{{received}} de {{total}}",
-      "privacy": "As tarefas do dispositivo permanecen neste teléfono. Só as descargas de modelos, os informes que escollas enviar e o teu ordenador asociado usan a rede.",
+      "privacy": "As tarefas locais quedan neste teléfono. As descargas de modelos, os informes que decides enviar e o ordenador vinculado usan a rede. Os metadatos de diagnóstico automático só usan a rede tras un consentimento independente.",
       "computer_feature": "Esta función execútase actualmente no teu ordenador. Podes usar Fala e Ditado neste teléfono sen vincular.",
       "accepted": "Licenza aceptada",
       "not_accepted": "Non se acepta licenza",
@@ -3836,7 +3862,7 @@
       "download_one": "{{name}} · {{size}} descargar"
     },
     "consent": {
-      "phone_note": "Gardado neste teléfono. Non se envía nada."
+      "phone_note": "A túa elección sobre estatísticas gárdase neste teléfono. Os informes de diagnóstico automático requiren un consentimento independente."
     },
     "report": {
       "action": "Informe",
@@ -4319,5 +4345,21 @@
       "failed": "Fallou",
       "cancelled": "Cancelado"
     }
+  },
+  "diagnostics": {
+    "title": "Informes automáticos de erros",
+    "body": "Envía a Supermetry informes técnicos sobre peches inesperados e fallos de instalación ou xeración, con datos da aplicación e do dispositivo, códigos de erro, localizacións do código e un identificador de instalación aleatorio. Nunca envía o teu audio, texto, ficheiros, nomes, credenciais nin rexistros. É independente da análise de uso e está desactivado por defecto. Podes desactivalo cando queiras en Privacidade.",
+    "allow": "Permitir informes de erros",
+    "keep_off": "Manter os informes desactivados",
+    "unavailable": "Os informes automáticos non están dispoñibles ou están desactivados nesta aplicación.",
+    "managed": "Xestiona esta opción na aplicación de escritorio conectada a este navegador.",
+    "save_failed": "Non se puido gardar esta opción. Téntao de novo."
+  },
+  "tray": {
+    "open": "Abrir {{app}}",
+    "start_dictation": "Comeza o ditado",
+    "stop_dictation": "Deter o ditado",
+    "settings": "Configuración",
+    "quit": "Saír"
   }
 }

@@ -13,6 +13,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { throttle } from '@tanstack/react-pacer';
@@ -43,6 +44,7 @@ import { isPresetOnly, useTtsReadiness } from './use-tts-readiness';
 import { useEngines } from './use-engines';
 import { expressionCaps } from '@/lib/expression';
 import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
+import { captureDiagnosticException, observeDiagnosticConsent } from '@/lib/diagnostic-reports';
 import { useResolvedLicenceError } from './use-resolved-licence-error';
 import { announceDroppedSpeech } from '@/lib/dropped-speech';
 import { recordTakeSpeed } from '@/lib/store/quality-offer';
@@ -54,8 +56,33 @@ import {
 } from '@/lib/store/transcript-saves';
 
 const TIMER_TICK_MS = 100;
+
+// Elapsed render time ticks at 10 Hz. It lives outside the generation context so a
+// tick re-renders only the timer labels, not every useGenerateClone consumer.
+const elapsedListeners = new Set<() => void>();
+let elapsedValue = 0;
+export const elapsedStore = {
+  set(value: number) {
+    if (value === elapsedValue) return;
+    elapsedValue = value;
+    elapsedListeners.forEach((listener) => listener());
+  },
+  subscribe(listener: () => void) {
+    elapsedListeners.add(listener);
+    return () => {
+      elapsedListeners.delete(listener);
+    };
+  },
+  get: () => elapsedValue,
+};
+/** Seconds the current (or last) take has been rendering, to 0.1 s. */
+export function useGenerationElapsed(): number {
+  return useSyncExternalStore(elapsedStore.subscribe, elapsedStore.get, elapsedStore.get);
+}
 const PROGRESS_THROTTLE_MS = 100;
 const MODEL_NOT_DOWNLOADED = 'model_not_downloaded';
+/** A deliberate queue validation outcome, rather than an engine failure. */
+class QueuedVoiceChangedError extends Error {}
 
 // One synthesis at a time across every mounted hook instance: the backend
 // serialises on the GPU anyway. Takes requested while one renders wait in a
@@ -183,7 +210,6 @@ export interface UseGenerateClone {
   removeQueued(id: string): void;
   clearFinished(): void;
   isGenerating: boolean;
-  elapsedSeconds: number;
   /** 0..100 while the WAV body streams in; null when unknown. */
   progress: number | null;
   stage: 'preparing' | 'loading' | 'generating' | 'receiving';
@@ -294,7 +320,6 @@ function useGenerateController(): UseGenerateClone {
   }, []);
   useResolvedLicenceError(errorCause, clearError);
   const [isGenerating, setIsGenerating] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [progress, setProgress] = useState<number | null>(null);
   const [stage, setStage] = useState<UseGenerateClone['stage']>('preparing');
   const [modelStage, setModelStage] = useState<UseGenerateClone['modelStage']>(null);
@@ -512,6 +537,8 @@ function useGenerateController(): UseGenerateClone {
         denoise: settings.denoise,
         postprocess: settings.postprocess,
         duration: settings.duration,
+        paragraphGapMs: settings.paragraphGapMs,
+        trimEngineSilence: settings.trimEngineSilence,
       };
       const spokenText = input.text.trim();
       return {
@@ -582,17 +609,18 @@ function useGenerateController(): UseGenerateClone {
       setErrorTopic(null);
       setErrorCause(null);
       setIsGenerating(true);
-      setElapsedSeconds(0);
+      elapsedStore.set(0);
       setProgress(null);
       setStage('preparing');
       setModelStage(null);
       setModelProgress(null);
       const startedAt = Date.now();
       timerRef.current = setInterval(() => {
-        setElapsedSeconds(Math.round((Date.now() - startedAt) / TIMER_TICK_MS) / 10);
+        elapsedStore.set(Math.round((Date.now() - startedAt) / TIMER_TICK_MS) / 10);
       }, TIMER_TICK_MS);
       const controller = new AbortController();
       abortRef.current = controller;
+      const diagnosticConsent = observeDiagnosticConsent();
       try {
         if (take.voiceFingerprint) {
           // An edit, lock or unlock still in flight has reached (or may reach) the
@@ -614,7 +642,7 @@ function useGenerateController(): UseGenerateClone {
                   take.transcriptBaseline.transcript,
                 )))
           )
-            throw new Error(tr('generationQueue.voice_changed'));
+            throw new QueuedVoiceChangedError(tr('generationQueue.voice_changed'));
         }
         const result = await generateClone(input, {
           signal: controller.signal,
@@ -664,10 +692,12 @@ function useGenerateController(): UseGenerateClone {
           queryClient.invalidateQueries({ queryKey: queryKeys.engines }),
         ]).catch(() => {});
       } catch (err) {
-        if (cancelledRef.current) {
+        if (cancelledRef.current || controller.signal.aborted) {
           patchQueueItem(take.id, { status: 'cancelled' });
         } else {
           recordActionBreadcrumb(`generate:${reportMode}:error`);
+          if (!isModelNotDownloaded(err) && !(err instanceof QueuedVoiceChangedError))
+            captureDiagnosticException(err, 'generation_failed', 'generation', diagnosticConsent);
           const message = isAbortError(err)
             ? tr('tts_errors.timeout')
             : isModelNotDownloaded(err)
@@ -799,12 +829,12 @@ function useGenerateController(): UseGenerateClone {
     cancel();
   }, [cancel]);
 
-  return {
+  return useMemo(
+    () => ({
     generate: () => generate(),
     generateDesign: generate,
     cancel,
     isGenerating,
-    elapsedSeconds,
     progress,
     stage,
     modelStage,
@@ -824,7 +854,29 @@ function useGenerateController(): UseGenerateClone {
     designBlockerFor,
     cloneBlocker: blocker,
     instructVocabulary,
-  };
+  }),
+    [
+      generate,
+      cancel,
+      isGenerating,
+      progress,
+      stage,
+      modelStage,
+      modelProgress,
+      error,
+      errorTopic,
+      clearError,
+      blocker,
+      designBlocker,
+      queue,
+      removeQueued,
+      clearFinished,
+      cancelAll,
+      designBlockerFor,
+      instructVocabulary,
+    ],
+  );
+
 }
 
 const GenerationContext = createContext<UseGenerateClone | null>(null);

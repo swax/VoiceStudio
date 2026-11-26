@@ -171,6 +171,9 @@ export function toGenerateForm(
   form.append('class_temperature', String(input.classTemp));
   form.append('layer_penalty_factor', String(input.layerPenalty));
   form.append('postprocess_output', String(input.postprocess));
+  // Join options go out only when set, so a default request is unchanged.
+  if (input.paragraphGapMs) form.append('paragraph_gap_ms', String(input.paragraphGapMs));
+  if (input.trimEngineSilence) form.append('trim_engine_silence', 'true');
   const duration = Number.parseFloat(input.duration);
   if (input.duration && Number.isFinite(duration)) form.append('duration', String(duration));
 
@@ -427,10 +430,11 @@ export async function generateClone(
   // budget read still in flight (just after connecting) is awaited briefly so
   // an operator-raised timeout is not missed.
   if (generateBudgetPending()) await generateBudgetSettled(2_000);
-  const backstop = setTimeout(
-    forwardAbort,
-    generateAbortMs(input.text.length, reportedGenerateBudget()),
-  );
+  let deadlineReached = false;
+  const backstop = setTimeout(() => {
+    deadlineReached = true;
+    controller.abort();
+  }, generateAbortMs(input.text.length, reportedGenerateBudget()));
   const finishActivity = beginAppActivity('synthesis');
   try {
     const res = await apiFetch('/generate', {
@@ -440,6 +444,15 @@ export async function generateClone(
     });
     const blob = await readAudioBody(res, opts.onProgress);
     return { blob, ...parseGenerateHeaders(res.headers) };
+  } catch (error) {
+    // Fetch uses AbortError for both cancellation and our internal deadline.
+    // Keep actual caller cancellation local while reporting a stalled request.
+    if (deadlineReached && !opts.signal?.aborted && isAbortError(error)) {
+      const timeout = new Error(i18next.t('tts_errors.timeout'));
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
+    throw error;
   } finally {
     finishActivity();
     clearTimeout(backstop);

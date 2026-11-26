@@ -1,25 +1,20 @@
 # VoiceStudio for Dub Anything
 
-This is [swax/VoiceStudio](https://github.com/swax/VoiceStudio), the backend
-fork pinned by [Dub Anything](https://github.com/swax/dub-anything).
+This fork supplies the VoiceStudio backend for [Dub Anything](https://github.com/swax/dub-anything).
 
-Additional behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
+Changes beyond [upstream VoiceStudio at `70a9ed0f`](https://github.com/debpalash/VoiceStudio/commit/70a9ed0f8670bbf1e0277be82ff3ca5590323c8b).
 
-- **Per-line direction:** accept voice references and transcripts, emotion references
-  and strengths, and seed overrides for individual dub segments. Include these
-  controls in incremental fingerprints and private crash-recovery identities.
-- **Audio effects:** add echo and public-address presets with reverb tails.
-- **Shared media:** let uploads skip built-in separation, attach client-separated
-  stems, and fork jobs over hard-linked media for another voice. Stem attachment
-  and job forking require administrator access.
-- **Responsive watermarking:** mark fresh dub segments on the existing watermark
-  worker; recovered segments keep their existing mark.
-- **Legacy Windows AMD support:** retain compatibility adjustments for the
-  `2.9.1+rocm7.13.x` Torch build in the backend and IndexTTS sidecar.
-- **Windows checkout:** preserve LF bytes in hash-pinned bundled model text assets
-  and generated mobile contracts.
+- **Per-line direction** adds voice reference audio and transcripts, emotion
+  references and strengths, and seed overrides to dub segments. These inputs
+  also identify reusable takes.
+- **Audio effects** add echo and public-address presets with reverb tails.
+- **Shared media** keeps a full-quality extract for client-side separation,
+  lets administrators attach the resulting stems, and lets them fork a job
+  over hard-linked media for another voice.
+- **Legacy Windows AMD support** adapts the backend and IndexTTS sidecar
+  for Torch `2.9.1+rocm7.13.x`.
 
-[Setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md) · [Fork notes](https://github.com/swax/VoiceStudio/blob/main/DUB_ANYTHING.md)
+[Dub Anything setup](https://github.com/swax/dub-anything/blob/main/docs/setup.md)
 
 ---
 
@@ -146,12 +141,12 @@ Additional behavior beyond upstream `9ce1333fe55c1bf9de6992e762679aea23f6c5b1`:
       <a href="https://voicestudio.sh/pro?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=project&amp;utm_content=readme-section"><img src="../assets/voicestudio-pro.svg" alt="" width="56" height="56" align="middle" /></a>&nbsp;&nbsp;<strong><a href="https://voicestudio.sh/pro?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=project&amp;utm_content=readme-section">VoiceStudio Pro</a></strong><br /><br />
       여러 대의 컴퓨터로 유료 클라이언트 작업을 하는 분께.
       <ul>
-        <li>클라이언트 작업용 상업용 라이선스를 이메일로 전달</li>
+        <li>클라이언트 작업에서 VoiceStudio 코드를 사용하기 위한 상업용 라이선스를 이메일로 전달</li>
         <li>사용자 1명당 최대 3대 기기 동시 사용</li>
         <li>프로젝트는 로컬에 두고 작업을 다른 GPU로 전송</li>
         <li>새 기능과 수정 사항을 먼저 이용</li>
       </ul>
-      <sub>비공개 소스 빌드, 계정 필요, 7일 내 전액 환불. AGPL-3.0 앱은 해당 조건에 따른 상업적 사용을 포함해 계속 무료입니다.</sub><br /><br />
+      <sub>비공개 소스 빌드, 계정 필요, 7일 내 전액 환불. AGPL-3.0 앱은 해당 조건에 따른 상업적 사용을 포함해 계속 무료입니다. 두 라이선스 모두 모델 가중치는 포함하지 않습니다. 기본 OmniVoice 가중치는 비상업용(CC-BY-NC)이므로 클라이언트 작업 전에 모델 관리자에서 각 모델의 라이선스를 확인하세요.</sub><br /><br />
       <strong><a href="https://voicestudio.sh/pro?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=project&amp;utm_content=readme-section">Pro 요금제 보기 →</a></strong>
     </td>
     <td width="50%" valign="top">

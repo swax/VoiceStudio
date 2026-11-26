@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from core.browser_guard import reject_cross_site_get
 from core.logging_utils import log_safe
+from core.scrub import scrub_text
 from core.nvidia_smi import find_nvidia_smi
 from core.engine_licenses import LICENSE_GATED_ENGINES
 from api.dependencies import require_admin, require_admin_action
@@ -856,7 +857,6 @@ def _scrub_llm_detail(e: Exception, api_key: str | None) -> str:
     home paths — but a STORE-persisted key isn't in the env, and some
     providers echo the key in error bodies, so redact the exact resolved key
     explicitly before the generic pass."""
-    from core.scrub import scrub_text
     detail = f"{type(e).__name__}: {e}"
     if api_key and api_key != "local" and len(api_key) >= 8:
         detail = detail.replace(api_key, "•••")
@@ -1219,7 +1219,13 @@ def set_models_dir(body: _ModelsDirBody):
         with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
     except OSError as e:
-        raise HTTPException(status_code=400, detail=f"Directory is not writable: {e}") from e
+        # A fixed message: the OS error carries the folder, and on Windows it
+        # escapes the separators (`C:\\Users\\...`), which is exactly the shape
+        # scrub_text does not match, so the account name would reach the toast.
+        raise HTTPException(
+            status_code=400,
+            detail="That folder is not writable. Choose one you can write to, then try again.",
+        ) from e
     finally:
         # Best-effort cleanup; a failed remove (concurrent process, perm change)
         # must not leave the request hanging or mask the real error.
@@ -1707,3 +1713,46 @@ def set_analytics(body: _AnalyticsBody):
 
     analytics.set_opted_in(body.enabled)
     return get_analytics()
+
+
+class _DiagnosticsBody(BaseModel):
+    model_config = {"extra": "forbid", "strict": True}
+    enabled: bool = Field(..., description="Separate explicit diagnostic consent; default OFF.")
+
+
+class _DiagnosticInput(BaseModel):
+    model_config = {"extra": "forbid", "strict": True}
+    expected_epoch: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$", max_length=32)
+    category: str = Field(..., max_length=64)
+    source: Literal["renderer"]
+    stage: str = Field(default="other", max_length=64)
+    error_type: str = Field(default="OtherError", max_length=64)
+    error_code: str | None = Field(default=None, max_length=64)
+    engine_id: str | None = Field(default=None, max_length=64)
+    frames: str | None = Field(default=None, max_length=1800)
+
+
+@router.get("/diagnostics")
+def get_diagnostics():
+    from core import diagnostic_reports
+    return diagnostic_reports.status()
+
+
+@router.put("/diagnostics", dependencies=[Depends(require_admin_action)])
+def set_diagnostics(body: _DiagnosticsBody):
+    from core import diagnostic_reports
+    try:
+        return diagnostic_reports.set_opted_in(body.enabled)
+    except diagnostic_reports.ConsentExternallyManaged:
+        raise HTTPException(status_code=409, detail="Desktop controls diagnostic consent") from None
+    except OSError:
+        raise HTTPException(status_code=503, detail={"code": "DIAGNOSTICS_SAVE_FAILED"}) from None
+
+
+@router.post("/diagnostics/event", dependencies=[Depends(require_admin_action)])
+def post_diagnostic_event(body: _DiagnosticInput):
+    from core import diagnostic_reports
+    try:
+        return {"sent": diagnostic_reports.capture_from_ui(body.model_dump(exclude_none=True))}
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Unsupported diagnostic metadata") from None

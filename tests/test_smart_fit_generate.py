@@ -105,8 +105,7 @@ def patched_generate(monkeypatch, tmp_path):
     monkeypatch.setattr(dg, "_save_job", lambda job_id, j: None)
     monkeypatch.setattr(dg, "DUB_DIR", str(tmp_path))
     monkeypatch.setattr(
-        dg,
-        "dub_seg_path",
+        dg, "dub_seg_path",
         lambda job_id, seg_id: str(job_dir / f"seg_{seg_id}.wav"),
     )
     monkeypatch.setattr(dg, "rvc_is_enabled", lambda: False)
@@ -271,6 +270,7 @@ def test_fresh_speech_is_watermarked_exactly_once(patched_generate, monkeypatch)
 
     import api.routers.dub_generate as dg
     import services.watermark as watermark
+    from services.model_manager import begin_watermark_pool_lifecycle
 
     run, _model, job, job_dir = patched_generate
     job["duration"] = 35.0
@@ -286,10 +286,12 @@ def test_fresh_speech_is_watermarked_exactly_once(patched_generate, monkeypatch)
 
     def _fake_detect(waveform, sample_rate):
         found = bool((waveform < -0.5).any())
-        return {"is_watermarked": found, "confidence": 1.0 if found else 0.0, "message_bits": "", "is_omnivoice": found}
+        return {"is_watermarked": found, "confidence": 1.0 if found else 0.0,
+                "message_bits": "", "is_omnivoice": found}
 
-    mark_async = AsyncMock(side_effect=_fake_mark)
-    monkeypatch.setattr(dg, "mark_synthetic_async", mark_async)
+    begin_watermark_pool_lifecycle()
+    monkeypatch.setattr(dg, "mark_synthetic_async", watermark.mark_synthetic_async)
+    monkeypatch.setattr(watermark, "mark_synthetic", _fake_mark)
     monkeypatch.setattr(watermark, "detect_watermark", _fake_detect)
 
     done = _done(run(_body(
@@ -308,7 +310,6 @@ def test_fresh_speech_is_watermarked_exactly_once(patched_generate, monkeypatch)
     assert watermark.detect_watermark(seg, seg_sr)["is_watermarked"]
 
     # One mark call, on the 33 s fresh segment: the 35 s track is not re-marked.
-    mark_async.assert_awaited_once()
     assert mark_lengths == [int(33.0 * SR)]
 
 
